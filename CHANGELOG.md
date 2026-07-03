@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [2.8.0] - 2026-07-03
+
 ### Added
 - **Native host diagnostics** - Added `surf doctor` to diagnose socket connectivity, native messaging manifests, allowed origins, and wrapper paths without requiring a working browser connection.
 - **Performance audit** - Added `surf perf-audit --duration ... --trigger ... --output ...` for bounded PerformanceObserver snapshots of layout shifts, events, long tasks, paints, and long animation frames.
@@ -35,6 +37,7 @@
 
 ### Dependencies
 - Bump Vitest package group from 4.0.18 to 4.1.9 to clear the critical audit advisory.
+- Bump TypeScript from 5.7.2 to 6.0.3.
 
 ## [2.7.2] - 2026-04-10
 
