@@ -2,6 +2,24 @@
 
 ## [Unreleased]
 
+### Added
+- **Authenticated Tailnet remote control** - Added mutually authenticated per-client remote access with Ed25519 host pinning, authorize/list/revoke lifecycle, shared local/remote FIFO serialization, disconnect cancellation, bounded single-file transfer, explicit `local:`/`remote:` path semantics, remote AI attachments and image outputs, network export, and transferred action/error screenshots. Thanks to @alvinunreal for the original remote-browser contribution in #155.
+- **Deep X Research skill** - Added `skills/deep-x-research/`, an agent skill that layers an exhaustive X (Twitter) research procedure on top of `surf grok`: a quota-budgeted multi-angle Grok sweep (keyword + semantic, with DeepSearch), Grok-native video analysis, quota-free URL verification via direct post opens, categorized findings, and a References section where every cited post carries its full post URL. Falls back to the x.com search UI when the Grok quota is exhausted.
+- **Tab movement** - Added `surf tab.move <id> --to-window <id>` with multi-tab and insertion-index support. (@zm2231, #148)
+- **Page text byte limit** - Added `page.read --max-bytes <n>` for UTF-8-safe visible-text truncation without changing the existing default limit. (@zm2231, #148)
+
+### Fixed
+- **Provider response extraction** - Fixed truncated Perplexity answers, trailing Grok suggestion chips, and incomplete Gemini stream/image extraction; refreshed Gemini's selectable web models and unknown-model fallback guidance. (@zm2231, #148)
+- **Browser command edge cases** - Fixed `tab.name` on restricted active pages, `zoom --level` argument loss, and selector-targeted `type --into`; selector typing now follows the active iframe context. (@zm2231, #148)
+
+### Docs
+- **Skills README** - Documented the two-skill layout (`surf/` reference, `deep-x-research/` procedure) with install steps for Pi, Claude Code, and Codex, and pointed the surf skill's Grok section at `deep-x-research` for exhaustive research tasks.
+
+### Dependencies
+- **Routine toolchain refresh** - Updated Gitleaks Action to v3, checkout Action to v7, Zod to 4.4.3, Chrome types to 0.2.2, the Vite Node polyfills plugin to 0.28.0, and the resolved Vitest package group to 4.1.10.
+- **TypeScript 7** - Updated the TypeScript compiler from 6.0.3 to 7.0.2.
+- **Vite 8** - Updated Vite from 7.3.1 to 8.1.4 with the compatible Node polyfills plugin, moving extension builds to Vite's Rolldown and Oxc toolchain.
+
 ## [2.8.0] - 2026-07-03
 
 ### Added

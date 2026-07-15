@@ -5,14 +5,16 @@
  * Similar approach to the ChatGPT client.
  */
 
+const { abortableDelay, raceAbort, throwIfAborted } = require("./abort.cjs");
+
 const PERPLEXITY_URL = "https://www.perplexity.ai/";
 
 // ============================================================================
 // Helpers
 // ============================================================================
 
-function delay(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
+function delay(ms, signal) {
+  return abortableDelay(ms, signal);
 }
 
 function buildClickDispatcher() {
@@ -371,7 +373,27 @@ async function submitPrompt(cdp, inputCdp) {
 // Response Handling
 // ============================================================================
 
-async function waitForResponse(cdp, timeoutMs = 120000) {
+function extractPerplexityResponseText() {
+  const selectors = [
+    '[id^="markdown-content"]',
+    '[data-testid="answer"]',
+    'article',
+    '.prose',
+  ];
+
+  for (const selector of selectors) {
+    const elements = Array.from(document.querySelectorAll(selector));
+    for (let i = elements.length - 1; i >= 0; i--) {
+      const text = elements[i].innerText?.trim() || '';
+      if (text) return text;
+    }
+  }
+
+  return '';
+}
+
+async function waitForResponse(cdp, timeoutMs = 120000, signal) {
+  throwIfAborted(signal);
   const deadline = Date.now() + timeoutMs;
   let previousText = '';
   let stableCycles = 0;
@@ -386,17 +408,16 @@ async function waitForResponse(cdp, timeoutMs = 120000) {
     if (url && url.includes('/search/')) {
       break;
     }
-    await delay(200);
+    await delay(200, signal);
   }
   
   // Wait a bit for the response area to render
-  await delay(1000);
+  await delay(1000, signal);
   
   // Now poll for response completion
   while (Date.now() < deadline) {
     const snapshot = await evaluate(cdp, `(function() {
-      const prose = document.querySelector('.prose');
-      const text = prose ? prose.innerText : '';
+      const text = (${extractPerplexityResponseText.toString()})();
       const hasStop = !!document.querySelector('button[aria-label*=stop], button[aria-label*=Stop]');
       const hasCopy = !!document.querySelector('button[aria-label*=copy], button[aria-label*=Copy]');
       const hasRelated = document.body.innerText.indexOf('Related') > -1;
@@ -412,7 +433,7 @@ async function waitForResponse(cdp, timeoutMs = 120000) {
     })()`);
     
     if (!snapshot) {
-      await delay(300);
+      await delay(300, signal);
       continue;
     }
     
@@ -437,7 +458,7 @@ async function waitForResponse(cdp, timeoutMs = 120000) {
     const hasCompletionIndicators = snapshot.hasActions || snapshot.hasRelated || snapshot.hasFollowUp;
     const isDone = !snapshot.generating && (hasCompletionIndicators || isStable);
     
-    if (isDone && currentText.length > 20) {
+    if (isDone && currentText.trim().length > 0) {
       // Clean up the response text
       let cleanText = currentText;
       
@@ -454,11 +475,11 @@ async function waitForResponse(cdp, timeoutMs = 120000) {
       };
     }
     
-    await delay(300);
+    await delay(300, signal);
   }
   
   // Timeout - return whatever we have
-  if (previousText.length > 20) {
+  if (previousText.trim().length > 0) {
     return {
       text: previousText,
       sources: 0,
@@ -485,13 +506,15 @@ async function query(options) {
     cdpEvaluate,
     cdpCommand,
     log = () => {},
+    signal,
   } = options;
+  throwIfAborted(signal);
   
   const startTime = Date.now();
   log("Starting Perplexity query");
   
   // Create tab
-  const tabInfo = await createTab();
+  const tabInfo = await raceAbort(createTab, signal);
   log(`createTab returned: ${JSON.stringify(tabInfo)}`);
   const { tabId } = tabInfo || {};
   
@@ -500,8 +523,8 @@ async function query(options) {
   }
   log(`Created tab ${tabId}`);
   
-  const cdp = (expr) => cdpEvaluate(tabId, expr);
-  const inputCdp = (method, params) => cdpCommand(tabId, method, params);
+  const cdp = (expr) => raceAbort(() => cdpEvaluate(tabId, expr), signal);
+  const inputCdp = (method, params) => raceAbort(() => cdpCommand(tabId, method, params), signal);
   
   try {
     // Wait for page load
@@ -522,6 +545,7 @@ async function query(options) {
         const selectedMode = await selectMode(cdp, mode);
         log(`Mode: ${selectedMode}`);
       } catch (e) {
+        if (signal?.aborted) throw e;
         log(`Mode selection failed: ${e.message}`);
       }
     }
@@ -532,6 +556,7 @@ async function query(options) {
         const selectedModel = await selectModel(cdp, model);
         log(`Model: ${selectedModel}`);
       } catch (e) {
+        if (signal?.aborted) throw e;
         log(`Model selection failed: ${e.message}`);
       }
     }
@@ -545,7 +570,7 @@ async function query(options) {
     log("Submitted, waiting for response...");
     
     // Wait for response
-    const response = await waitForResponse(cdp, timeout);
+    const response = await waitForResponse(cdp, timeout, signal);
     log(`Response: ${response.text.length} chars, ${response.sources} sources${response.partial ? ' (partial)' : ''}`);
     
     return {
@@ -558,8 +583,12 @@ async function query(options) {
       tookMs: Date.now() - startTime,
     };
   } finally {
-    await closeTab(tabId).catch(() => {});
+    try {
+      await closeTab(tabId);
+    } catch (error) {
+      log(`Failed to close Perplexity tab ${tabId}: ${error?.message || error}`);
+    }
   }
 }
 
-module.exports = { query, PERPLEXITY_URL };
+module.exports = { query, PERPLEXITY_URL, waitForResponse, extractPerplexityResponseText };

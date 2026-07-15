@@ -6,6 +6,7 @@
  */
 
 const { loadConfig, getConfigPath, clearCache } = require("./config.cjs");
+const { abortableDelay, raceAbort, throwIfAborted } = require("./abort.cjs");
 
 const GROK_URL = "https://x.com/i/grok";
 const DEFAULT_MODEL = "fast";
@@ -38,8 +39,8 @@ const GROK_MODELS = DEFAULT_GROK_MODELS;
 // Helpers
 // ============================================================================
 
-function delay(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
+function delay(ms, signal) {
+  return abortableDelay(ms, signal);
 }
 
 function buildClickDispatcher() {
@@ -132,8 +133,10 @@ function hasRequiredCookies(cookies) {
   return Boolean(authToken);
 }
 
-async function evaluate(cdp, expression) {
+async function evaluate(cdp, expression, signal) {
+  throwIfAborted(signal);
   const result = await cdp(expression);
+  throwIfAborted(signal);
   if (result.exceptionDetails) {
     const desc = result.exceptionDetails.exception?.description ||
                  result.exceptionDetails.text ||
@@ -450,52 +453,16 @@ async function submitPrompt(cdp, inputCdp) {
 // Response Handling
 // ============================================================================
 
-function looksLikeTrailingSuggestion(line) {
-  if (!line || line.length < 4 || line.length > 90) return false;
-  if (/[.!:;)]$/.test(line)) return false;
-  const words = line.split(/\s+/).filter(Boolean);
-  if (words.length < 2 || words.length > 9) return false;
-  if (/^[-*•\d]/.test(line)) return false;
-  if (/\b(https?:\/\/|www\.)\b/i.test(line)) return false;
-  return true;
-}
-
-function trimTrailingSuggestionLines(lines) {
-  let end = lines.length;
-  while (end > 0 && looksLikeTrailingSuggestion(lines[end - 1])) {
-    end--;
-  }
-
-  const trimmedCount = lines.length - end;
-  if (trimmedCount >= 2 && end > 0) {
-    return lines.slice(0, end);
-  }
-
-  const last = lines[lines.length - 1];
-  if (
-    trimmedCount === 1 &&
-    lines.length > 1 &&
-    /^(explain|tell|share|compare|derive|make|show|summari[sz]e|expand|rewrite)\b/i.test(last)
-  ) {
-    return lines.slice(0, -1);
-  }
-
-  const previous = lines[lines.length - 2];
-  if (
-    last &&
-    previous &&
-    /^[A-Z][a-z]{3,}$/.test(last) &&
-    /(?:[.!?)]|^\d+(?:\.\d+)?$)/.test(previous)
-  ) {
-    return lines.slice(0, -1);
-  }
-
-  return lines;
-}
-
 // Extract Grok's response from the full page body text
-function extractGrokResponse(bodyText, userPrompt = '') {
+function extractGrokResponse(bodyText, userPrompt = '', chipTexts = []) {
   if (!bodyText) return null;
+
+  // Suggestion chips are captured from the DOM as button texts; count occurrences.
+  const chipCounts = new Map();
+  for (const t of chipTexts || []) {
+    const key = String(t).trim();
+    if (key) chipCounts.set(key, (chipCounts.get(key) || 0) + 1);
+  }
 
   // Split into lines and filter out navigation/UI elements
   const lines = bodyText.split('\n').map(l => l.trim()).filter(l => l);
@@ -543,7 +510,15 @@ function extractGrokResponse(bodyText, userPrompt = '') {
     contentLines.push(line);
   }
 
-  const responseLines = trimTrailingSuggestionLines(contentLines);
+  // Chips follow the answer; strip trailing chip lines but never the first line.
+  let contentEnd = contentLines.length;
+  while (contentEnd > 1) {
+    const remaining = chipCounts.get(contentLines[contentEnd - 1]) || 0;
+    if (remaining <= 0) break;
+    chipCounts.set(contentLines[contentEnd - 1], remaining - 1);
+    contentEnd--;
+  }
+  const responseLines = contentLines.slice(0, contentEnd);
 
   // If we found content after the question, return the response
   if (responseLines.length > 0) {
@@ -561,7 +536,8 @@ function extractGrokResponse(bodyText, userPrompt = '') {
   return null;
 }
 
-async function waitForResponse(cdp, timeoutMs = 300000, userPrompt = '') {
+async function waitForResponse(cdp, timeoutMs = 300000, userPrompt = '', signal) {
+  throwIfAborted(signal);
   // Grok can take a long time:
   // - Thinking models: 40-60+ seconds to think, then streams
   // - Fast/Auto models: No thinking phase, just streams directly
@@ -569,6 +545,7 @@ async function waitForResponse(cdp, timeoutMs = 300000, userPrompt = '') {
   const deadline = Date.now() + timeoutMs;
   let previousText = '';
   let previousLength = 0;
+  let lastChipTexts = [];
   let lastChangeAt = Date.now();
   let thinkingTime = null;
   let thinkingComplete = false;
@@ -583,43 +560,54 @@ async function waitForResponse(cdp, timeoutMs = 300000, userPrompt = '') {
       // Check for stop/cancel button (indicates still generating)
       const hasStopBtn = !!document.querySelector('button[aria-label*="Stop"], button[aria-label*="stop"], button[aria-label*="Cancel"]');
 
-      // Check for "Thought for Xs" which indicates thinking model completed thinking
-      const thinkMatch = bodyText.match(/Thought for (\\d+)s/i);
-      const thinkingDone = !!thinkMatch;
-      const thinkingSecs = thinkMatch ? parseInt(thinkMatch[1], 10) : null;
-
-      // Check if actively showing "thinking..." or similar loading state
-      const isThinking = /\\bthinking\\.\\.\\./i.test(bodyText) ||
-                         /\\bSearching\\.\\.\\./i.test(bodyText) ||
-                         bodyText.includes('Grok is thinking') ||
-                         bodyText.includes('is thinking...');
-
       // Try to find the actual Grok response in the DOM
       // Look for the main content area - Grok responses appear in the conversation area
       let responseText = '';
+      let responseRoot = null;
+      let preciseRoot = false;
 
       // Strategy 1: Look for article elements or main content containers
       const articles = document.querySelectorAll('article');
       if (articles.length > 0) {
         // Get the last article which should be the response
-        const lastArticle = articles[articles.length - 1];
-        responseText = lastArticle.innerText || '';
+        responseRoot = articles[articles.length - 1];
+        responseText = responseRoot.innerText || '';
+        preciseRoot = true;
       }
 
       // Strategy 2: If no articles, look for the conversation container
       if (!responseText) {
         const convArea = document.querySelector('[data-testid="conversation"], [role="main"] > div > div');
         if (convArea) {
+          responseRoot = convArea;
           responseText = convArea.innerText || '';
+          preciseRoot = true;
         }
       }
 
       // Strategy 3: Fallback to looking for text after common Grok UI patterns
       if (!responseText || responseText.length < 10) {
         // Find content between user question and follow-up suggestions
-        const mainArea = document.querySelector('main') || document.body;
-        responseText = mainArea.innerText || bodyText;
+        responseRoot = document.querySelector('main') || document.body;
+        responseText = responseRoot.innerText || bodyText;
+        preciseRoot = false;
       }
+
+      // Completion state must come from the current response container. Page-wide markers can belong to an earlier turn and would make a new short response finish prematurely.
+      const currentStateText = preciseRoot && responseRoot ? (responseRoot.innerText || '') : '';
+      const thinkMatch = currentStateText.match(/Thought for (\\d+)s/i);
+      const thinkingDone = !!thinkMatch;
+      const thinkingSecs = thinkMatch ? parseInt(thinkMatch[1], 10) : null;
+      const isThinking = /\\bthinking\\.\\.\\./i.test(currentStateText) ||
+                         /\\bSearching\\.\\.\\./i.test(currentStateText) ||
+                         currentStateText.includes('Grok is thinking') ||
+                         currentStateText.includes('is thinking...');
+
+      // Suggestion chips are the no-testid/no-aria-label buttons inside the response container. Only collect them from a precise container: a broad main/body fallback holds unrelated buttons that could erase a matching answer line.
+      const chipTexts = (preciseRoot && responseRoot ? Array.from(responseRoot.querySelectorAll('button')) : [])
+        .filter(function(b){ return !b.getAttribute('data-testid') && !b.getAttribute('aria-label'); })
+        .map(function(b){ return (b.innerText || '').trim(); })
+        .filter(function(t){ return t && !t.includes('\\n') && t.length <= 120; });
 
       return {
         bodyText: bodyText,
@@ -629,12 +617,13 @@ async function waitForResponse(cdp, timeoutMs = 300000, userPrompt = '') {
         thinkingDone: thinkingDone,
         thinkingSecs: thinkingSecs,
         isThinking: isThinking,
+        chipTexts: chipTexts,
         url: location.href
       };
     })()`);
 
     if (!snapshot || !snapshot.bodyText) {
-      await delay(300);
+      await delay(300, signal);
       continue;
     }
 
@@ -653,16 +642,18 @@ async function waitForResponse(cdp, timeoutMs = 300000, userPrompt = '') {
     if (snapshot.thinkingDone && !thinkingComplete) {
       thinkingComplete = true;
       // Give a brief moment for final render, then we're done
-      await delay(500);
+      await delay(500, signal);
     }
 
     // Extract the actual response text - try DOM-extracted first, fall back to body parsing
+    const chipTexts = snapshot.chipTexts || [];
+    lastChipTexts = chipTexts;
     let currentResponseText = '';
     if (snapshot.responseText && snapshot.responseText.length > 10) {
-      currentResponseText = extractGrokResponse(snapshot.responseText, userPrompt) || '';
+      currentResponseText = extractGrokResponse(snapshot.responseText, userPrompt, chipTexts) || '';
     }
     if (!currentResponseText || currentResponseText.length < 5) {
-      currentResponseText = extractGrokResponse(bodyText, userPrompt) || '';
+      currentResponseText = extractGrokResponse(bodyText, userPrompt, chipTexts) || '';
     }
 
     // Track RESPONSE text stability (more reliable than body text)
@@ -681,24 +672,24 @@ async function waitForResponse(cdp, timeoutMs = 300000, userPrompt = '') {
     }
 
     const stableMs = Date.now() - lastChangeAt;
-    const noStopButton = !snapshot.hasStopBtn;
+    const noStopButton = !snapshot.hasStopBtn && !snapshot.isThinking;
 
     // Response is stable if the extracted response text hasn't changed
     // Use shorter thresholds since we're checking actual content, not noisy body text
     // 4 cycles (1.2s) + 1.5s minimum is enough for response stability
-    const responseIsStable = responseStableCycles >= 4 && stableMs >= 1500 && currentResponseText.length > 10;
+    const responseIsStable = responseStableCycles >= 4 && stableMs >= 1500 && currentResponseText.trim().length > 0;
 
     // "Thought for Xs" is the strongest completion signal - response is definitely done
     const thinkingModelDone = snapshot.thinkingDone && noStopButton;
 
     // SIMPLE CHECK: If we have response content, no stop button, and stable for 3+ cycles
-    const hasResponseNoStop = currentResponseText.length > 5 && noStopButton && responseStableCycles >= 3;
+    const hasResponseNoStop = currentResponseText.trim().length > 0 && noStopButton && responseStableCycles >= 3;
 
     // Response is complete when:
-    // 1. Has meaningful response content (> 5 chars)
+    // 1. Has any non-empty extracted text
     // 2. No stop button
     // 3. Either: thinking done, response stable for 3+ cycles, OR stable for 4+ cycles with 1.5s
-    const isDone = currentResponseText.length > 5 && noStopButton &&
+    const isDone = currentResponseText.trim().length > 0 && noStopButton &&
                    (thinkingModelDone || hasResponseNoStop || responseIsStable);
 
     if (isDone) {
@@ -709,12 +700,12 @@ async function waitForResponse(cdp, timeoutMs = 300000, userPrompt = '') {
       };
     }
 
-    await delay(300);
+    await delay(300, signal);
   }
 
   // Timeout - return whatever we have (partial response is better than nothing)
-  const finalText = extractGrokResponse(previousText, userPrompt);
-  if (finalText && finalText.length > 10) {
+  const finalText = extractGrokResponse(previousText, userPrompt, lastChipTexts);
+  if (finalText && finalText.trim().length > 0) {
     return {
       text: finalText,
       thinkingTime: thinkingTime,
@@ -741,20 +732,22 @@ async function query(options) {
     cdpEvaluate,
     cdpCommand,
     log = () => {},
+    signal,
   } = options;
+  throwIfAborted(signal);
 
   const startTime = Date.now();
   log("Starting Grok query");
 
   // Check cookies for X.com authentication
-  const { cookies } = await getCookies();
+  const { cookies } = await raceAbort(getCookies, signal);
   if (!hasRequiredCookies(cookies)) {
     throw new Error("X.com login required - log in to x.com in Chrome first");
   }
   log(`Got ${cookies.length} cookies`);
 
   // Create tab
-  const tabInfo = await createTab();
+  const tabInfo = await raceAbort(createTab, signal);
   const { tabId } = tabInfo || {};
 
   if (!tabId) {
@@ -762,8 +755,8 @@ async function query(options) {
   }
   log(`Created tab ${tabId}`);
 
-  const cdp = (expr) => cdpEvaluate(tabId, expr);
-  const inputCdp = (method, params) => cdpCommand(tabId, method, params);
+  const cdp = (expr) => raceAbort(() => cdpEvaluate(tabId, expr), signal);
+  const inputCdp = (method, params) => raceAbort(() => cdpCommand(tabId, method, params), signal);
 
   try {
     // Wait for page load
@@ -801,6 +794,7 @@ async function query(options) {
         warnings.push(`Requested model "${targetModel}" but got "${selectedModel}" - model may not be available`);
       }
     } catch (e) {
+      if (signal?.aborted) throw e;
       modelSelectionFailed = true;
       warnings.push(`Model selection failed: ${e.message}. Run 'surf grok --validate' to check available models.`);
       log(`Model selection failed: ${e.message}`);
@@ -818,6 +812,7 @@ async function query(options) {
           warnings.push(`DeepSearch toggle not found - feature may require X Premium or UI changed`);
         }
       } catch (e) {
+        if (signal?.aborted) throw e;
         warnings.push(`DeepSearch toggle failed: ${e.message}`);
         log(`DeepSearch toggle failed: ${e.message}`);
       }
@@ -832,7 +827,7 @@ async function query(options) {
     log("Submitted, waiting for response...");
 
     // Wait for response
-    const response = await waitForResponse(cdp, timeout, prompt);
+    const response = await waitForResponse(cdp, timeout, prompt, signal);
     const thinkingInfo = response.thinkingTime ? ` (thought for ${response.thinkingTime}s)` : '';
     log(`Response: ${response.text.length} chars${thinkingInfo}${response.partial ? ' (partial)' : ''}`);
 
@@ -850,7 +845,11 @@ async function query(options) {
       tookMs: Date.now() - startTime,
     };
   } finally {
-    await closeTab(tabId).catch(() => {});
+    try {
+      await closeTab(tabId);
+    } catch (error) {
+      log(`Failed to close Grok tab ${tabId}: ${error?.message || error}`);
+    }
   }
 }
 
@@ -865,7 +864,9 @@ async function validate(options) {
     closeTab,
     cdpEvaluate,
     log = () => {},
+    signal,
   } = options;
+  throwIfAborted(signal);
 
   const startTime = Date.now();
   log("Starting Grok validation");
@@ -884,7 +885,7 @@ async function validate(options) {
 
   // Check cookies
   try {
-    const { cookies } = await getCookies();
+    const { cookies } = await raceAbort(getCookies, signal);
     result.authenticated = hasRequiredCookies(cookies);
     if (!result.authenticated) {
       result.errors.push("Not authenticated - log in to x.com in Chrome first");
@@ -892,6 +893,7 @@ async function validate(options) {
     }
     log("Cookies OK");
   } catch (e) {
+    if (signal?.aborted) throw e;
     result.errors.push(`Cookie check failed: ${e.message}`);
     return { ...result, tookMs: Date.now() - startTime };
   }
@@ -899,7 +901,7 @@ async function validate(options) {
   // Create tab
   let tabId;
   try {
-    const tabInfo = await createTab();
+    const tabInfo = await raceAbort(createTab, signal);
     tabId = tabInfo?.tabId;
     if (!tabId) {
       result.errors.push("Failed to create tab");
@@ -907,15 +909,16 @@ async function validate(options) {
     }
     log(`Created tab ${tabId}`);
   } catch (e) {
+    if (signal?.aborted) throw e;
     result.errors.push(`Tab creation failed: ${e.message}`);
     return { ...result, tookMs: Date.now() - startTime };
   }
 
-  const cdp = (expr) => cdpEvaluate(tabId, expr);
+  const cdp = (expr) => raceAbort(() => cdpEvaluate(tabId, expr), signal);
 
   try {
     // Wait for page load
-    await waitForPageLoad(cdp);
+    await raceAbort(waitForPageLoad(cdp), signal);
     log("Page loaded");
 
     // Check login status
@@ -930,7 +933,7 @@ async function validate(options) {
     log(`Login: yes${result.premium ? ' (Premium)' : ''}`);
 
     // Wait for Grok UI
-    await waitForGrokReady(cdp);
+    await raceAbort(waitForGrokReady(cdp), signal);
     log("Grok ready");
 
     // Check for input field
@@ -967,7 +970,7 @@ async function validate(options) {
     })()`);
 
     if (modelButtonClicked?.success) {
-      await delay(500);
+      await abortableDelay(500, signal);
 
       // Scrape model options
       const modelScrape = await evaluate(cdp, `(() => {
@@ -1013,9 +1016,14 @@ async function validate(options) {
     }
 
   } catch (e) {
+    if (signal?.aborted) throw e;
     result.errors.push(`Validation error: ${e.message}`);
   } finally {
-    await closeTab(tabId).catch(() => {});
+    try {
+      await closeTab(tabId);
+    } catch (error) {
+      log(`Failed to close Grok validation tab ${tabId}: ${error?.message || error}`);
+    }
   }
 
   result.tookMs = Date.now() - startTime;
@@ -1067,6 +1075,7 @@ module.exports = {
   normalizeGrokModelLabel,
   getGrokModelMatchLabels,
   grokModelLabelsMatch,
+  waitForResponse,
   GROK_URL,
   GROK_MODELS,
   DEFAULT_GROK_MODELS,

@@ -15,6 +15,28 @@ On macOS, Chrome reads the native messaging manifest at `~/Library/Application S
 
 If a command reports `Socket connect failed`, run `surf doctor` first, then check the `Attempted socket:` line. Default sockets are `/tmp/surf.sock` on macOS/Linux/WSL2 and `//./pipe/surf` on Windows. If `SURF_SOCKET` is set, the browser-launched host and the shell running `surf` must use the same value.
 
+## Remote Surf
+
+Remote clients require a per-client credential; Tailnet reachability alone is not authorization. On the POSIX browser host, authorize the client before installing the listener:
+
+```bash
+surf remote authorize agent-macbook --output ~/agent-macbook.surf-credential.json
+surf install <extension-id> --listen 100.101.102.103:4321
+surf remote list
+```
+
+Move the mode-0600 credential to the client through a secure channel. It grants full trusted Surf authority. Use it explicitly or through `SURF_REMOTE` and `SURF_REMOTE_CREDENTIAL`:
+
+```bash
+surf --remote 100.101.102.103:4321 \
+  --remote-credential ~/.config/surf/agent-macbook.json \
+  page.read
+
+surf remote revoke agent-macbook  # Run on the browser host
+```
+
+Remote paths are client-local by default. `local:./file` is explicit client-local syntax; only `remote:/absolute/path` accesses the browser host directly. Remote transfer supports one upload or ChatGPT/Gemini input and one screenshot, network-export, or Gemini image output. Limits are 256 MiB per file, 512 MiB and 32 files per connection, and 256 KiB decoded chunks. `record`, `aistudio.build`, smoke screenshot directories, directories, and multi-file inputs are not supported remotely. Successful action screenshots and failure `--auto-capture` diagnostics are transferred back to client-local paths.
+
 ## CLI Quick Reference
 
 ```bash
@@ -68,7 +90,7 @@ surf gemini "analyze" --file data.csv             # Attach file
 surf gemini "a robot surfing" --generate-image /tmp/robot.png
 surf gemini "add sunglasses" --edit-image photo.jpg --output out.jpg
 surf gemini "summarize" --youtube "https://youtube.com/..."
-surf gemini "hello" --model gemini-2.5-flash      # Models: gemini-3-pro (default), gemini-2.5-pro, gemini-2.5-flash
+surf gemini "hello" --model gemini-3.5-flash      # Models: gemini-3.1-pro (default), gemini-3.5-flash, gemini-3.1-flash-lite
 surf gemini "wide banner" --generate-image /tmp/banner.png --aspect-ratio 16:9
 ```
 
@@ -88,6 +110,8 @@ surf grok "summarize this page" --with-page       # Include page context
 surf grok "find viral AI posts" --deep-search     # DeepSearch mode
 surf grok "quick question" --model fast           # Models: auto, fast, expert, grok-4.20-beta
 ```
+
+For exhaustive, multi-angle X research with categorized findings and full post-URL traceability, use the `deep-x-research` skill (`skills/deep-x-research/`) instead of a single Grok query.
 
 **Grok Validation & Troubleshooting:**
 ```bash
@@ -158,6 +182,7 @@ surf tab.list
 surf tab.new "https://google.com"
 surf tab.switch 12345
 surf tab.close 12345
+surf tab.move 12345 --to-window 67890
 surf tab.reload                # Reload current tab
 
 # Named tabs (aliases)
@@ -207,12 +232,13 @@ Use `window.new`, `--window-id`, `--tab-id`, and named tabs to keep parallel age
 ## Input Methods
 
 ```bash
-# CDP method (real events) - default
+# CDP method (real events) types at the current focus
 surf type --text "hello"
 surf click --x 100 --y 200
 
-# JS method (DOM manipulation) - for contenteditable
-surf type --text "hello" --selector "#input" --method js
+# Selector/ref targets use frame-aware DOM input
+surf type "hello" --into "#input"
+surf type "hello" --ref e5
 
 # Keys
 surf key Enter
@@ -233,6 +259,7 @@ surf animate-audit --selector ".thing" --duration 2000 --fps 10  # JSON animatio
 surf page.read --ref e5        # Get specific element details
 surf page.read --depth 3       # Limit tree depth
 surf page.read --compact       # Minimal output for LLM efficiency
+surf page.read --max-bytes 2000 # Cap visible text at a UTF-8 byte boundary
 surf page.text                 # Plain text content only
 surf page.state                # Modals, loading state, scroll info
 ```

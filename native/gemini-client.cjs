@@ -6,6 +6,7 @@
  */
 
 const https = require("https");
+const { abortError, abortableDelay, raceAbort, throwIfAborted } = require("./abort.cjs");
 const fs = require("fs");
 const path = require("path");
 
@@ -22,9 +23,9 @@ const USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36
 
 const MODEL_HEADER_NAME = "x-goog-ext-525001261-jspb";
 const MODEL_HEADERS = {
-  "gemini-3-pro": '[1,null,null,null,"9d8ca3786ebdfbea",null,null,0,[4]]',
-  "gemini-2.5-pro": '[1,null,null,null,"4af6c7f5da75d65d",null,null,0,[4]]',
-  "gemini-2.5-flash": '[1,null,null,null,"9ec249fc9ad08861",null,null,0,[4]]',
+  "gemini-3.1-pro": '[1,null,null,null,"e6fa609c3fa255c0",null,null,0,[4]]',
+  "gemini-3.5-flash": '[1,null,null,null,"56fdd199312815e2",null,null,0,[4]]',
+  "gemini-3.1-flash-lite": '[1,null,null,null,"8c46e95b1a07cecc",null,null,0,[4]]',
 };
 
 const REQUIRED_COOKIES = ["__Secure-1PSID", "__Secure-1PSIDTS"];
@@ -96,7 +97,8 @@ function hasRequiredCookies(cookieMap) {
 // ============================================================================
 
 function httpsGet(url, headers, opts = {}) {
-  const { binary = false, timeoutMs = 30000, log = null, label = "httpsGet" } = opts;
+  const { binary = false, timeoutMs = 30000, log = null, label = "httpsGet", signal } = opts;
+  throwIfAborted(signal);
   return new Promise((resolve, reject) => {
     const urlObj = new URL(url);
     const options = {
@@ -131,13 +133,17 @@ function httpsGet(url, headers, opts = {}) {
       });
     });
 
+    const onAbort = () => req.destroy(abortError(signal, "Request cancelled"));
+    signal?.addEventListener("abort", onAbort, { once: true });
     req.on("timeout", () => {
       req.destroy(new Error(`${label}: request timeout after ${timeoutMs}ms`));
     });
     req.on("error", (err) => {
+      signal?.removeEventListener("abort", onAbort);
       if (log) log(`${label}: request error ${err.message}`);
       reject(err);
     });
+    req.on("close", () => signal?.removeEventListener("abort", onAbort));
     req.end();
   });
 }
@@ -151,7 +157,8 @@ function httpsPut(url, headers, body, opts = {}) {
 }
 
 function httpsSend(method, url, headers, body, opts = {}) {
-  const { timeoutMs = 30000, log = null, label = "httpsSend" } = opts;
+  const { timeoutMs = 30000, log = null, label = "httpsSend", signal } = opts;
+  throwIfAborted(signal);
   return new Promise((resolve, reject) => {
     const urlObj = new URL(url);
     const bodyBuffer = body == null
@@ -185,13 +192,17 @@ function httpsSend(method, url, headers, body, opts = {}) {
       });
     });
 
+    const onAbort = () => req.destroy(abortError(signal, "Request cancelled"));
+    signal?.addEventListener("abort", onAbort, { once: true });
     req.on("timeout", () => {
       req.destroy(new Error(`${label}: request timeout after ${timeoutMs}ms`));
     });
     req.on("error", (err) => {
+      signal?.removeEventListener("abort", onAbort);
       if (log) log(`${label}: request error ${err.message}`);
       reject(err);
     });
+    req.on("close", () => signal?.removeEventListener("abort", onAbort));
     if (bodyBuffer) req.write(bodyBuffer);
     req.end();
   });
@@ -292,14 +303,49 @@ function ensureFullSizeImageUrl(url) {
   return `${url}=s2048`;
 }
 
+function getFirstStringAtPaths(value, paths) {
+  for (const pathParts of paths) {
+    const found = getNestedValue(value, pathParts, "");
+    if (typeof found === "string" && found.trim()) return found;
+  }
+  return "";
+}
+
+const GEMINI_TEXT_PATHS = [
+  [1, 0],
+  [1, 0, 0],
+  [1, 0, 1],
+  [1, 1, 0],
+  [2, 0],
+  [22, 0],
+];
+
+const GEMINI_CARD_CONTENT_RE = /^http:\/\/googleusercontent\.com\/card_content\/\d+/;
+const GEMINI_CARD_ALT_PATHS = [[22, 0], [1, 1, 0], [2, 0]];
+
+function resolveCandidateText(candidate) {
+  const textRaw = getFirstStringAtPaths(candidate, GEMINI_TEXT_PATHS);
+  if (GEMINI_CARD_CONTENT_RE.test(textRaw)) {
+    return getFirstStringAtPaths(candidate, GEMINI_CARD_ALT_PATHS) || textRaw;
+  }
+  return textRaw;
+}
+
+// An unresolved card_content placeholder URL is not answer text; score it zero.
+function candidateTextScore(candidate) {
+  const resolved = resolveCandidateText(candidate);
+  return GEMINI_CARD_CONTENT_RE.test(resolved) ? 0 : resolved.length;
+}
+
 function parseGeminiStreamGenerateResponse(rawText) {
   const responseJson = JSON.parse(trimGeminiJsonEnvelope(rawText));
   const errorCode = extractErrorCode(responseJson);
 
   const parts = Array.isArray(responseJson) ? responseJson : [];
-  let bodyIndex = 0;
   let body = null;
-  
+  let bestTextLength = -1;
+
+  // Stream chunks are cumulative; the longest text is the most complete answer.
   for (let i = 0; i < parts.length; i++) {
     const partBody = getNestedValue(parts[i], [2], null);
     if (!partBody) continue;
@@ -307,9 +353,14 @@ function parseGeminiStreamGenerateResponse(rawText) {
       const parsed = JSON.parse(partBody);
       const candidateList = getNestedValue(parsed, [4], []);
       if (Array.isArray(candidateList) && candidateList.length > 0) {
-        bodyIndex = i;
-        body = parsed;
-        break;
+        if (!body) {
+          body = parsed;
+        }
+        const score = candidateTextScore(candidateList[0]);
+        if (score > bestTextLength) {
+          bestTextLength = score;
+          body = parsed;
+        }
       }
     } catch {
       // ignore
@@ -318,11 +369,7 @@ function parseGeminiStreamGenerateResponse(rawText) {
 
   const candidateList = getNestedValue(body, [4], []);
   const firstCandidate = candidateList[0];
-  const textRaw = getNestedValue(firstCandidate, [1, 0], "");
-  const cardContent = /^http:\/\/googleusercontent\.com\/card_content\/\d+/.test(textRaw);
-  const text = cardContent
-    ? (getNestedValue(firstCandidate, [22, 0], null) ?? textRaw)
-    : textRaw;
+  const text = resolveCandidateText(firstCandidate);
   const thoughts = getNestedValue(firstCandidate, [37, 0, 0], null);
   const metadata = getNestedValue(body, [1], []);
 
@@ -341,27 +388,23 @@ function parseGeminiStreamGenerateResponse(rawText) {
     });
   }
 
-  // Generated images
-  const hasGenerated = Boolean(getNestedValue(firstCandidate, [12, 7, 0], null));
-  if (hasGenerated) {
-    let imgBody = null;
-    for (let i = bodyIndex; i < parts.length; i++) {
-      const partBody = getNestedValue(parts[i], [2], null);
-      if (!partBody) continue;
-      try {
-        const parsed = JSON.parse(partBody);
-        const candidateImages = getNestedValue(parsed, [4, 0, 12, 7, 0], null);
-        if (candidateImages != null) {
-          imgBody = parsed;
-          break;
-        }
-      } catch {
-        // ignore
+  // Keep the last chunk with a non-empty image list; a trailing empty must not erase it.
+  let imgBody = null;
+  for (let i = 0; i < parts.length; i++) {
+    const partBody = getNestedValue(parts[i], [2], null);
+    if (!partBody) continue;
+    try {
+      const parsed = JSON.parse(partBody);
+      const imgs = getNestedValue(parsed, [4, 0, 12, 7, 0], null);
+      if (Array.isArray(imgs) && imgs.length > 0) {
+        imgBody = parsed;
       }
+    } catch {
+      // ignore
     }
-
-    const imgCandidate = getNestedValue(imgBody ?? body, [4, 0], null);
-    const generated = getNestedValue(imgCandidate, [12, 7, 0], []);
+  }
+  if (imgBody) {
+    const generated = getNestedValue(imgBody, [4, 0, 12, 7, 0], []);
     for (const genImage of generated) {
       const url = getNestedValue(genImage, [0, 3, 3], null);
       if (!url) continue;
@@ -517,16 +560,17 @@ function buildGeminiFReqPayload(prompt, uploaded, chatMetadata) {
 }
 
 async function runGeminiWebOnce(input) {
-  const { prompt, files, model, cookieMap, chatMetadata, timeoutMs = 30000, log = null } = input;
+  const { prompt, files, model, cookieMap, chatMetadata, timeoutMs = 30000, log = null, signal } = input;
+  throwIfAborted(signal);
   const cookieHeader = buildCookieHeader(cookieMap);
   
   // 1. Get access token
-  const at = await fetchGeminiAccessToken(cookieMap, { timeoutMs, log, label: "geminiAccessToken" });
+  const at = await fetchGeminiAccessToken(cookieMap, { timeoutMs, log, label: "geminiAccessToken", signal });
 
   // 2. Upload files
   const uploaded = [];
   for (const file of files ?? []) {
-    uploaded.push(await uploadGeminiFile(file, cookieMap, { timeoutMs, log, label: "geminiUpload" }));
+    uploaded.push(await uploadGeminiFile(file, cookieMap, { timeoutMs, log, label: "geminiUpload", signal }));
   }
 
   // 3. Build request
@@ -543,8 +587,8 @@ async function runGeminiWebOnce(input) {
     "referer": "https://gemini.google.com/",
     "x-same-domain": "1",
     "cookie": cookieHeader,
-    [MODEL_HEADER_NAME]: MODEL_HEADERS[model] || MODEL_HEADERS["gemini-3-pro"],
-  }, params.toString(), { timeoutMs, log, label: "geminiStreamGenerate" });
+    [MODEL_HEADER_NAME]: MODEL_HEADERS[model] || MODEL_HEADERS["gemini-3.1-pro"],
+  }, params.toString(), { timeoutMs, log, label: "geminiStreamGenerate", signal });
 
   const rawResponseText = res.text;
   
@@ -591,12 +635,13 @@ async function runGeminiWebOnce(input) {
 }
 
 async function runGeminiWebWithFallback(input) {
+  throwIfAborted(input.signal);
   const attempt = await runGeminiWebOnce(input);
   
   // Auto-fallback to flash if model unavailable
-  if (isModelUnavailable(attempt.errorCode) && input.model !== "gemini-2.5-flash") {
-    const fallback = await runGeminiWebOnce({ ...input, model: "gemini-2.5-flash" });
-    return { ...fallback, effectiveModel: "gemini-2.5-flash" };
+  if (isModelUnavailable(attempt.errorCode) && input.model !== "gemini-3.5-flash") {
+    const fallback = await runGeminiWebOnce({ ...input, model: "gemini-3.5-flash" });
+    return { ...fallback, effectiveModel: "gemini-3.5-flash" };
   }
   
   return { ...attempt, effectiveModel: input.model };
@@ -607,7 +652,14 @@ async function runGeminiWebWithFallback(input) {
 // ============================================================================
 
 async function runGeminiWebViaPage(input) {
-  const { prompt, files, model, timeoutMs = 120000, log = null, createTab, closeTab, jsEval, fetchUrl, uploadFile } = input;
+  const { prompt, files, model, timeoutMs = 120000, log = null, createTab, closeTab, jsEval, fetchUrl, uploadFile, signal } = input;
+  throwIfAborted(signal);
+  const guardedUploadFile = uploadFile
+    ? (...args) => raceAbort(() => uploadFile(...args), signal)
+    : uploadFile;
+  const guardedFetchUrl = fetchUrl
+    ? (...args) => raceAbort(() => fetchUrl(...args), signal)
+    : fetchUrl;
 
   if (!createTab || !closeTab || !jsEval) {
     throw new Error("In-page execution requires createTab, closeTab, and jsEval callbacks");
@@ -616,19 +668,19 @@ async function runGeminiWebViaPage(input) {
   let tabId = null;
   try {
     if (log) log("Creating Gemini tab...");
-    const tabResult = await createTab();
+    const tabResult = await raceAbort(createTab, signal);
     tabId = tabResult?.tabId;
     if (!tabId) throw new Error("Failed to create Gemini tab");
     if (log) log(`Gemini tab created: ${tabId}`);
-    await new Promise(r => setTimeout(r, 12000));
+    await abortableDelay(12000, signal);
 
     if (files?.length && uploadFile) {
       const absFiles = files.map(f => path.resolve(process.cwd(), f));
       if (log) log(`Uploading ${absFiles.length} file(s) via file chooser...`);
-      const result = await uploadFile(tabId, absFiles);
+      const result = await guardedUploadFile(tabId, absFiles);
       if (result?.error) throw new Error(`File upload failed: ${result.error}`);
       if (log) log("File uploaded, waiting for processing...");
-      await new Promise(r => setTimeout(r, 3000));
+      await abortableDelay(3000, signal);
     }
 
     const checkJsResult = (result, context) => {
@@ -638,20 +690,20 @@ async function runGeminiWebViaPage(input) {
     };
 
     // Type prompt
-    const fullPrompt = prompt.replace(/\\/g, "\\\\").replace(/'/g, "\\'").replace(/\n/g, "\\n").replace(/\r/g, "\\r");
+    const promptJson = JSON.stringify(prompt);
     if (log) log("Typing prompt...");
-    const typeResult = await jsEval(tabId, `
+    const typeResult = await jsEval(tabId, `(() => {
       const editor = document.querySelector('.ql-editor[contenteditable=true]');
       if (!editor) return JSON.stringify({ error: "No editor found on page" });
       editor.focus();
       document.execCommand('selectAll', false, null);
-      document.execCommand('insertText', false, '${fullPrompt}');
+      document.execCommand('insertText', false, ${promptJson});
       return JSON.stringify({ ok: true, len: editor.textContent.length });
-    `);
+    })()`);
     const typed = JSON.parse(JSON.parse(checkJsResult(typeResult, "Type prompt")));
     if (typed.error) throw new Error(typed.error);
 
-    const beforeResult = await jsEval(tabId, `
+    const beforeResult = await jsEval(tabId, `(() => {
       const imageKey = (img) => {
         const url = img.currentSrc || img.src || "";
         return url + "|" + img.naturalWidth + "x" + img.naturalHeight;
@@ -665,16 +717,16 @@ async function runGeminiWebViaPage(input) {
         })
         .map(imageKey);
       return JSON.stringify(baselineKeys);
-    `);
+    })()`);
     const baselineImageKeys = JSON.parse(JSON.parse(checkJsResult(beforeResult, "Count images")) || "[]");
 
     if (log) log("Submitting...");
-    const sendResult = await jsEval(tabId, `
+    const sendResult = await jsEval(tabId, `(() => {
       const btn = document.querySelector('button[aria-label="Send message"]');
       if (!btn) return 'no-btn';
       btn.click();
       return 'sent';
-    `);
+    })()`);
     const sendVal = JSON.parse(checkJsResult(sendResult, "Click send"));
     if (sendVal === "no-btn") throw new Error("Send button not found on Gemini page");
 
@@ -685,8 +737,8 @@ async function runGeminiWebViaPage(input) {
     let responseText = "";
 
     while (Date.now() < deadline) {
-      await new Promise(r => setTimeout(r, 2000));
-      const pollResult = await jsEval(tabId, `
+      await abortableDelay(2000, signal);
+      const pollResult = await jsEval(tabId, `(async () => {
         const baselineKeys = new Set(${JSON.stringify(baselineImageKeys)});
         const imageKey = (img) => {
           const url = img.currentSrc || img.src || "";
@@ -729,7 +781,7 @@ async function runGeminiWebViaPage(input) {
         const lastTurn = turns.length ? turns[turns.length - 1] : null;
         const text = lastTurn ? lastTurn.textContent?.trim() : "";
         return JSON.stringify({ images, loading, text, turns: turns.length });
-      `);
+      })()`);
       const poll = JSON.parse(JSON.parse(checkJsResult(pollResult, "Poll response")));
       const newImgs = poll.images || [];
 
@@ -758,7 +810,7 @@ async function runGeminiWebViaPage(input) {
         const chunkSize = 40000;
         let type = img.type || "image/png";
         while (true) {
-          const chunkResult = await jsEval(tabId, `
+          const chunkResult = await jsEval(tabId, `(() => {
             const item = window.__surfGeminiBlobImages?.[${img.blobIndex}];
             if (!item) return JSON.stringify({ error: "Blob image not found" });
             return JSON.stringify({
@@ -767,7 +819,7 @@ async function runGeminiWebViaPage(input) {
               type: item.type || "image/png",
               url: item.url,
             });
-          `);
+          })()`);
           const chunk = JSON.parse(JSON.parse(checkJsResult(chunkResult, "Read blob image chunk")));
           if (chunk.error) throw new Error(chunk.error);
           b64 += chunk.chunk || "";
@@ -780,7 +832,7 @@ async function runGeminiWebViaPage(input) {
       }
       if (img?.url && fetchUrl) {
         if (log) log(`Downloading image (${img.url.slice(0, 60)}...)...`);
-        const dlResult = await fetchUrl(img.url);
+        const dlResult = await guardedFetchUrl(img.url);
         if (dlResult?.b64) {
           images.push({ url: img.url, b64: dlResult.b64, type: dlResult.type || "image/png" });
         }
@@ -798,7 +850,13 @@ async function runGeminiWebViaPage(input) {
       _pageTabId: tabId,
     };
   } catch (err) {
-    if (tabId) { try { await closeTab(tabId); } catch {} }
+    if (tabId) {
+      try {
+        await closeTab(tabId);
+      } catch (closeError) {
+        log?.(`Failed to close Gemini tab ${tabId}: ${closeError?.message || closeError}`);
+      }
+    }
     throw err;
   }
 }
@@ -810,7 +868,7 @@ async function runGeminiWebViaPage(input) {
 async function query(options) {
   const {
     prompt,
-    model = "gemini-3-pro",
+    model = "gemini-3.1-pro",
     file,
     generateImage,
     editImage,
@@ -825,14 +883,17 @@ async function query(options) {
     uploadFile,
     timeout = 300000,
     log = () => {},
+    signal,
   } = options;
+  throwIfAborted(signal);
   const hasPageCallbacks = !!(createTab && closeTab && jsEval);
+  const guardedJsEval = (...args) => raceAbort(() => jsEval(...args), signal);
 
   const startTime = Date.now();
   log("Starting Gemini query");
 
   // 1. Get cookies from Chrome
-  const cookieResponse = await getCookies();
+  const cookieResponse = await raceAbort(getCookies, signal);
   const cookies = cookieResponse?.cookies;
   if (!Array.isArray(cookies)) {
     throw new Error("Failed to get cookies from Chrome. Make sure the extension is loaded and Chrome is running.");
@@ -846,7 +907,13 @@ async function query(options) {
   log(`Got ${Object.keys(cookieMap).length} Gemini cookies`);
 
   // 2. Resolve model
-  const resolvedModel = MODEL_HEADERS[model] ? model : "gemini-3-pro";
+  let resolvedModel;
+  if (MODEL_HEADERS[model]) {
+    resolvedModel = model;
+  } else {
+    resolvedModel = "gemini-3.1-pro";
+    log(`Unknown Gemini model "${model}"; using "${resolvedModel}"`);
+  }
 
   // 3. Build prompt
   let fullPrompt = prompt || "";
@@ -883,16 +950,17 @@ async function query(options) {
         log,
         createTab,
         closeTab,
-        jsEval,
+        jsEval: guardedJsEval,
         fetchUrl,
         uploadFile,
+        signal,
       });
 
       response = out;
       
       // Save output image
       const outputPath = output || generateImage || "edited.png";
-      const saveOpts = { timeoutMs: timeout, log };
+      const saveOpts = { timeoutMs: timeout, log, signal };
       if (fetchUrl) saveOpts.fetchUrl = fetchUrl;
       try {
         const imageSave = await saveFirstGeminiImage(out, cookieMap, outputPath, saveOpts);
@@ -900,7 +968,13 @@ async function query(options) {
           throw new Error(`No images generated. Response: ${out.text?.slice(0, 200) || "(empty)"}`);
         }
       } finally {
-        if (out._pageTabId && closeTab) { try { await closeTab(out._pageTabId); } catch {} }
+        if (out._pageTabId && closeTab) {
+          try {
+            await closeTab(out._pageTabId);
+          } catch (closeError) {
+            log(`Failed to close Gemini tab ${out._pageTabId}: ${closeError?.message || closeError}`);
+          }
+        }
       }
       imagePath = outputPath;
       
@@ -916,8 +990,9 @@ async function query(options) {
           log,
           createTab,
           closeTab,
-          jsEval,
+          jsEval: guardedJsEval,
           fetchUrl,
+          signal,
         });
       } else {
         out = await runGeminiWebWithFallback({
@@ -928,13 +1003,14 @@ async function query(options) {
           chatMetadata: null,
           timeoutMs: timeout,
           log,
+          signal,
         });
       }
 
       response = out;
       
       // Save output image
-      const saveOpts = { timeoutMs: timeout, log };
+      const saveOpts = { timeoutMs: timeout, log, signal };
       if (fetchUrl) saveOpts.fetchUrl = fetchUrl;
       try {
         const imageSave = await saveFirstGeminiImage(out, cookieMap, generateImage, saveOpts);
@@ -942,7 +1018,13 @@ async function query(options) {
           throw new Error(`No images generated. Response: ${out.text?.slice(0, 200) || "(empty)"}`);
         }
       } finally {
-        if (out._pageTabId && closeTab) { try { await closeTab(out._pageTabId); } catch {} }
+        if (out._pageTabId && closeTab) {
+          try {
+            await closeTab(out._pageTabId);
+          } catch (closeError) {
+            log(`Failed to close Gemini tab ${out._pageTabId}: ${closeError?.message || closeError}`);
+          }
+        }
       }
       imagePath = generateImage;
       
@@ -957,11 +1039,13 @@ async function query(options) {
         chatMetadata: null,
         timeoutMs: timeout,
         log,
+        signal,
       });
 
       response = out;
     }
   } catch (error) {
+    if (error?.code === "SURF_REQUEST_ABORTED") throw error;
     throw new Error(`Gemini request failed: ${error.message}`);
   }
 
@@ -983,6 +1067,7 @@ async function query(options) {
 // ============================================================================
 
 module.exports = {
+  httpsGet,
   query,
   hasRequiredCookies,
   buildCookieMap,

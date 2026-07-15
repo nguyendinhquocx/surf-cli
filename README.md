@@ -43,7 +43,7 @@ Surf takes a different approach:
 |---------|------|-------|------------------|--------------|-------------|
 | Agent-agnostic | Yes | No (Manus only) | No (Claude only) | Partial | No (Claude skill) |
 | Zero config | Yes | No (subscription) | No (subscription) | No (MCP setup) | No (relay server) |
-| Local-only | Yes | No (cloud) | Partial | Yes | Partial |
+| Self-hosted (local or Tailnet) | Yes | No (cloud) | Partial | Yes | Partial |
 | CLI interface | Yes | No | No | No | No |
 | Free | Yes | No | No | Yes | Yes |
 | AI via browser cookies | Yes | No | No | No | No |
@@ -108,6 +108,88 @@ surf uninstall --all            # All browsers + wrapper files
 surf uninstall --target linux   # Remove WSLg/Linux-browser config from WSL2
 ```
 
+### Remote Surf over Tailscale
+
+Remote Surf runs the browser and native host on one Tailnet machine while the CLI runs on another. The listener is available only while the browser extension's native-messaging connection is alive. Tailnet reachability is not authorization: every remote client also needs its own Surf credential.
+
+On the browser host, authorize a client before installing the listener:
+
+```bash
+surf remote authorize agent-macbook --output ~/agent-macbook.surf-credential.json
+surf remote list
+surf install <extension-id> --listen 100.101.102.103:4321
+```
+
+`authorize` creates a mode-0600 credential containing the client's Ed25519 private identity and the pinned host identity. Move it to that client through an existing secure channel, then remove the generated copy from the host if it is no longer needed there. The host keeps only the client's public identity in `~/.surf/remote/remote-clients.json`.
+
+From the authorized client:
+
+```bash
+surf --remote 100.101.102.103:4321 \
+  --remote-credential ~/.config/surf/agent-macbook.json \
+  tab.list
+
+# Environment equivalent
+SURF_REMOTE=100.101.102.103:4321 \
+SURF_REMOTE_CREDENTIAL=~/.config/surf/agent-macbook.json \
+  surf tab.list
+```
+
+Surf performs mutual Ed25519 challenge-response with fresh nonces and checks authorization throughout the connection. A credential grants the same browser and host-file authority as a trusted local Surf user. Give each client its own credential, do not share it, and revoke it immediately if the client or file is lost:
+
+```bash
+surf remote revoke agent-macbook
+surf remote list
+```
+
+`--remote <host>:<port>` takes precedence over `SURF_REMOTE`; `--remote-credential` takes precedence over `SURF_REMOTE_CREDENTIAL`. A selected remote endpoint overrides `SURF_SOCKET` and the default local socket. Local and remote requests share one bounded FIFO browser lease, so they cannot race each other. Disconnects and timeouts abort queued or in-flight work and hold the lease until request-owned cleanup drains or the hard deadline is reached. Browser side effects that already completed are not rolled back.
+
+`surf install --listen` persists the explicit Tailnet address in the native-host wrapper. Re-run `surf install` without `--listen` to remove it. The address must be a Tailscale IPv4 or IPv6 address with a port; Surf does not bind every interface. Remote listeners currently require a POSIX browser host and are not supported by Windows native-host wrappers.
+
+Keep Tailscale policy restrictions as defense in depth. For example:
+
+```json
+{
+  "acls": [
+    {
+      "action": "accept",
+      "src": ["tag:surf-agent"],
+      "dst": ["tag:surf-browser:4321"]
+    }
+  ]
+}
+```
+
+Adapt tags and ports to your Tailnet. Surf authentication does not replace Tailnet policy, and Surf does not add a separate TLS or SSH tunnel.
+
+**Operations and troubleshooting**
+
+```bash
+tailscale status
+tailscale ping 100.101.102.103
+surf doctor --remote 100.101.102.103:4321 \
+  --remote-credential ~/.config/surf/agent-macbook.json
+```
+
+Use `tailscale status` and `tailscale ping` to confirm reachability, then use `doctor` to verify endpoint selection and authentication.
+
+**Remote filesystem and transfer semantics**
+
+Unprefixed paths and `local:` paths refer to the client. Only `remote:/absolute/path` refers directly to the browser host. For example:
+
+```bash
+surf --remote "$SURF_REMOTE" --remote-credential "$SURF_REMOTE_CREDENTIAL" \
+  upload --ref e5 --files ./client-file.pdf
+surf --remote "$SURF_REMOTE" --remote-credential "$SURF_REMOTE_CREDENTIAL" \
+  screenshot --output local:./shot.png
+surf --remote "$SURF_REMOTE" --remote-credential "$SURF_REMOTE_CREDENTIAL" \
+  network.export --output remote:/var/tmp/network.har --har
+```
+
+Client-local inputs are staged privately on the host and removed after the request. Client-local outputs are downloaded with size/hash verification and atomic destination replacement. `surf js --file` and `perf-audit --output` are handled by the client itself. `network.export` defaults to a generated client-local `.json`, `.jsonl`, or `.har` path. Gemini edits default to client-local `edited.png`. Successful remote actions transfer their automatic screenshot to a generated client-local path; `--auto-capture` on failure remains a separate screenshot and console diagnostic.
+
+The remote single-file boundary supports one `upload` file, one ChatGPT attachment, or one Gemini attachment/edit input, plus one screenshot, network export, or Gemini image output. Transfers are limited to 256 MiB per file, 512 MiB and 32 files per connection, with 256 KiB decoded chunks. Remote `record`, `aistudio.build`, smoke screenshot directories, directory transfer, and multi-file inputs are intentionally rejected. A `remote:` path bypasses transfer and gives the trusted client direct authority over that absolute host path.
+
 ### Development Setup
 
 ```bash
@@ -146,6 +228,7 @@ surf read --no-text                 # Accessibility tree only (no text)
 surf read --depth 3                 # Limit tree depth (smaller output)
 surf read --compact                 # Remove empty structural elements
 surf read --depth 3 --compact       # Both (60% smaller output)
+surf read --max-bytes 2000          # Cap visible text on a UTF-8 byte boundary
 surf page.text                      # Raw text content only
 surf page.state                     # Modals, loading state, scroll position
 ```
@@ -184,6 +267,7 @@ surf frame.switch --selector "#checkout-frame"  # Switch by CSS selector
 # Now all commands target the iframe
 surf read                           # Read iframe content
 surf click e5                       # Click in iframe
+surf type "4242" --into "#card-number"
 surf locate.role button --action click
 
 surf frame.main                     # Return to main page
@@ -195,8 +279,9 @@ surf frame.main                     # Return to main page
 surf click e5                       # Click by element ref
 surf click --selector ".btn"        # Click by CSS selector
 surf click 100 200                  # Click by coordinates
-surf type "hello" --submit          # Type and press Enter
-surf type "email@example.com" --ref e12  # Type into specific element
+surf type "hello" --submit          # Type at the current focus with CDP events
+surf type "email@example.com" --ref e12  # Fill an element from page.read
+surf type "hello" --into "#message"     # Fill a selector in the active frame
 surf key Escape                     # Press key
 surf scroll down 800                # Scroll down 800px
 surf scroll bottom                  # Scroll to bottom
@@ -252,6 +337,7 @@ surf tab.list
 surf tab.new "https://example.com"
 surf tab.switch 123
 surf tab.close 123
+surf tab.move 123 --to-window 456   # Move one tab; use --ids 123,124 for several
 surf tab.name "dashboard"           # Name current tab
 surf tab.switch "dashboard"         # Switch by name
 surf tab.group --name "Work" --color blue
@@ -377,7 +463,7 @@ surf gemini "analyze" --file data.csv                         # Attach file
 surf gemini "a robot surfing" --generate-image /tmp/robot.png # Generate image
 surf gemini "add sunglasses" --edit-image photo.jpg --output out.jpg
 surf gemini "summarize" --youtube "https://youtube.com/..."   # YouTube analysis
-surf gemini "hello" --model gemini-2.5-flash                  # Model selection
+surf gemini "hello" --model gemini-3.5-flash                  # Model selection
 
 # Perplexity
 surf perplexity "what is quantum computing"
@@ -609,6 +695,10 @@ surf workflow.validate ./my-workflow.json
 ```bash
 SURF_NETWORK_PATH         # Path for network capture logs (default: /tmp/surf)
 SURF_SOCKET               # Socket path or named pipe (default: /tmp/surf.sock, Windows: //./pipe/surf)
+SURF_REMOTE               # Remote Surf endpoint as host:port (overrides SURF_SOCKET)
+SURF_REMOTE_CREDENTIAL    # Client Ed25519 credential for the selected remote endpoint
+SURF_REMOTE_STATE_DIR     # Host identity/authorization directory (default: ~/.surf/remote)
+SURF_LISTEN               # Native-host Tailnet bind address as <tailscale-ip>:<port>
 SURF_NODE_PATH            # Path to node binary (for native host wrapper)
 SURF_HOST_PATH            # Path to native/host.cjs (for native host wrapper)
 SURF_EXTENSION_PATH       # Path to extension dist/ directory
@@ -616,6 +706,10 @@ SURF_EXTENSION_PATH       # Path to extension dist/ directory
 
 **Use cases:**
 - `SURF_SOCKET`: Advanced socket override. Set it for both the native host and CLI if you need a non-default socket, including separate sockets for separate browser/profile instances in hard-isolated multi-agent workflows. Each socket gets an independent request lock.
+- `SURF_REMOTE`: Remote client endpoint. `--remote <host>:<port>` overrides it; both override `SURF_SOCKET`.
+- `SURF_REMOTE_CREDENTIAL`: Credential used for mutual remote authentication. `--remote-credential <path>` overrides it.
+- `SURF_REMOTE_STATE_DIR`: Advanced host-side override for the mode-0700 identity and client registry directory.
+- `SURF_LISTEN`: Native-host listener address on the browser machine. Use `surf install ... --listen <tailscale-ip>:<port>` to persist it in that host's wrapper.
 - `SURF_NODE_PATH` / `SURF_HOST_PATH`: Package manager installs (e.g., Nix) that store binaries in non-standard locations
 - `SURF_EXTENSION_PATH`: Package managers that create stable symlinks instead of changing paths on reinstall
 

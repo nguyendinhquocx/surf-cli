@@ -1258,16 +1258,63 @@ function setFormValue(ref: string, value: string | boolean | number): { success:
   }
 }
 
-function getPageText(): { text: string; title: string; url: string; error?: string } {
+function smartType(selector: string, text: string, clear = true, submit = false): { success: boolean; contentEditable?: boolean; error?: string } {
+  try {
+    const element = document.querySelector(selector) as HTMLElement | null;
+    if (!element) return { success: false, error: `Element not found: ${selector}` };
+
+    const contentEditableChild = element.querySelector<HTMLElement>('[contenteditable="true"]');
+    const target = contentEditableChild || element;
+    const contentEditable = element.isContentEditable || !!contentEditableChild;
+    target.focus();
+
+    if (clear) {
+      if (contentEditable) target.textContent = "";
+      else (target as HTMLInputElement | HTMLTextAreaElement).value = "";
+    }
+
+    if (contentEditable) target.textContent = text;
+    else (target as HTMLInputElement | HTMLTextAreaElement).value = text;
+
+    target.dispatchEvent(new Event("input", { bubbles: true }));
+    target.dispatchEvent(new Event("change", { bubbles: true }));
+
+    if (submit) {
+      const form = element.closest("form");
+      const submitButton = form?.querySelector<HTMLElement>('button[type="submit"], input[type="submit"]')
+        || document.querySelector<HTMLElement>('button[type="submit"], button[data-testid*="send"], button[aria-label*="Send"]');
+      if (submitButton) submitButton.click();
+      else if (form) form.dispatchEvent(new Event("submit", { bubbles: true }));
+      else target.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", code: "Enter", keyCode: 13, bubbles: true }));
+    }
+
+    return { success: true, contentEditable };
+  } catch (err) {
+    return { success: false, error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+function truncateToUtf8Bytes(input: string, maxBytes: number): string {
+  const encoder = new TextEncoder();
+  const encoded = encoder.encode(input);
+  if (encoded.length <= maxBytes) return input;
+  let end = maxBytes;
+  while (end > 0 && (encoded[end] & 0xc0) === 0x80) end--;
+  return new TextDecoder("utf-8", { fatal: false }).decode(encoded.subarray(0, end));
+}
+
+function getPageText(options: { maxBytes?: number } = {}): { text: string; title: string; url: string; error?: string } {
   try {
     const article = document.querySelector("article");
     const main = document.querySelector("main");
     const content = article || main || document.body;
 
-    const text = content.textContent
+    const normalized = content.textContent
       ?.replace(/\s+/g, " ")
-      .trim()
-      .substring(0, 50000) || "";
+      .trim() || "";
+    const text = Number.isFinite(options.maxBytes) && options.maxBytes! > 0
+      ? truncateToUtf8Bytes(normalized, options.maxBytes!)
+      : normalized.substring(0, 50000);
 
     return {
       text,
@@ -1467,8 +1514,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       break;
     }
     case "GET_PAGE_TEXT": {
-      const result = getPageText();
+      const result = getPageText(message.options || {});
       sendResponse(result);
+      break;
+    }
+    case "SMART_TYPE": {
+      sendResponse(smartType(message.selector, message.text, message.clear, message.submit));
       break;
     }
     case "GET_FRAME_BY_SELECTOR": {
