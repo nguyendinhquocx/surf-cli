@@ -23,6 +23,9 @@ class FakeElement extends FakeNode {
   disabled = false;
   indeterminate = false;
   checked = false;
+  focused = false;
+  clicked = false;
+  isContentEditable = false;
 
   private attrs = new Map<string, string>();
 
@@ -80,6 +83,18 @@ class FakeElement extends FakeNode {
     return null;
   }
 
+  focus(): void {
+    this.focused = true;
+  }
+
+  click(): void {
+    this.clicked = true;
+  }
+
+  dispatchEvent(): boolean {
+    return true;
+  }
+
   getBoundingClientRect(): { top: number; bottom: number; left: number; right: number } {
     return { top: 0, bottom: 10, left: 0, right: 10 };
   }
@@ -122,6 +137,7 @@ describe("accessibility tree", () => {
     (globalThis as any).window = {
       innerWidth: 1024,
       innerHeight: 768,
+      location: { href: "https://example.test/page" },
       getComputedStyle: () => ({
         display: "block",
         visibility: "visible",
@@ -132,6 +148,7 @@ describe("accessibility tree", () => {
 
     (globalThis as any).document = {
       body: new FakeElement("body"),
+      title: "Example",
       getElementById: () => null,
       querySelector: () => null,
       querySelectorAll: () => [],
@@ -175,5 +192,74 @@ describe("accessibility tree", () => {
     expect(response.error).toBeUndefined();
     expect(response.pageContent).toContain('link "Read docs"');
     expect(response.pageContent).toContain('button "Save changes"');
+  });
+
+  it("caps visible text in compact mode", () => {
+    (document.body as unknown as FakeElement).append(text("abcdef"));
+
+    let response: any;
+    messageHandler?.(
+      { type: "GET_PAGE_TEXT", options: { compact: true, maxBytes: 3 } },
+      {},
+      (result) => {
+        response = result;
+      },
+    );
+
+    expect(response).toMatchObject({
+      text: "abc",
+      title: "Example",
+      url: "https://example.test/page",
+    });
+  });
+
+  it("preserves the existing 50000-character default when max-bytes is not given", () => {
+    const long = "😀".repeat(30000);
+    (document.body as unknown as FakeElement).append(text(long));
+
+    let response: any;
+    messageHandler?.({ type: "GET_PAGE_TEXT", options: { compact: true } }, {}, (result) => {
+      response = result;
+    });
+
+    expect(response.text.length).toBe(50000);
+    expect(new TextEncoder().encode(response.text).length).toBe(100000);
+  });
+
+  it("types into a selector in the content-script frame", () => {
+    const input = new FakeInputElement("input");
+    (document as any).querySelector = (selector: string) => (selector === "#target" ? input : null);
+
+    let response: any;
+    messageHandler?.(
+      { type: "SMART_TYPE", selector: "#target", text: "hello", clear: true, submit: false },
+      {},
+      (result) => {
+        response = result;
+      },
+    );
+
+    expect(input.focused).toBe(true);
+    expect(input.value).toBe("hello");
+    expect(response).toEqual({ success: true, contentEditable: false });
+  });
+
+  it("truncates multi-byte utf-8 text on a byte boundary, not a surrogate", () => {
+    (document.body as unknown as FakeElement).append(text("😀😀"));
+
+    let response: any;
+    messageHandler?.(
+      { type: "GET_PAGE_TEXT", options: { compact: true, maxBytes: 3 } },
+      {},
+      (result) => {
+        response = result;
+      },
+    );
+
+    expect(response.text).not.toContain("\uD83D");
+    expect(response.text).not.toContain("\uDE00");
+    const byteLen = new TextEncoder().encode(response.text).length;
+    expect(byteLen).toBeLessThanOrEqual(3);
+    expect(response.text).toBe("");
   });
 });

@@ -471,11 +471,16 @@ function mapComputerAction(args, tabId) {
       if (ref) return { type: "CLICK_REF", ref, button: "triple", ...baseMsg };
       return { type: "EXECUTE_TRIPLE_CLICK", x: coordinate?.[0], y: coordinate?.[1], modifiers, ...baseMsg };
     
-    case "type":
+    case "type": {
       if (ref) {
         return { type: "FORM_FILL", data: [{ ref, value: text }], ...baseMsg };
       }
+      const typeSelector = a.selector || a.into;
+      if (typeSelector) {
+        return { type: "SMART_TYPE", selector: typeSelector, text, clear: a.clear ?? true, submit: a.submit ?? false, ...baseMsg };
+      }
       return { type: "EXECUTE_TYPE", text, ...baseMsg };
+    }
     
     case "key": {
       const keyValue = a.key || text;
@@ -798,6 +803,12 @@ function mapToolToMessage(tool, args, tabId) {
       }
       return { type: "CLOSE_TAB", tabId: id, tabIds: ids };
     }
+    case "tab.move": {
+      const id = a.id || a.tab_id || a.tabId;
+      const ids = a.ids || a.tab_ids || a.tabIds;
+      const windowId = a["to-window"] || a.toWindow || a.window_id || a.windowId;
+      return { type: "TAB_MOVE", tabId: id, tabIds: ids, windowId, index: a.index };
+    }
     case "tab.name":
       return { type: "TABS_REGISTER", name: a.name, ...baseMsg };
     case "tab.unname":
@@ -890,18 +901,32 @@ function mapToolToMessage(tool, args, tabId) {
     case "upload":
       const files = a.files ? (typeof a.files === "string" ? a.files.split(",").map(f => f.trim()) : a.files) : [];
       return { type: "UPLOAD_FILE", ref: a.ref, files, ...baseMsg };
-    case "page.read":
-      return { 
-        type: "READ_PAGE", 
-        options: { 
-          filter: a.filter || "interactive", 
-          refId: a.ref, 
+    case "page.read": {
+      let maxBytes;
+      if (a["max-bytes"] !== undefined) {
+        const raw = String(a["max-bytes"]).trim();
+        if (!/^\d+$/.test(raw) || raw === "0") {
+          throw new Error("max-bytes must be a positive integer");
+        }
+        maxBytes = parseInt(raw, 10);
+        if (!Number.isFinite(maxBytes) || maxBytes <= 0) {
+          throw new Error("max-bytes must be a positive integer");
+        }
+      }
+      return {
+        type: "READ_PAGE",
+        options: {
+          filter: a.filter || "interactive",
+          refId: a.ref,
           includeText: a["no-text"] !== true,
           depth: a.depth !== undefined ? parseInt(a.depth, 10) : undefined,
           compact: a.compact || false,
-        }, 
-        ...baseMsg 
+          maxBytes,
+          forceFullSnapshot: a.compact === true || maxBytes !== undefined,
+        },
+        ...baseMsg
       };
+    }
     case "page.text":
       return { type: "GET_PAGE_TEXT", ...baseMsg };
     case "page.state":
@@ -1081,7 +1106,7 @@ function mapToolToMessage(tool, args, tabId) {
       return {
         type: "GEMINI_QUERY",
         query: a.query,
-        model: a.model || "gemini-3-pro",
+        model: a.model || "gemini-3.1-pro",
         withPage: a["with-page"],
         file: a.file,
         generateImage: a["generate-image"],

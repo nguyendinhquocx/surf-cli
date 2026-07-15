@@ -146,6 +146,7 @@ surf read --no-text                 # Accessibility tree only (no text)
 surf read --depth 3                 # Limit tree depth (smaller output)
 surf read --compact                 # Remove empty structural elements
 surf read --depth 3 --compact       # Both (60% smaller output)
+surf read --max-bytes 2000          # Cap visible text on a UTF-8 byte boundary
 surf page.text                      # Raw text content only
 surf page.state                     # Modals, loading state, scroll position
 ```
@@ -184,6 +185,7 @@ surf frame.switch --selector "#checkout-frame"  # Switch by CSS selector
 # Now all commands target the iframe
 surf read                           # Read iframe content
 surf click e5                       # Click in iframe
+surf type "4242" --into "#card-number"
 surf locate.role button --action click
 
 surf frame.main                     # Return to main page
@@ -195,8 +197,9 @@ surf frame.main                     # Return to main page
 surf click e5                       # Click by element ref
 surf click --selector ".btn"        # Click by CSS selector
 surf click 100 200                  # Click by coordinates
-surf type "hello" --submit          # Type and press Enter
-surf type "email@example.com" --ref e12  # Type into specific element
+surf type "hello" --submit          # Type at the current focus with CDP events
+surf type "email@example.com" --ref e12  # Fill an element from page.read
+surf type "hello" --into "#message"     # Fill a selector in the active frame
 surf key Escape                     # Press key
 surf scroll down 800                # Scroll down 800px
 surf scroll bottom                  # Scroll to bottom
@@ -252,6 +255,7 @@ surf tab.list
 surf tab.new "https://example.com"
 surf tab.switch 123
 surf tab.close 123
+surf tab.move 123 --to-window 456   # Move one tab; use --ids 123,124 for several
 surf tab.name "dashboard"           # Name current tab
 surf tab.switch "dashboard"         # Switch by name
 surf tab.group --name "Work" --color blue
@@ -377,7 +381,7 @@ surf gemini "analyze" --file data.csv                         # Attach file
 surf gemini "a robot surfing" --generate-image /tmp/robot.png # Generate image
 surf gemini "add sunglasses" --edit-image photo.jpg --output out.jpg
 surf gemini "summarize" --youtube "https://youtube.com/..."   # YouTube analysis
-surf gemini "hello" --model gemini-2.5-flash                  # Model selection
+surf gemini "hello" --model gemini-3.5-flash                  # Model selection
 
 # Perplexity
 surf perplexity "what is quantum computing"

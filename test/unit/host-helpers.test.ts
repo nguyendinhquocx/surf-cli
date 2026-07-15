@@ -90,6 +90,20 @@ describe("mapToolToMessage", () => {
       expect(msg.type).toBe("NEW_TAB");
       expect(msg.url).toBe("https://example.com");
     });
+
+    it("maps tab.move to TAB_MOVE", () => {
+      const msg = helpers.mapToolToMessage("tab.move", {
+        id: "123",
+        "to-window": "456",
+        index: "0",
+      });
+      expect(msg).toMatchObject({
+        type: "TAB_MOVE",
+        tabId: "123",
+        windowId: "456",
+        index: "0",
+      });
+    });
   });
 
   describe("aistudio commands", () => {
@@ -113,6 +127,80 @@ describe("mapToolToMessage", () => {
         model: "gemini-flash-lite-latest",
       });
       expect(msg.model).toBe("gemini-flash-lite-latest");
+    });
+  });
+
+  describe("page.read command", () => {
+    it("maps compact max-bytes to READ_PAGE options", () => {
+      const msg = helpers.mapToolToMessage("page.read", {
+        compact: true,
+        "max-bytes": "1200",
+        depth: "2",
+      });
+      expect(msg).toMatchObject({
+        type: "READ_PAGE",
+        options: {
+          compact: true,
+          maxBytes: 1200,
+          depth: 2,
+          forceFullSnapshot: true,
+        },
+      });
+    });
+
+    it("throws when max-bytes is not a positive integer", () => {
+      for (const bad of ["abc", "0", "-5", "12abc", "1.5", " ", ""]) {
+        expect(() => helpers.mapToolToMessage("page.read", { "max-bytes": bad })).toThrow(
+          /max-bytes must be a positive integer/,
+        );
+      }
+    });
+
+    it("accepts a valid positive integer max-bytes", () => {
+      const msg = helpers.mapToolToMessage("page.read", { "max-bytes": "1200" });
+      expect(msg.options.maxBytes).toBe(1200);
+      expect(msg.options.forceFullSnapshot).toBe(true);
+    });
+  });
+
+  describe("type command", () => {
+    it("routes a selector target to SMART_TYPE", () => {
+      const msg = helpers.mapToolToMessage("type", { text: "hello", selector: "#i" });
+      expect(msg.type).toBe("SMART_TYPE");
+      expect(msg.selector).toBe("#i");
+      expect(msg.text).toBe("hello");
+      expect(msg.clear).toBe(true);
+      expect(msg.submit).toBe(false);
+    });
+
+    it("routes an --into target to SMART_TYPE without CLI normalization", () => {
+      const msg = helpers.mapToolToMessage("type", { text: "hello", into: "#target" });
+      expect(msg.type).toBe("SMART_TYPE");
+      expect(msg.selector).toBe("#target");
+    });
+
+    it("honors submit and clear flags on a selector target", () => {
+      const msg = helpers.mapToolToMessage("type", {
+        text: "hello",
+        selector: "#i",
+        clear: false,
+        submit: true,
+      });
+      expect(msg.type).toBe("SMART_TYPE");
+      expect(msg.clear).toBe(false);
+      expect(msg.submit).toBe(true);
+    });
+
+    it("uses FORM_FILL for a ref target", () => {
+      const msg = helpers.mapToolToMessage("type", { text: "hello", ref: "e1" });
+      expect(msg.type).toBe("FORM_FILL");
+      expect(msg.data).toEqual([{ ref: "e1", value: "hello" }]);
+    });
+
+    it("falls back to cursor typing with no target", () => {
+      const msg = helpers.mapToolToMessage("type", { text: "hello" });
+      expect(msg.type).toBe("EXECUTE_TYPE");
+      expect(msg.text).toBe("hello");
     });
   });
 
@@ -205,6 +293,13 @@ describe("mapToolToMessage", () => {
       expect(() => helpers.mapToolToMessage("perf-audit", { trigger: true })).toThrow(
         "trigger must be action:target",
       );
+    });
+  });
+
+  describe("zoom command", () => {
+    it("maps zoom level to ZOOM_SET", () => {
+      const msg = helpers.mapToolToMessage("zoom", { level: "1.5" }, 123);
+      expect(msg).toMatchObject({ type: "ZOOM_SET", level: 1.5, tabId: 123 });
     });
   });
 

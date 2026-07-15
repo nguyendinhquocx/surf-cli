@@ -5,6 +5,16 @@ const { extractGrokResponse, normalizeGrokModelLabel } = grokClient;
 
 describe("grok-client", () => {
   describe("extractGrokResponse", () => {
+    it("extracts a short non-numeric answer", () => {
+      const bodyText = `Grok
+reply with the word pong. nothing else.
+pong
+Think Harder`;
+
+      const result = extractGrokResponse(bodyText, "reply with the word pong. nothing else.");
+      expect(result).toBe("pong");
+    });
+
     it("extracts simple numeric answer", () => {
       const bodyText = `Home
 Explore
@@ -15,7 +25,9 @@ What is 2+2? Reply with just the number.
 Explain basic arithmetic
 Think Harder`;
 
-      const result = extractGrokResponse(bodyText, "What is 2+2? Reply with just the number.");
+      const result = extractGrokResponse(bodyText, "What is 2+2? Reply with just the number.", [
+        "Explain basic arithmetic",
+      ]);
       expect(result).toBe("4");
     });
 
@@ -30,7 +42,7 @@ Green
 Tell me more
 Think Harder`;
 
-      const result = extractGrokResponse(bodyText, "Name 3 colors");
+      const result = extractGrokResponse(bodyText, "Name 3 colors", ["Tell me more"]);
       expect(result).toBe("Here are 3 colors:\nBlue\nRed\nGreen");
     });
 
@@ -42,7 +54,7 @@ What is 7*8?
 Explain multiplication
 Think Harder`;
 
-      const result = extractGrokResponse(bodyText, "What is 7*8?");
+      const result = extractGrokResponse(bodyText, "What is 7*8?", ["Explain multiplication"]);
       expect(result).toBe("7 × 8 = 56");
     });
 
@@ -57,7 +69,10 @@ What is 5*5?
 Explain multiplication
 Think Harder`;
 
-      const result = extractGrokResponse(bodyText, "What is 5*5?");
+      const result = extractGrokResponse(bodyText, "What is 5*5?", [
+        "Explain basic arithmetic",
+        "Explain multiplication",
+      ]);
       expect(result).toBe("25");
     });
 
@@ -93,8 +108,26 @@ Share greetings in other languages
 Fun icebreaker questions
 Make it more playful`;
 
-      const result = extractGrokResponse(bodyText, "say hello in 3 words");
+      const result = extractGrokResponse(bodyText, "say hello in 3 words", [
+        "Share greetings in other languages",
+        "Fun icebreaker questions",
+        "Make it more playful",
+      ]);
       expect(result).toBe("Hello there, friend!");
+    });
+
+    it("keeps an answer line that coincidentally matches a chip when the real chips still trail it", () => {
+      const bodyText = `Grok
+name a fruit
+Exotic tropical fruits list
+Nutritional benefits of apples
+Exotic tropical fruits list`;
+
+      const result = extractGrokResponse(bodyText, "name a fruit", [
+        "Nutritional benefits of apples",
+        "Exotic tropical fruits list",
+      ]);
+      expect(result).toBe("Exotic tropical fruits list");
     });
 
     it("trims suggested follow-ups without depending on fixed prefixes", () => {
@@ -105,7 +138,10 @@ It's the ratio of a circle's circumference to its diameter
 Compare circle constants
 Derive it geometrically`;
 
-      const result = extractGrokResponse(bodyText, "What is pi?");
+      const result = extractGrokResponse(bodyText, "What is pi?", [
+        "Compare circle constants",
+        "Derive it geometrically",
+      ]);
       expect(result).toBe(
         "Pi is approximately 3.14159\nIt's the ratio of a circle's circumference to its diameter",
       );
@@ -128,6 +164,52 @@ Hello there`;
 
       const result = extractGrokResponse(bodyText, "Give a two-line casual answer");
       expect(result).toBe("Sure thing.\nHello there");
+    });
+
+    it("drops suggestion chips captured as DOM buttons even when the answer is chip-shaped", () => {
+      const bodyText = `Grok
+Reply with exactly this and nothing else: alpha bravo charlie delta echo foxtrot
+alpha bravo charlie delta echo foxtrot
+Explore NATO phonetic alphabet origins
+Learn about military radio procedures`;
+
+      const result = extractGrokResponse(
+        bodyText,
+        "Reply with exactly this and nothing else: alpha bravo charlie delta echo foxtrot",
+        ["Explore NATO phonetic alphabet origins", "Learn about military radio procedures"],
+      );
+      expect(result).toBe("alpha bravo charlie delta echo foxtrot");
+    });
+
+    it("keeps a lone lowercase punctuation-free answer", () => {
+      const bodyText = `Grok
+say the code
+pong ping`;
+
+      const result = extractGrokResponse(bodyText, "say the code");
+      expect(result).toBe("pong ping");
+    });
+
+    it("keeps an answer that matches a chip label, dropping only the trailing chip", () => {
+      const bodyText = `Grok
+Give one action item
+Explore the repository
+Explore the repository`;
+
+      const result = extractGrokResponse(bodyText, "Give one action item", [
+        "Explore the repository",
+      ]);
+      expect(result).toBe("Explore the repository");
+    });
+
+    it("keeps verb-led answer lines that are not DOM chip buttons", () => {
+      const bodyText = `Grok
+Give two action items
+Explore the repository
+Learn the deployment steps`;
+
+      const result = extractGrokResponse(bodyText, "Give two action items", []);
+      expect(result).toBe("Explore the repository\nLearn the deployment steps");
     });
 
     it("returns null for empty body", () => {
@@ -154,7 +236,7 @@ What's 2+2?
 4
 Explain`;
 
-      const result = extractGrokResponse(bodyText, "What's 2+2?");
+      const result = extractGrokResponse(bodyText, "What's 2+2?", ["Explain"]);
       expect(result).toBe("4");
     });
 
@@ -198,6 +280,63 @@ Think Harder`;
 
     it("returns false for non-array", () => {
       expect(grokClient.hasRequiredCookies({} as unknown as [])).toBe(false);
+    });
+  });
+
+  describe("waitForResponse", () => {
+    it("completes when a short extracted answer is stable and generation stopped", async () => {
+      await expect(
+        grokClient.waitForResponse(
+          async () => ({
+            result: {
+              value: {
+                bodyText: `Grok
+reply with the word pong. nothing else.
+pong`,
+                responseText: `reply with the word pong. nothing else.
+pong`,
+                bodyLength: 50,
+                hasStopBtn: false,
+                thinkingDone: false,
+                thinkingSecs: null,
+                isThinking: false,
+                url: "https://x.com/i/grok",
+              },
+            },
+          }),
+          5000,
+          "reply with the word pong. nothing else.",
+        ),
+      ).resolves.toMatchObject({ text: "pong" });
+    });
+
+    it("does not complete from a stale thinking marker while the current response is still changing", async () => {
+      let calls = 0;
+      const result = await grokClient.waitForResponse(
+        async () => {
+          calls++;
+          const currentText = calls < 3 ? "p" : "pong";
+          return {
+            result: {
+              value: {
+                bodyText: `Thought for 4s\nreply with one word\n${currentText}`,
+                responseText: `reply with one word\n${currentText}`,
+                bodyLength: 50 + currentText.length,
+                hasStopBtn: false,
+                thinkingDone: true,
+                thinkingSecs: 4,
+                isThinking: calls < 3,
+                url: "https://x.com/i/grok",
+              },
+            },
+          };
+        },
+        5000,
+        "reply with one word",
+      );
+
+      expect(result.text).toBe("pong");
+      expect(calls).toBe(3);
     });
   });
 

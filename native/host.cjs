@@ -688,7 +688,7 @@ function handleToolRequest(msg, socket) {
       // 3. Call Gemini client
       const result = await geminiClient.query({
         prompt: fullPrompt,
-        model: model || "gemini-3-pro",
+        model: model || "gemini-3.1-pro",
         file,
         generateImage,
         editImage,

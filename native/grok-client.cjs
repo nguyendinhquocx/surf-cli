@@ -450,52 +450,16 @@ async function submitPrompt(cdp, inputCdp) {
 // Response Handling
 // ============================================================================
 
-function looksLikeTrailingSuggestion(line) {
-  if (!line || line.length < 4 || line.length > 90) return false;
-  if (/[.!:;)]$/.test(line)) return false;
-  const words = line.split(/\s+/).filter(Boolean);
-  if (words.length < 2 || words.length > 9) return false;
-  if (/^[-*•\d]/.test(line)) return false;
-  if (/\b(https?:\/\/|www\.)\b/i.test(line)) return false;
-  return true;
-}
-
-function trimTrailingSuggestionLines(lines) {
-  let end = lines.length;
-  while (end > 0 && looksLikeTrailingSuggestion(lines[end - 1])) {
-    end--;
-  }
-
-  const trimmedCount = lines.length - end;
-  if (trimmedCount >= 2 && end > 0) {
-    return lines.slice(0, end);
-  }
-
-  const last = lines[lines.length - 1];
-  if (
-    trimmedCount === 1 &&
-    lines.length > 1 &&
-    /^(explain|tell|share|compare|derive|make|show|summari[sz]e|expand|rewrite)\b/i.test(last)
-  ) {
-    return lines.slice(0, -1);
-  }
-
-  const previous = lines[lines.length - 2];
-  if (
-    last &&
-    previous &&
-    /^[A-Z][a-z]{3,}$/.test(last) &&
-    /(?:[.!?)]|^\d+(?:\.\d+)?$)/.test(previous)
-  ) {
-    return lines.slice(0, -1);
-  }
-
-  return lines;
-}
-
 // Extract Grok's response from the full page body text
-function extractGrokResponse(bodyText, userPrompt = '') {
+function extractGrokResponse(bodyText, userPrompt = '', chipTexts = []) {
   if (!bodyText) return null;
+
+  // Suggestion chips are captured from the DOM as button texts; count occurrences.
+  const chipCounts = new Map();
+  for (const t of chipTexts || []) {
+    const key = String(t).trim();
+    if (key) chipCounts.set(key, (chipCounts.get(key) || 0) + 1);
+  }
 
   // Split into lines and filter out navigation/UI elements
   const lines = bodyText.split('\n').map(l => l.trim()).filter(l => l);
@@ -543,7 +507,15 @@ function extractGrokResponse(bodyText, userPrompt = '') {
     contentLines.push(line);
   }
 
-  const responseLines = trimTrailingSuggestionLines(contentLines);
+  // Chips follow the answer; strip trailing chip lines but never the first line.
+  let contentEnd = contentLines.length;
+  while (contentEnd > 1) {
+    const remaining = chipCounts.get(contentLines[contentEnd - 1]) || 0;
+    if (remaining <= 0) break;
+    chipCounts.set(contentLines[contentEnd - 1], remaining - 1);
+    contentEnd--;
+  }
+  const responseLines = contentLines.slice(0, contentEnd);
 
   // If we found content after the question, return the response
   if (responseLines.length > 0) {
@@ -569,6 +541,7 @@ async function waitForResponse(cdp, timeoutMs = 300000, userPrompt = '') {
   const deadline = Date.now() + timeoutMs;
   let previousText = '';
   let previousLength = 0;
+  let lastChipTexts = [];
   let lastChangeAt = Date.now();
   let thinkingTime = null;
   let thinkingComplete = false;
@@ -583,43 +556,54 @@ async function waitForResponse(cdp, timeoutMs = 300000, userPrompt = '') {
       // Check for stop/cancel button (indicates still generating)
       const hasStopBtn = !!document.querySelector('button[aria-label*="Stop"], button[aria-label*="stop"], button[aria-label*="Cancel"]');
 
-      // Check for "Thought for Xs" which indicates thinking model completed thinking
-      const thinkMatch = bodyText.match(/Thought for (\\d+)s/i);
-      const thinkingDone = !!thinkMatch;
-      const thinkingSecs = thinkMatch ? parseInt(thinkMatch[1], 10) : null;
-
-      // Check if actively showing "thinking..." or similar loading state
-      const isThinking = /\\bthinking\\.\\.\\./i.test(bodyText) ||
-                         /\\bSearching\\.\\.\\./i.test(bodyText) ||
-                         bodyText.includes('Grok is thinking') ||
-                         bodyText.includes('is thinking...');
-
       // Try to find the actual Grok response in the DOM
       // Look for the main content area - Grok responses appear in the conversation area
       let responseText = '';
+      let responseRoot = null;
+      let preciseRoot = false;
 
       // Strategy 1: Look for article elements or main content containers
       const articles = document.querySelectorAll('article');
       if (articles.length > 0) {
         // Get the last article which should be the response
-        const lastArticle = articles[articles.length - 1];
-        responseText = lastArticle.innerText || '';
+        responseRoot = articles[articles.length - 1];
+        responseText = responseRoot.innerText || '';
+        preciseRoot = true;
       }
 
       // Strategy 2: If no articles, look for the conversation container
       if (!responseText) {
         const convArea = document.querySelector('[data-testid="conversation"], [role="main"] > div > div');
         if (convArea) {
+          responseRoot = convArea;
           responseText = convArea.innerText || '';
+          preciseRoot = true;
         }
       }
 
       // Strategy 3: Fallback to looking for text after common Grok UI patterns
       if (!responseText || responseText.length < 10) {
         // Find content between user question and follow-up suggestions
-        const mainArea = document.querySelector('main') || document.body;
-        responseText = mainArea.innerText || bodyText;
+        responseRoot = document.querySelector('main') || document.body;
+        responseText = responseRoot.innerText || bodyText;
+        preciseRoot = false;
       }
+
+      // Completion state must come from the current response container. Page-wide markers can belong to an earlier turn and would make a new short response finish prematurely.
+      const currentStateText = preciseRoot && responseRoot ? (responseRoot.innerText || '') : '';
+      const thinkMatch = currentStateText.match(/Thought for (\\d+)s/i);
+      const thinkingDone = !!thinkMatch;
+      const thinkingSecs = thinkMatch ? parseInt(thinkMatch[1], 10) : null;
+      const isThinking = /\\bthinking\\.\\.\\./i.test(currentStateText) ||
+                         /\\bSearching\\.\\.\\./i.test(currentStateText) ||
+                         currentStateText.includes('Grok is thinking') ||
+                         currentStateText.includes('is thinking...');
+
+      // Suggestion chips are the no-testid/no-aria-label buttons inside the response container. Only collect them from a precise container: a broad main/body fallback holds unrelated buttons that could erase a matching answer line.
+      const chipTexts = (preciseRoot && responseRoot ? Array.from(responseRoot.querySelectorAll('button')) : [])
+        .filter(function(b){ return !b.getAttribute('data-testid') && !b.getAttribute('aria-label'); })
+        .map(function(b){ return (b.innerText || '').trim(); })
+        .filter(function(t){ return t && !t.includes('\\n') && t.length <= 120; });
 
       return {
         bodyText: bodyText,
@@ -629,6 +613,7 @@ async function waitForResponse(cdp, timeoutMs = 300000, userPrompt = '') {
         thinkingDone: thinkingDone,
         thinkingSecs: thinkingSecs,
         isThinking: isThinking,
+        chipTexts: chipTexts,
         url: location.href
       };
     })()`);
@@ -657,12 +642,14 @@ async function waitForResponse(cdp, timeoutMs = 300000, userPrompt = '') {
     }
 
     // Extract the actual response text - try DOM-extracted first, fall back to body parsing
+    const chipTexts = snapshot.chipTexts || [];
+    lastChipTexts = chipTexts;
     let currentResponseText = '';
     if (snapshot.responseText && snapshot.responseText.length > 10) {
-      currentResponseText = extractGrokResponse(snapshot.responseText, userPrompt) || '';
+      currentResponseText = extractGrokResponse(snapshot.responseText, userPrompt, chipTexts) || '';
     }
     if (!currentResponseText || currentResponseText.length < 5) {
-      currentResponseText = extractGrokResponse(bodyText, userPrompt) || '';
+      currentResponseText = extractGrokResponse(bodyText, userPrompt, chipTexts) || '';
     }
 
     // Track RESPONSE text stability (more reliable than body text)
@@ -681,24 +668,24 @@ async function waitForResponse(cdp, timeoutMs = 300000, userPrompt = '') {
     }
 
     const stableMs = Date.now() - lastChangeAt;
-    const noStopButton = !snapshot.hasStopBtn;
+    const noStopButton = !snapshot.hasStopBtn && !snapshot.isThinking;
 
     // Response is stable if the extracted response text hasn't changed
     // Use shorter thresholds since we're checking actual content, not noisy body text
     // 4 cycles (1.2s) + 1.5s minimum is enough for response stability
-    const responseIsStable = responseStableCycles >= 4 && stableMs >= 1500 && currentResponseText.length > 10;
+    const responseIsStable = responseStableCycles >= 4 && stableMs >= 1500 && currentResponseText.trim().length > 0;
 
     // "Thought for Xs" is the strongest completion signal - response is definitely done
     const thinkingModelDone = snapshot.thinkingDone && noStopButton;
 
     // SIMPLE CHECK: If we have response content, no stop button, and stable for 3+ cycles
-    const hasResponseNoStop = currentResponseText.length > 5 && noStopButton && responseStableCycles >= 3;
+    const hasResponseNoStop = currentResponseText.trim().length > 0 && noStopButton && responseStableCycles >= 3;
 
     // Response is complete when:
-    // 1. Has meaningful response content (> 5 chars)
+    // 1. Has any non-empty extracted text
     // 2. No stop button
     // 3. Either: thinking done, response stable for 3+ cycles, OR stable for 4+ cycles with 1.5s
-    const isDone = currentResponseText.length > 5 && noStopButton &&
+    const isDone = currentResponseText.trim().length > 0 && noStopButton &&
                    (thinkingModelDone || hasResponseNoStop || responseIsStable);
 
     if (isDone) {
@@ -713,8 +700,8 @@ async function waitForResponse(cdp, timeoutMs = 300000, userPrompt = '') {
   }
 
   // Timeout - return whatever we have (partial response is better than nothing)
-  const finalText = extractGrokResponse(previousText, userPrompt);
-  if (finalText && finalText.length > 10) {
+  const finalText = extractGrokResponse(previousText, userPrompt, lastChipTexts);
+  if (finalText && finalText.trim().length > 0) {
     return {
       text: finalText,
       thinkingTime: thinkingTime,
@@ -1067,6 +1054,7 @@ module.exports = {
   normalizeGrokModelLabel,
   getGrokModelMatchLabels,
   grokModelLabelsMatch,
+  waitForResponse,
   GROK_URL,
   GROK_MODELS,
   DEFAULT_GROK_MODELS,

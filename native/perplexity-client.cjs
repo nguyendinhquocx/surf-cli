@@ -371,6 +371,25 @@ async function submitPrompt(cdp, inputCdp) {
 // Response Handling
 // ============================================================================
 
+function extractPerplexityResponseText() {
+  const selectors = [
+    '[id^="markdown-content"]',
+    '[data-testid="answer"]',
+    'article',
+    '.prose',
+  ];
+
+  for (const selector of selectors) {
+    const elements = Array.from(document.querySelectorAll(selector));
+    for (let i = elements.length - 1; i >= 0; i--) {
+      const text = elements[i].innerText?.trim() || '';
+      if (text) return text;
+    }
+  }
+
+  return '';
+}
+
 async function waitForResponse(cdp, timeoutMs = 120000) {
   const deadline = Date.now() + timeoutMs;
   let previousText = '';
@@ -395,8 +414,7 @@ async function waitForResponse(cdp, timeoutMs = 120000) {
   // Now poll for response completion
   while (Date.now() < deadline) {
     const snapshot = await evaluate(cdp, `(function() {
-      const prose = document.querySelector('.prose');
-      const text = prose ? prose.innerText : '';
+      const text = (${extractPerplexityResponseText.toString()})();
       const hasStop = !!document.querySelector('button[aria-label*=stop], button[aria-label*=Stop]');
       const hasCopy = !!document.querySelector('button[aria-label*=copy], button[aria-label*=Copy]');
       const hasRelated = document.body.innerText.indexOf('Related') > -1;
@@ -437,7 +455,7 @@ async function waitForResponse(cdp, timeoutMs = 120000) {
     const hasCompletionIndicators = snapshot.hasActions || snapshot.hasRelated || snapshot.hasFollowUp;
     const isDone = !snapshot.generating && (hasCompletionIndicators || isStable);
     
-    if (isDone && currentText.length > 20) {
+    if (isDone && currentText.trim().length > 0) {
       // Clean up the response text
       let cleanText = currentText;
       
@@ -458,7 +476,7 @@ async function waitForResponse(cdp, timeoutMs = 120000) {
   }
   
   // Timeout - return whatever we have
-  if (previousText.length > 20) {
+  if (previousText.trim().length > 0) {
     return {
       text: previousText,
       sources: 0,
@@ -562,4 +580,4 @@ async function query(options) {
   }
 }
 
-module.exports = { query, PERPLEXITY_URL };
+module.exports = { query, PERPLEXITY_URL, waitForResponse, extractPerplexityResponseText };

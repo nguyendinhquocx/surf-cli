@@ -405,7 +405,7 @@ const TOOLS = {
         args: ["query"],
         opts: {
           "with-page": "Include current page context",
-          model: "Model: gemini-3-pro (default), gemini-2.5-pro, gemini-2.5-flash",
+          model: "Model: gemini-3.1-pro (default), gemini-3.5-flash, gemini-3.1-flash-lite",
           file: "Attach file to analyze",
           "generate-image": "Generate image and save to path",
           "edit-image": "Edit existing image (use with --output)",
@@ -527,6 +527,12 @@ const TOOLS = {
         args: ["id"],
         opts: { ids: "Close multiple tabs" },
         examples: [{ cmd: "tab.close 123", desc: "Close tab" }]
+      },
+      "tab.move": {
+        desc: "Move tab to another window",
+        args: ["id"],
+        opts: { ids: "Move multiple tabs", "to-window": "Destination window ID", index: "Destination index" },
+        examples: [{ cmd: "tab.move 123 --to-window 456", desc: "Move tab to window" }]
       },
       "tab.name": {
         desc: "Register current tab with a name",
@@ -675,6 +681,7 @@ const TOOLS = {
           "no-text": "Exclude visible text content",
           depth: "Maximum tree depth (default: unlimited)",
           compact: "Remove empty structural elements",
+          "max-bytes": "Maximum visible text bytes",
         },
         examples: [
           { cmd: "page.read", desc: "Interactive elements + text content" },
@@ -682,7 +689,7 @@ const TOOLS = {
           { cmd: "page.read --no-text", desc: "Interactive elements only (no text)" },
           { cmd: "page.read --depth 3", desc: "Limit to 3 levels deep" },
           { cmd: "page.read --compact", desc: "Skip empty containers" },
-          { cmd: "page.read --depth 3 --compact", desc: "Shallow + compact (60% smaller)" },
+          { cmd: "page.read --depth 3 --compact --max-bytes 2000", desc: "Shallow + compact output" },
           { cmd: "read", desc: "Alias" },
         ]
       },
@@ -823,7 +830,7 @@ const TOOLS = {
           ref: "Element ref (uses JS DOM method, more reliable for modals)",
           submit: "Press enter after",
           clear: "Clear first",
-          method: "cdp|js (default: cdp, but ref uses JS automatically)"
+          method: "cdp|js (cursor typing uses CDP; selector/ref targets use JS)"
         },
         examples: [
           { cmd: 'type "hello world"', desc: "Type at cursor (CDP events)" },
@@ -1567,7 +1574,7 @@ const ALL_SOCKET_TOOLS = [
   "computer",
   "page.read", "page.text", "page.state",
   "locate.role", "locate.text", "locate.label",
-  "tab.list", "tab.new", "tab.switch", "tab.close", "tab.name", "tab.unname", "tab.named",
+  "tab.list", "tab.new", "tab.switch", "tab.close", "tab.move", "tab.name", "tab.unname", "tab.named",
   "tab.group", "tab.ungroup", "tab.groups", "tab.reload",
   "scroll.top", "scroll.bottom", "scroll.to", "scroll.info",
   "wait.element", "wait.network", "wait.url", "wait.dom", "wait.load",
@@ -2732,6 +2739,7 @@ const PRIMARY_ARG_MAP = {
   "tab.switch": "id",
   close_tab: "tab_id",
   "tab.close": "id",
+  "tab.move": "id",
   "tab.name": "name",
   "tab.unname": "name",
   scroll_to_position: "position",
@@ -2908,6 +2916,14 @@ if (tool === "gemini") {
   if (toolArgs.file && typeof toolArgs.file === "string") {
     toolArgs.file = path.resolve(toolArgs.file);
   }
+  if (toolArgs.model) {
+    const known = ["gemini-3.1-pro", "gemini-3.5-flash", "gemini-3.1-flash-lite"];
+    if (!known.includes(toolArgs.model)) {
+      process.stderr.write(
+        `warning: unknown Gemini model "${toolArgs.model}"; using "gemini-3.1-pro". Available: ${known.join(", ")}\n`,
+      );
+    }
+  }
 }
 if (tool === "chatgpt" && toolArgs.file) {
   if (Array.isArray(toolArgs.file)) {
@@ -2938,7 +2954,9 @@ const streamMode = toolArgs.stream === true;
 delete toolArgs.stream;
 
 const streamLevel = toolArgs.level;
-delete toolArgs.level;
+if (tool === "console" || tool === "network") {
+  delete toolArgs.level;
+}
 
 const streamFilter = toolArgs.filter;
 delete toolArgs.filter;
@@ -2946,11 +2964,15 @@ delete toolArgs.filter;
 let finalTool = tool;
 if (methodFlag === "js") {
   if (tool === "type") {
-    if (!toolArgs.selector) {
-      console.error("Error: --selector or --into required for type with --method js");
-      process.exit(1);
+    if (toolArgs.ref) {
+      finalTool = "type";
+    } else {
+      if (!toolArgs.selector) {
+        console.error("Error: --selector, --into, or --ref required for type with --method js");
+        process.exit(1);
+      }
+      finalTool = "smart_type";
     }
-    finalTool = "smart_type";
   } else if (tool === "click") {
     if (!toolArgs.selector) {
       console.error("Error: --selector required for click with --method js");
@@ -2961,8 +2983,13 @@ if (methodFlag === "js") {
     finalTool = "js";
   }
 } else if (methodFlag === "cdp") {
+  if (tool === "type" && (toolArgs.selector || toolArgs.ref)) {
+    console.error("Error: --method cdp types at the current focus and cannot be combined with --into, --selector, or --ref");
+    process.exit(1);
+  }
   if (tool === "smart_type") {
-    finalTool = "type";
+    console.error("Error: smart_type uses the JS input path and cannot be combined with --method cdp");
+    process.exit(1);
   }
 }
 

@@ -4,6 +4,12 @@
 
 ### Added
 - **Deep X Research skill** - Added `skills/deep-x-research/`, an agent skill that layers an exhaustive X (Twitter) research procedure on top of `surf grok`: a quota-budgeted multi-angle Grok sweep (keyword + semantic, with DeepSearch), Grok-native video analysis, quota-free URL verification via direct post opens, categorized findings, and a References section where every cited post carries its full post URL. Falls back to the x.com search UI when the Grok quota is exhausted.
+- **Tab movement** - Added `surf tab.move <id> --to-window <id>` with multi-tab and insertion-index support. (@zm2231, #148)
+- **Page text byte limit** - Added `page.read --max-bytes <n>` for UTF-8-safe visible-text truncation without changing the existing default limit. (@zm2231, #148)
+
+### Fixed
+- **Provider response extraction** - Fixed truncated Perplexity answers, trailing Grok suggestion chips, and incomplete Gemini stream/image extraction; refreshed Gemini's selectable web models and unknown-model fallback guidance. (@zm2231, #148)
+- **Browser command edge cases** - Fixed `tab.name` on restricted active pages, `zoom --level` argument loss, and selector-targeted `type --into`; selector typing now follows the active iframe context. (@zm2231, #148)
 
 ### Docs
 - **Skills README** - Documented the two-skill layout (`surf/` reference, `deep-x-research/` procedure) with install steps for Pi, Claude Code, and Codex, and pointed the surf skill's Grok section at `deep-x-research` for exhaustive research tasks.
