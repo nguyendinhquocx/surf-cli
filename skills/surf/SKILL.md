@@ -89,6 +89,8 @@ surf grok "find viral AI posts" --deep-search     # DeepSearch mode
 surf grok "quick question" --model fast           # Models: auto, fast, expert, grok-4.20-beta
 ```
 
+For exhaustive, multi-angle X research with categorized findings and full post-URL traceability, use the `deep-x-research` skill (`skills/deep-x-research/`) instead of a single Grok query.
+
 **Grok Validation & Troubleshooting:**
 ```bash
 # Validate Grok UI and check available models (no query sent)
