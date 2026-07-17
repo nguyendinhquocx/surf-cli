@@ -7,20 +7,23 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
 import { createServer } from "node:http";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
-import puppeteer from "puppeteer";
 
 const execFileAsync = promisify(execFile);
+const require = createRequire(import.meta.url);
 const repo = process.cwd();
 const extensionKey =
   "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEArWZVsRzpoyzuyQFqRzGOnkxv9FNaX/SR/VMw2f9ld+DKmUMxJhi/14olehkLWRJQumFPYTzWr1oqb1LwwI2KhBtn9mbaqzPSrrRGQ1VobTx7ZmxU+ooppXNdb2KGh/WXVqahS0D1nsQplAE6hCqQWPjsPCnXnWjUIH/B0EsInIUDwA8PKfuMG8p2HDlLj8hEpmLwOA48W4aHbl2S6bZHu9O50Lbd0L94aSwJLBNLKuXpBt/kFwlnpHd3zoJme9DIbqnDU/nMNh9SlA+EXRT6FhyiKdo6ZBMdtJeUPLQI2uHeoF8wikkNhIXX/E2EXlBqtZJJaFEi895x2s40+j/iZQIDAQAB"; // gitleaks:allow -- public test manifest key
 const extensionId = "nionemkjcnknfdhdolfloigkhpjnifmf";
+const pinnedChromeVersion = "150.0.7871.24";
 const scratch = mkdtempSync(join(tmpdir(), "surf-real-chrome-"));
 const home = join(scratch, "home");
 const extensionDir = join(scratch, "extension");
@@ -31,6 +34,8 @@ const screenshotPath = join(scratch, "shot.png");
 const hostPidPath = join(scratch, "native-host.pid");
 let browser;
 let browserPid;
+let chromeExecutablePath;
+let puppeteer;
 let server;
 let failure;
 
@@ -107,6 +112,49 @@ try {
   if (!new Set(["darwin", "linux"]).has(process.platform)) {
     throw new Error(`Real Chrome E2E does not support ${process.platform}`);
   }
+
+  const projectPackage = JSON.parse(readFileSync(join(repo, "package.json"), "utf8"));
+  const expectedPuppeteerVersion = projectPackage.devDependencies?.puppeteer;
+  const projectPuppeteerPackagePath = join(repo, "node_modules/puppeteer/package.json");
+  let resolvedPuppeteerPackagePath;
+  try {
+    resolvedPuppeteerPackagePath = require.resolve("puppeteer/package.json");
+  } catch (error) {
+    throw new Error("Project-local Puppeteer is not installed. Run `npm ci` first.", {
+      cause: error,
+    });
+  }
+  if (
+    !existsSync(projectPuppeteerPackagePath) ||
+    realpathSync(resolvedPuppeteerPackagePath) !== realpathSync(projectPuppeteerPackagePath)
+  ) {
+    throw new Error(
+      `Real Chrome E2E resolved Puppeteer outside this project (${resolvedPuppeteerPackagePath}). Run \`npm ci\` first.`,
+    );
+  }
+  const installedPuppeteerVersion = JSON.parse(
+    readFileSync(projectPuppeteerPackagePath, "utf8"),
+  ).version;
+  if (installedPuppeteerVersion !== expectedPuppeteerVersion) {
+    throw new Error(
+      `Expected project-local Puppeteer ${expectedPuppeteerVersion}, found ${installedPuppeteerVersion}. Run \`npm ci\` first.`,
+    );
+  }
+
+  ({ default: puppeteer } = await import("puppeteer"));
+  const browserVersion = await puppeteer.browserVersion();
+  if (browserVersion !== pinnedChromeVersion) {
+    throw new Error(
+      `Puppeteer ${installedPuppeteerVersion} expects Chrome ${browserVersion}, but this test pins ${pinnedChromeVersion}.`,
+    );
+  }
+  chromeExecutablePath = await puppeteer.executablePath();
+  if (!existsSync(chromeExecutablePath)) {
+    throw new Error(
+      `Pinned Chrome for Testing ${pinnedChromeVersion} is not installed. Run \`npx puppeteer browsers install chrome@${pinnedChromeVersion}\`.`,
+    );
+  }
+
   if (extensionIdForKey(extensionKey) !== extensionId) {
     throw new Error("Stable extension key does not match the expected test extension ID");
   }
@@ -309,7 +357,7 @@ try {
   console.log(
     JSON.stringify(
       {
-        chrome: await puppeteer.executablePath(),
+        chrome: chromeExecutablePath,
         extensionId,
         platform: process.platform,
         result: "pass",
