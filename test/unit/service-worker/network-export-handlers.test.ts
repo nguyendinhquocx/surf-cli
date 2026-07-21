@@ -4,12 +4,16 @@ import { createChromeMock, resetChromeMock } from "../../mocks/chrome";
 const cdpState = vi.hoisted(() => ({
   entries: [] as Array<Record<string, unknown>>,
   enableNetworkTracking: vi.fn(),
+  disableNetworkTracking: vi.fn(),
+  drainNetworkEvents: vi.fn(),
   getNetworkEntries: vi.fn(() => cdpState.entries),
 }));
 
 vi.mock("../../../src/cdp/controller", () => ({
   CDPController: class {
     enableNetworkTracking = cdpState.enableNetworkTracking;
+    disableNetworkTracking = cdpState.disableNetworkTracking;
+    drainNetworkEvents = cdpState.drainNetworkEvents;
     getNetworkEntries = cdpState.getNetworkEntries;
   },
 }));
@@ -31,6 +35,8 @@ describe("network export handlers", () => {
     resetChromeMock();
     cdpState.entries = [];
     cdpState.enableNetworkTracking.mockReset();
+    cdpState.disableNetworkTracking.mockReset();
+    cdpState.drainNetworkEvents.mockReset();
     cdpState.getNetworkEntries.mockClear();
   });
 
@@ -43,7 +49,16 @@ describe("network export handlers", () => {
     );
     expect(result).toEqual({ entries: cdpState.entries, har: true, jsonl: false });
     expect(cdpState.enableNetworkTracking).toHaveBeenCalledWith(42);
+    expect(cdpState.drainNetworkEvents).toHaveBeenCalledWith(42);
     expect(cdpState.getNetworkEntries).toHaveBeenCalledWith(42, {});
+  });
+
+  it("stops explicit network capture", async () => {
+    const handleMessage = await loadHandleMessage();
+    await expect(handleMessage({ type: "STOP_NETWORK_CAPTURE", tabId: 42 }, {})).resolves.toEqual({
+      success: true,
+    });
+    expect(cdpState.disableNetworkTracking).toHaveBeenCalledWith(42);
   });
 
   it("rejects entries exceeding the native-message source cap", async () => {

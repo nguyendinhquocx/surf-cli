@@ -23,13 +23,17 @@ const PROVIDER_DEFAULT_TIMEOUT_SECONDS = {
   gemini: 300,
   grok: 300,
   perplexity: 120,
+  "playbook.run": 600,
 };
 
 function resolveRequestDeadlineMs(tool, args = {}) {
   const defaultSeconds = PROVIDER_DEFAULT_TIMEOUT_SECONDS[tool];
   if (defaultSeconds === undefined) return DEFAULT_DEADLINE_MS;
+  const rawTimeout = tool === "playbook.run" && args && typeof args === "object" && !Array.isArray(args)
+    ? args.timeout ?? args.args?.timeout
+    : args?.timeout;
   const requestedSeconds = Number(
-    args && typeof args === "object" && !Array.isArray(args) ? args.timeout : undefined,
+    rawTimeout,
   );
   const seconds = Number.isFinite(requestedSeconds) && requestedSeconds > 0
     ? requestedSeconds

@@ -935,6 +935,63 @@ describe("CDPController", () => {
         maxPostDataSize: 65536,
       });
     });
+
+    it("captures response bodies at loadingFinished and respects disabled mode", async () => {
+      mockChrome.debugger.sendCommand.mockImplementation(
+        async (_target: unknown, method: string) =>
+          method === "Network.getResponseBody"
+            ? { body: '{"items":[1]}', base64Encoded: false }
+            : {},
+      );
+      await controller.enableNetworkTracking(tabId, {
+        bodyMode: "text",
+        perBodyBytes: 1024,
+        totalBytes: 2048,
+      });
+      const dispatch = (method: string, params: Record<string, unknown>) =>
+        (
+          controller as unknown as {
+            handleCDPEvent: (tab: number, event: string, value: unknown) => Promise<void> | void;
+          }
+        ).handleCDPEvent(tabId, method, params);
+      const emitRequest = async (requestId: string, encodedDataLength: number) => {
+        await dispatch("Network.requestWillBeSent", {
+          requestId,
+          timestamp: 1,
+          request: { url: `https://example.test/${requestId}`, method: "GET", headers: {} },
+        });
+        await dispatch("Network.responseReceived", {
+          requestId,
+          timestamp: 1.01,
+          response: {
+            status: 200,
+            statusText: "OK",
+            mimeType: "application/json",
+            headers: { "content-type": "application/json" },
+          },
+        });
+        await dispatch("Network.loadingFinished", {
+          requestId,
+          timestamp: 1.02,
+          encodedDataLength,
+        });
+      };
+
+      await emitRequest("req-1", 13);
+      expect(controller.getNetworkEntries(tabId)[0]).toMatchObject({
+        responseBody: '{"items":[1]}',
+        bodyCapture: { mode: "text", complete: true, capturedBytes: 13 },
+      });
+
+      controller.clearNetworkRequests(tabId);
+      await controller.enableNetworkTracking(tabId, { bodyMode: "none" });
+      await emitRequest("req-2", 10);
+      expect(controller.getNetworkEntries(tabId)[0].bodyCapture).toEqual({
+        mode: "none",
+        complete: false,
+        reason: "disabled",
+      });
+    });
   });
 
   describe("handleDialog", () => {
