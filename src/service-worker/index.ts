@@ -2259,12 +2259,62 @@ export async function handleMessage(
       return { success: true };
     }
 
+    case "START_NETWORK_CAPTURE": {
+      if (!tabId) throw new Error("No tabId provided");
+      cdp.clearNetworkRequests(tabId);
+      await cdp.enableNetworkTracking(tabId, {
+        bodyMode: message.bodyMode || "text",
+        perBodyBytes: message.perBodyBytes,
+        totalBytes: message.totalBodyBytes,
+      });
+      return { success: true };
+    }
+
+    case "STOP_NETWORK_CAPTURE": {
+      if (!tabId) throw new Error("No tabId provided");
+      await cdp.disableNetworkTracking(tabId);
+      return { success: true };
+    }
+
+    case "GET_PLAYBOOK_RECORD_CONTEXT": {
+      if (!tabId) throw new Error("No tabId provided");
+      const tab = await chrome.tabs.get(tabId);
+      let origin: string | undefined;
+      try {
+        if (tab.url) {
+          const parsed = new URL(tab.url);
+          if (parsed.protocol === "http:" || parsed.protocol === "https:") origin = parsed.origin;
+        }
+      } catch {}
+      return { success: true, origin, url: tab.url };
+    }
+
+    case "START_PLAYBOOK_WATCH": {
+      if (!tabId) throw new Error("No tabId provided");
+      await chrome.tabs.sendMessage(tabId, { type: "PLAYBOOK_WATCH_START", includeInputValues: message.includeInputValues === true }, { frameId: 0 });
+      return { success: true };
+    }
+
+    case "STOP_PLAYBOOK_WATCH": {
+      if (!tabId) throw new Error("No tabId provided");
+      await chrome.tabs.sendMessage(tabId, { type: "PLAYBOOK_WATCH_STOP" }, { frameId: 0 }).catch(() => {});
+      return { success: true };
+    }
+
+    case "PLAYBOOK_WATCH_EVENT": {
+      postToNativeHost({ ...message, tabId: sender.tab?.id, type: "PLAYBOOK_WATCH_EVENT" });
+      return { success: true };
+    }
+
     case "READ_NETWORK_REQUESTS": {
       if (!tabId) throw new Error("No tabId provided");
 
       try {
-        await cdp.enableNetworkTracking(tabId);
+        if (message.bodyMode !== undefined || message.perBodyBytes !== undefined || message.totalBodyBytes !== undefined) {
+          await cdp.enableNetworkTracking(tabId, { bodyMode: message.bodyMode, perBodyBytes: message.perBodyBytes, totalBytes: message.totalBodyBytes });
+        } else await cdp.enableNetworkTracking(tabId);
       } catch (e) {}
+      await cdp.drainNetworkEvents(tabId);
 
       // If full flag is passed, use getNetworkEntries for rich data
       if (message.full) {
@@ -2327,8 +2377,11 @@ export async function handleMessage(
       if (!tabId) throw new Error("No tabId provided");
       if (message.har && message.jsonl) throw new Error("network export cannot combine HAR and JSONL");
       try {
-        await cdp.enableNetworkTracking(tabId);
+        if (message.bodyMode !== undefined || message.perBodyBytes !== undefined || message.totalBodyBytes !== undefined) {
+          await cdp.enableNetworkTracking(tabId, { bodyMode: message.bodyMode, perBodyBytes: message.perBodyBytes, totalBytes: message.totalBodyBytes });
+        } else await cdp.enableNetworkTracking(tabId);
       } catch (e) {}
+      await cdp.drainNetworkEvents(tabId);
       const entries = cdp.getNetworkEntries(tabId, {});
       const serializedSize = new TextEncoder().encode(JSON.stringify(entries)).byteLength;
       if (serializedSize > 16 * 1024 * 1024) {
@@ -2349,6 +2402,7 @@ export async function handleMessage(
       try {
         await cdp.enableNetworkTracking(tabId);
       } catch (e) {}
+      await cdp.drainNetworkEvents(tabId);
       
       let entries = cdp.getNetworkEntries(tabId, {
         urlPattern: message.urlPattern,
@@ -2388,6 +2442,7 @@ export async function handleMessage(
     case "GET_NETWORK_ENTRY": {
       if (!tabId) throw new Error("No tabId provided");
       if (!message.requestId) throw new Error("No requestId provided");
+      await cdp.drainNetworkEvents(tabId);
       
       // First try direct lookup by CDP requestId
       let entry = cdp.getNetworkEntry(tabId, message.requestId);
@@ -2413,6 +2468,7 @@ export async function handleMessage(
     case "GET_RESPONSE_BODY": {
       if (!tabId) throw new Error("No tabId provided");
       if (!message.requestId) throw new Error("No requestId provided");
+      await cdp.drainNetworkEvents(tabId);
       
       // If requestId looks like entry.id format (r_xxx), look up the CDP requestId
       let cdpRequestId = message.requestId;
@@ -2430,6 +2486,7 @@ export async function handleMessage(
 
     case "GET_NETWORK_ORIGINS": {
       if (!tabId) throw new Error("No tabId provided");
+      await cdp.drainNetworkEvents(tabId);
       
       const entries = cdp.getNetworkEntries(tabId, {});
       const origins: Record<string, { count: number; lastSeen: number; size: number }> = {};
@@ -2448,6 +2505,7 @@ export async function handleMessage(
 
     case "GET_NETWORK_STATS": {
       if (!tabId) throw new Error("No tabId provided");
+      await cdp.drainNetworkEvents(tabId);
       
       const entries = cdp.getNetworkEntries(tabId, {});
       const origins: Record<string, number> = {};

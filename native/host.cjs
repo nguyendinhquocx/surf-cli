@@ -22,11 +22,30 @@ const { parseListenEndpoint } = require("./listener.cjs");
 const { getStateDir } = require("./remote-auth.cjs");
 const { createFrameParser, createServerAuthSession, createSocketWriter, isClientAuthorized, writeFrame, MAX_FRAME_BYTES } = require("./remote-transport.cjs");
 const { HostSessionManager, resolveRequestDeadlineMs } = require("./host-sessions.cjs");
-const { abortError, throwIfAborted } = require("./abort.cjs");
+const { abortError, abortableDelay, throwIfAborted } = require("./abort.cjs");
 const { BoundedAiQueue } = require("./ai-queue.cjs");
 const { RequestPendingMap } = require("./request-pending.cjs");
 const { cleanupFilePaths, createStagingDirectory, createTransferState, materializeRemoteTool, rewriteTransferPaths, streamFileDownload, transferError } = require("./file-transfer.cjs");
 const { writeNetworkExport } = require("./network-export.cjs");
+const networkStore = require("./network-store.cjs");
+const { redactUrlSecrets } = require("./redaction.cjs");
+const { appendActivity, journalCommand } = require("./activity-journal.cjs");
+const { reserveReceipt, updateReceipt } = require("./playbook-receipts.cjs");
+const {
+  activeRecord,
+  appendRecordEvent,
+  attachNetworkTrace,
+  discardRecord,
+  markRecord,
+  pauseRecord,
+  resumeRecord,
+  startRecord,
+  stopRecord,
+  updateRecordContext,
+} = require("./playbook-records.cjs");
+const { resolveArgs, runPlaybookOp } = require("./playbook-runtime.cjs");
+const { resolveOp } = require("./playbooks.cjs");
+const { commandMetadata, redactCommandArgs } = require("./workflow-definition.cjs");
 const MAX_CLIENT_FRAME_BYTES = MAX_FRAME_BYTES;
 const TEST_REQUEST_DEADLINE_MS = process.env.SURF_TEST_MODE === "1" && Number.isFinite(Number(process.env.SURF_TEST_REQUEST_DEADLINE_MS))
   ? Number(process.env.SURF_TEST_REQUEST_DEADLINE_MS)
@@ -428,6 +447,131 @@ function requestCallExtension(request, tool, message, timeoutMs = 30000, cleanup
   });
 }
 
+async function executeMappedHostTool(request, tool, args, tabId) {
+  const extensionMsg = mapToolToMessage(tool, args, tabId);
+  if (!extensionMsg) throw new Error(`Unknown tool: ${tool}`);
+  if (extensionMsg.type === "UNSUPPORTED_ACTION") throw new Error(extensionMsg.message);
+  if (extensionMsg.type === "LOCAL_WAIT") {
+    await abortableDelay(extensionMsg.seconds * 1000, request.signal);
+    return { success: true };
+  }
+  if (extensionMsg.type === "BATCH_EXECUTE" || extensionMsg.type.endsWith("_QUERY")) {
+    throw new Error(`tool ${tool} is not available inside a host-owned workflow`);
+  }
+  return requestCallExtension(request, tool, extensionMsg, resolveRequestDeadlineMs(tool, args));
+}
+
+async function executeNativePlaybook(request, handler, args, options = {}) {
+  if (handler !== "chatgpt.ask") throw new Error(`unknown native playbook handler: ${handler}`);
+  const result = await chatgptClient.query({
+    prompt: args.prompt,
+    signal: request.signal,
+    model: args.model,
+    timeout: args.timeout ? Number(args.timeout) * 1000 : undefined,
+    getCookies: () => requestCallExtension(request, "get_cookies", { type: "GET_CHATGPT_COOKIES" }),
+    createTab: () => requestCallExtension(request, "create_tab", { type: "CHATGPT_NEW_TAB" }),
+    closeTab: (tabId) => requestCallExtension(request, "close_tab", { type: "CHATGPT_CLOSE_TAB", tabId }, 45000, true),
+    cdpEvaluate: (tabId, expression) => requestCallExtension(request, "cdp_evaluate", { type: "CHATGPT_EVALUATE", tabId, expression }),
+    cdpCommand: (tabId, method, params) => requestCallExtension(request, "cdp_command", { type: "CHATGPT_CDP_COMMAND", tabId, method, params }),
+    beforeSubmit: options.markDispatched,
+    log: (message) => log(`[playbook:chatgpt] ${message}`),
+  });
+  return { response: result.response, model: result.model, tookMs: result.tookMs };
+}
+
+async function runHostPlaybook(msg, request) {
+  const params = msg.params?.args || {};
+  const { playbook, op } = resolveOp(params.playbook, params.op, {
+    cwd: request.context?.isRemote ? process.cwd() : params.projectDir || process.cwd(),
+    pinBuiltIn: params.pinBuiltIn === true,
+  });
+  const runArgs = resolveArgs(op, params.args || {});
+  if (op.effect === "write" && op.safety.authorization === "explicit" && params.write !== true) {
+    throw new Error(`write op ${playbook.id} ${op.id} requires --write`);
+  }
+  const receipt = reserveReceipt({
+    playbookId: playbook.id,
+    op,
+    args: runArgs,
+    repeat: params.repeat === true,
+    retryAttempt: params.retryAttempt,
+    overrideInDoubt: params.overrideInDoubt === true,
+  });
+  const report = (event) => {
+    appendActivity(event);
+    appendRecordEvent(event);
+  };
+  return runPlaybookOp({
+    playbook,
+    op,
+    args: runArgs,
+    attemptId: receipt?.attemptId,
+    signal: request.signal,
+    executeTool: (tool, args) => executeMappedHostTool(request, tool, args, msg.tabId),
+    executeNative: (handler, args, options) => executeNativePlaybook(request, handler, args, options),
+    sleep: (ms) => abortableDelay(ms, request.signal),
+    onEvent: report,
+    beforeDispatch: async () => updateReceipt(receipt, "dispatched"),
+    afterDispatch: async ({ status, error }) => updateReceipt(receipt, status, { error }),
+  });
+}
+
+async function handleRecordRequest(tool, args, msg, request) {
+  if (tool === "playbook.record.start") {
+    let record = startRecord({ ...args, tabId: msg.tabId });
+    try {
+      const context = await requestCallExtension(request, tool, {
+        type: "GET_PLAYBOOK_RECORD_CONTEXT",
+        tabId: msg.tabId,
+      });
+      record = updateRecordContext({
+        tabId: context._resolvedTabId || msg.tabId,
+        origin: context.origin,
+      });
+      if (record.capture.network) {
+        const result = await requestCallExtension(request, tool, { type: "START_NETWORK_CAPTURE", tabId: record.tabId, bodyMode: "text" });
+        record = updateRecordContext({ tabId: result._resolvedTabId || record.tabId });
+      }
+      if (record.capture.watch) {
+        const result = await requestCallExtension(request, tool, { type: "START_PLAYBOOK_WATCH", tabId: record.tabId || msg.tabId, includeInputValues: record.redaction.includeInputValues });
+        record = updateRecordContext({ tabId: result._resolvedTabId || record.tabId || msg.tabId });
+      }
+      return record;
+    } catch (error) {
+      if (record?.capture.network) await requestCallExtension(request, tool, { type: "STOP_NETWORK_CAPTURE", tabId: record.tabId }, 30000, true).catch(() => {});
+      if (record?.capture.watch) await requestCallExtension(request, tool, { type: "STOP_PLAYBOOK_WATCH", tabId: record.tabId }, 30000, true).catch(() => {});
+      discardRecord();
+      throw error;
+    }
+  }
+  if (tool === "playbook.record.status") return activeRecord() || { status: "idle" };
+  if (tool === "playbook.record.mark") return markRecord(args.label);
+  if (tool === "playbook.record.pause") return pauseRecord();
+  if (tool === "playbook.record.resume") return resumeRecord();
+  if (tool === "playbook.record.discard") {
+    const record = activeRecord();
+    if (record?.capture.network) await requestCallExtension(request, tool, { type: "STOP_NETWORK_CAPTURE", tabId: record.tabId }, 30000, true).catch(() => {});
+    if (record?.capture.watch) await requestCallExtension(request, tool, { type: "STOP_PLAYBOOK_WATCH", tabId: record.tabId }, 30000, true).catch(() => {});
+    return discardRecord();
+  }
+  if (tool === "playbook.record.stop") {
+    const record = activeRecord();
+    if (!record) throw new Error("no active playbook record");
+    if (record.capture.network) {
+      try {
+        const result = await requestCallExtension(request, tool, { type: "READ_NETWORK_REQUESTS", tabId: record.tabId, full: true, limit: 500 });
+        const cutoff = Date.parse(record.startedAt);
+        attachNetworkTrace(record.id, (result.entries || []).filter((entry) => entry.ts >= cutoff));
+      } finally {
+        await requestCallExtension(request, tool, { type: "STOP_NETWORK_CAPTURE", tabId: record.tabId }, 30000, true).catch(() => {});
+      }
+    }
+    if (record.capture.watch) await requestCallExtension(request, tool, { type: "STOP_PLAYBOOK_WATCH", tabId: record.tabId }, 30000, true).catch(() => {});
+    return stopRecord({ draft: args.draft === true });
+  }
+  throw new Error(`Unknown record command: ${tool}`);
+}
+
 const sessionManager = new HostSessionManager({
   audit: auditSession,
   onTimeout(context, request) {
@@ -531,6 +675,21 @@ function sendToolResponse(socket, id, result, error) {
     if (finalError && request) {
       finalError = rewriteTransferPaths(finalError, request.pathRewrites || []);
     }
+    if (request?.tool && !request.tool.startsWith("playbook.")) {
+      const metadata = commandMetadata(request.tool);
+      if (metadata.recordable) {
+        const event = {
+          type: finalError ? "tool.failed" : "tool.completed",
+          command: metadata.name,
+          argsRedacted: redactCommandArgs(request.tool, request.args || {}),
+          startedAt: request.activityStartedAt || new Date().toISOString(),
+          endedAt: new Date().toISOString(),
+          resultSummary: finalError ? "failed" : "success",
+        };
+        appendActivity(event);
+        appendRecordEvent(event);
+      }
+    }
     await cleanupRequestTransfers(request);
     if (request?.settled) return;
     const outcome = request?.signal.aborted
@@ -605,6 +764,22 @@ function handleToolRequest(msg, socket, requestContext = requestStorage.getStore
   
   if (!tool) {
     sendToolResponse(socket, originalId, null, "No tool specified");
+    return;
+  }
+
+  requestContext.args = args || {};
+  requestContext.activityStartedAt = new Date().toISOString();
+  if (!tool.startsWith("playbook.")) journalCommand(tool, args || {}, { tabId });
+  if (tool === "playbook.run") {
+    runHostPlaybook(msg, requestContext)
+      .then((result) => sendToolResponse(socket, originalId, { output: JSON.stringify(result) }, null))
+      .catch((error) => sendToolResponse(socket, originalId, null, error.message));
+    return;
+  }
+  if (tool.startsWith("playbook.record.")) {
+    handleRecordRequest(tool, args || {}, msg, requestContext)
+      .then((result) => sendToolResponse(socket, originalId, result, null))
+      .catch((error) => sendToolResponse(socket, originalId, null, error.message));
     return;
   }
   
@@ -1264,7 +1439,9 @@ function handleToolRequest(msg, socket, requestContext = requestStorage.getStore
     autoScreenshot: args?.autoScreenshot === true,
     autoScreenshotOutput: args?.autoScreenshotOutput,
     networkExport: extensionMsg.type === "EXPORT_NETWORK_REQUESTS",
+    persistNetwork: extensionMsg.type === "READ_NETWORK_REQUESTS" && extensionMsg.full && args?.["no-save"] !== true,
     networkExportPath: args?.output,
+    networkPath: args?.["network-path"],
     networkExportFormat: extensionMsg.har ? "har" : extensionMsg.jsonl ? "jsonl" : "json",
     fullRes: extensionMsg.fullRes || args?.fullRes,
     maxSize: extensionMsg.maxSize || args?.maxSize,
@@ -1431,6 +1608,19 @@ function processInput() {
         handleApiRequest(msg, writeMessage);
         return;
       }
+
+      if (msg.type === "PLAYBOOK_WATCH_EVENT") {
+        appendRecordEvent({
+          type: "browser.event",
+          event: msg.event,
+          selector: msg.selector,
+          value: msg.value,
+          url: redactUrlSecrets(msg.url),
+          tabId: msg.tabId,
+          timestamp: msg.timestamp || new Date().toISOString(),
+        });
+        return;
+      }
       
       if (msg.type === "STREAM_EVENT") {
         const stream = activeStreams.get(msg.streamId);
@@ -1488,6 +1678,14 @@ function processInput() {
               sendToolResponse(socket, originalId, exportResult, null);
             } catch (error) {
               sendToolResponse(socket, originalId, null, `Failed to export network requests: ${error.message}`);
+            }
+          } else if (pending.persistNetwork && Array.isArray(msg.entries)) {
+            try {
+              for (const entry of msg.entries) networkStore.appendEntrySync(entry, pending.networkPath);
+              networkStore.maybeAutoCleanup();
+              sendToolResponse(socket, originalId, msg, null);
+            } catch (error) {
+              sendToolResponse(socket, originalId, null, `Failed to persist network requests: ${error.message}`);
             }
           } else if (savePath && msg.base64) {
             try {
