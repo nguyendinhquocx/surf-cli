@@ -2,8 +2,16 @@
 
 ## [Unreleased]
 
+### Changed
+- **Extension icon** - Replaced the placeholder teal glyph with on-brand artwork matching the project banner: a cartoon wave curl with the surfing robot mascot, tuned to stay legible at 16px in the browser toolbar.
+
+## [2.10.0] - 2026-07-29
+
 ### Added
 - **Surf Playbooks** - Added durable browser-session playbooks with `surf playbook`/`surf pb` management, `surf use` execution, workflow and network strategies, host-owned write receipts, private activity/record state, record drafting, trace export, and standalone client projection.
+
+### Dependencies
+- **Routine toolchain refresh** - Updated Biome to 2.5.5, Vite to 8.1.5, and the setup-node Action to v7.
 
 ## [2.9.0] - 2026-07-17
 
