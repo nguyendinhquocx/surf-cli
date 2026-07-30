@@ -12,7 +12,7 @@ function createReadyChatGptEvaluate(
     if (expression === "document.title.toLowerCase()") {
       return { result: { value: "chatgpt" } };
     }
-    if (expression.includes("challenge-platform")) {
+    if (expression.includes("challenge-platform") || expression.includes("cloudflare ray id")) {
       return { result: { value: false } };
     }
     if (expression.includes("fetch('/backend-api/me'")) {
@@ -26,6 +26,30 @@ function createReadyChatGptEvaluate(
 }
 
 describe("chatgpt-client", () => {
+  describe("isCloudflareBlocked", () => {
+    it("does not treat normal logged-in ChatGPT pages with challenge scripts as blocked", async () => {
+      const result = await chatgptClient.isCloudflareBlocked(async (expression: string) => {
+        if (expression === "document.title.toLowerCase()") {
+          return { result: { value: "chatgpt" } };
+        }
+        return { result: { value: false } };
+      });
+
+      expect(result).toBe(false);
+    });
+
+    it("detects visible Cloudflare challenge pages", async () => {
+      const result = await chatgptClient.isCloudflareBlocked(async (expression: string) => {
+        if (expression === "document.title.toLowerCase()") {
+          return { result: { value: "chatgpt" } };
+        }
+        return { result: { value: true } };
+      });
+
+      expect(result).toBe(true);
+    });
+  });
+
   describe("cleanChatGPTResponseText", () => {
     it.each([
       [
@@ -231,6 +255,57 @@ describe("chatgpt-client", () => {
     });
   });
 
+  describe("verified ChatGPT picker state", () => {
+    const modelState = [
+      {
+        role: "button",
+        label: "ChatGPT 5.4 Thinking",
+        testId: "model-switcher-dropdown-button",
+      },
+    ];
+    const effortOptions = [
+      { role: "menuitemradio", label: "Light", testId: "thinking-time-light" },
+      { role: "menuitemradio", label: "Standard", testId: "thinking-time-standard" },
+      { role: "menuitemradio", label: "Extended", testId: "thinking-time-extended" },
+      { role: "menuitemradio", label: "Heavy", testId: "thinking-time-heavy" },
+    ];
+
+    it.each([
+      ["requested model found", modelState, "thinking", "ChatGPT 5.4 Thinking"],
+      ["requested model missing", modelState, "pro", null],
+      ["ambiguous model state", [...modelState, ...modelState], "thinking", null],
+      ["unreadable model state", [{ role: "button", label: "", testId: null }], "thinking", null],
+    ])("handles %s", (_, items, requested, expectedLabel) => {
+      expect(chatgptClient.verifyChatGPTModelSelection(items, requested)?.label ?? null).toBe(
+        expectedLabel,
+      );
+    });
+
+    it.each([
+      ["requested effort found", [effortOptions[2]], "extended", "Extended"],
+      ["requested effort missing", [effortOptions[1]], "extended", null],
+      ["ambiguous effort state", [effortOptions[2], effortOptions[2]], "extended", null],
+      [
+        "unreadable effort state",
+        [{ role: "menuitemradio", label: "", testId: null }],
+        "extended",
+        null,
+      ],
+    ])("handles %s", (_, items, requested, expectedLabel) => {
+      expect(chatgptClient.verifyChatGPTEffortSelection(items, requested)?.label ?? null).toBe(
+        expectedLabel,
+      );
+    });
+
+    it("resolves effort options and accepts only the documented vocabulary", () => {
+      expect(chatgptClient.resolveChatGPTEffortMenuOption(effortOptions, "extended")).toEqual(
+        effortOptions[2],
+      );
+      expect(chatgptClient.normalizeChatGPTEffortChoice("STANDARD")).toBe("standard");
+      expect(chatgptClient.normalizeChatGPTEffortChoice("maximum")).toBeNull();
+    });
+  });
+
   describe("isNewAssistantContent", () => {
     it.each([
       ["no latest", null, { text: "Answer" }, 2, 1, false],
@@ -339,6 +414,50 @@ describe("chatgpt-client", () => {
           1199,
         ),
       ).toBe(false);
+    });
+  });
+
+  describe("fresh-tab harvest gates", () => {
+    it("preserves Cloudflare challenge classification", async () => {
+      const closeTab = vi.fn(async () => undefined);
+
+      await expect(
+        chatgptClient.harvest({
+          tabId: null,
+          conversationUrl: "https://chatgpt.com/c/conversation-id",
+          promptEcho: "review",
+          createTab: async () => ({ tabId: 123 }),
+          closeTab,
+          cdpCommand: vi.fn(async () => ({})),
+          cdpEvaluate: async (_tabId: number, expression: string) => {
+            if (expression === "document.readyState") {
+              return { result: { value: "complete" } };
+            }
+            if (expression === "document.title.toLowerCase()") {
+              return { result: { value: "just a moment" } };
+            }
+            throw new Error(`Unexpected expression: ${expression}`);
+          },
+        }),
+      ).rejects.toMatchObject({ code: "cloudflare" });
+      expect(closeTab).toHaveBeenCalledWith(123);
+    });
+
+    it("preserves login failure classification", async () => {
+      const closeTab = vi.fn(async () => undefined);
+
+      await expect(
+        chatgptClient.harvest({
+          tabId: null,
+          conversationUrl: "https://chatgpt.com/c/conversation-id",
+          promptEcho: "review",
+          createTab: async () => ({ tabId: 123 }),
+          closeTab,
+          cdpCommand: vi.fn(async () => ({})),
+          cdpEvaluate: createReadyChatGptEvaluate({ status: 401, hasLoginCta: true }),
+        }),
+      ).rejects.toMatchObject({ code: "auth" });
+      expect(closeTab).toHaveBeenCalledWith(123);
     });
   });
 
