@@ -936,6 +936,18 @@ function mapToolToMessage(tool, args, tabId) {
     }
     case "page.text":
       return { type: "GET_PAGE_TEXT", ...baseMsg };
+    case "page.html":
+    case "page.save": {
+      if (a.selector !== undefined && (typeof a.selector !== "string" || a.selector.length === 0)) {
+        throw new Error("selector must be a non-empty string");
+      }
+      return {
+        type: "GET_PAGE_HTML",
+        selector: a.selector,
+        stripScripts: a["strip-scripts"] === true,
+        ...baseMsg,
+      };
+    }
     case "page.state":
       return { type: "PAGE_STATE", ...baseMsg };
     case "locate.role":

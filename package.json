@@ -1,6 +1,6 @@
 {
   "name": "surf-cli",
-  "version": "2.11.0",
+  "version": "2.12.0",
   "description": "CLI for AI agents to control Chrome. Zero config, agent-agnostic, battle-tested.",
   "keywords": [
     "chrome",
@@ -10,7 +10,8 @@
     "agent",
     "cli",
     "cdp",
-    "devtools"
+    "devtools",
+    "pi-package"
   ],
   "author": "Nico Bailon",
   "license": "MIT",
@@ -28,6 +29,7 @@
   },
   "files": [
     "native/",
+    "pi-extension/",
     "playbooks/",
     "scripts/",
     "dist/",
@@ -38,7 +40,7 @@
   "scripts": {
     "dev": "vite build --watch --mode development",
     "build": "vite build",
-    "check": "tsc --noEmit",
+    "check": "tsc --noEmit && tsc --noEmit -p tsconfig.pi-extension.json",
     "lint": "biome check .",
     "lint:fix": "biome check --write .",
     "lint:test": "biome check test/",
@@ -64,11 +66,24 @@
   "devDependencies": {
     "@biomejs/biome": "^2.5.4",
     "@types/chrome": "^0.2.2",
+    "@types/node": "^26.1.2",
     "@vitest/coverage-v8": "^4.1.9",
     "@vitest/ui": "^4.1.9",
     "puppeteer": "25.4.0",
     "typescript": "^7.0.2",
     "vite": "^8.1.4",
-    "vitest": "^4.1.9"
+    "vitest": "^4.1.9",
+    "typebox": "^1.3.11"
+  },
+  "pi": {
+    "extensions": [
+      "./pi-extension/surf.ts"
+    ],
+    "skills": [
+      "./skills"
+    ]
+  },
+  "peerDependencies": {
+    "typebox": "*"
   }
 }

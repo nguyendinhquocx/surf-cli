@@ -533,7 +533,7 @@ const TOOLS = {
       "scroll": {
         desc: "Scroll in direction",
         args: ["direction", "pixels"],
-        opts: { direction: "up|down|left|right", amount: "Scroll amount (1-10)" },
+        opts: { direction: "up|down|left|right", amount: "Scroll amount in 100 px steps (1-10)" },
         examples: [
           { cmd: "scroll down 800", desc: "Scroll down 800px" },
           { cmd: "scroll --direction down --amount 3", desc: "Scroll down" },
@@ -576,6 +576,18 @@ const TOOLS = {
       },
       "read": { desc: "Alias for page.read", args: [], alias: "page.read" },
       "page.text": { desc: "Extract all text from page", args: [] },
+      "page.html": {
+        desc: "Print rendered document HTML",
+        args: [],
+        opts: { selector: "Export matching CSS selector", "strip-scripts": "Remove script elements" },
+        examples: [{ cmd: "page.html", desc: "Print current document HTML" }],
+      },
+      "page.save": {
+        desc: "Save rendered document HTML",
+        args: [],
+        opts: { output: "File path", selector: "Export matching CSS selector", "strip-scripts": "Remove script elements" },
+        examples: [{ cmd: "page.save --output page.html", desc: "Save current document HTML" }],
+      },
       "page.state": { desc: "Get page state (modals, loading, etc.)", args: [] },
     }
   },
@@ -1464,7 +1476,7 @@ const ALL_SOCKET_TOOLS = [
   "click_type", "click_type_submit", "type", "key", "type_submit",
   "scroll", "scroll_to", "hover", "left_click_drag", "drag", "wait",
   "computer",
-  "page.read", "page.text", "page.state",
+  "page.read", "page.text", "page.html", "page.save", "page.state",
   "locate.role", "locate.text", "locate.label",
   "tab.list", "tab.new", "tab.switch", "tab.close", "tab.move", "tab.name", "tab.unname", "tab.named",
   "tab.group", "tab.ungroup", "tab.groups", "tab.reload",
@@ -2818,8 +2830,13 @@ if (tool === "network.export" && outputPath !== undefined) {
   toolArgs.output = outputPath;
 }
 
-if ((tool === "screenshot" || tool === "record" || tool === "perf-audit") && outputPath && typeof outputPath !== "string") {
+if ((tool === "screenshot" || tool === "record" || tool === "perf-audit" || tool === "page.save") && outputPath && typeof outputPath !== "string") {
   console.error("Error: --output requires a file path");
+  process.exit(1);
+}
+
+if (tool === "page.save" && !outputPath) {
+  console.error("Error: page.save requires --output <path>");
   process.exit(1);
 }
 
@@ -3294,6 +3311,17 @@ async function handleResponse(response) {
     data = { response: data };
   }
 
+  if (tool === "page.save" && typeof data?.html === "string") {
+    const saveTo = path.resolve(outputPath);
+    fs.mkdirSync(path.dirname(saveTo), { recursive: true });
+    fs.writeFileSync(saveTo, data.html);
+    if (!wantJson) {
+      console.log(`Saved rendered page HTML to ${saveTo}`);
+      socket.end();
+      process.exit(0);
+    }
+  }
+
   if (tool === "perf-audit" && outputPath) {
     const saveTo = path.resolve(outputPath);
     fs.mkdirSync(path.dirname(saveTo), { recursive: true });
@@ -3375,6 +3403,8 @@ async function handleResponse(response) {
     console.log(data.pageContent);
   } else if (tool === "page.text" && data?.text) {
     console.log(data.text);
+  } else if (tool === "page.html" && typeof data?.html === "string") {
+    console.log(data.html);
   } else if (tool === "emulate.device" && data?.devices) {
     console.log("Available devices:\n");
     const devices = data.devices;

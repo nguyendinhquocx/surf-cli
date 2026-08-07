@@ -63,8 +63,8 @@ surf click --x 100 --y 200
 # 4. Type text
 surf type --text "hello"
 
-# 5. Screenshot
-surf screenshot --output /tmp/shot.png
+# 5. Full-page screenshot
+surf screenshot --full-page --output /tmp/shot.png
 
 # Inspect animation/style changes as JSON
 surf animate-audit --selector ".thing" --duration 2000 --fps 10
@@ -292,8 +292,25 @@ surf page.read --depth 3       # Limit tree depth
 surf page.read --compact       # Minimal output for LLM efficiency
 surf page.read --max-bytes 2000 # Cap visible text at a UTF-8 byte boundary
 surf page.text                 # Plain text content only
+surf page.html --strip-scripts # Rendered HTML without scripts
+surf page.save --selector "#artifact" --strip-scripts --output page.html # Save one static element
 surf page.state                # Modals, loading state, scroll info
 ```
+
+### Export Rendered HTML
+
+Use `page.html` when the user wants a static copy of the current rendered DOM. This works for Claude artifact pages and ordinary web pages.
+
+```bash
+# Save the active page as HTML.
+surf page.save --output page.html
+
+# Save a Claude artifact or other preview page after it loads, without scripts.
+surf wait.dom --stable 500
+surf page.html --selector "#artifact" --strip-scripts > artifact.html
+```
+
+Use `--selector <css>` to export its matching element only. A selector miss fails with an error. `--strip-scripts` removes scripts from exported markup without changing the page. Without `--selector`, `page.html` exports the whole document with its doctype. `page.html` exports the selected frame when `frame.switch` is active. Use `page.read` first when you need refs or visible text.
 
 ## Semantic Element Location
 
@@ -687,10 +704,11 @@ surf wait.element ".missing" --auto-capture --timeout 2000
 12. **Window isolation** - Use `window.new` + `--window-id` or `--tab-id` to keep agent work separate from your browsing
 13. **Request lock** - Non-streaming browser CLI requests serialize per socket; use `--no-lock` only when you intentionally want to bypass it
 14. **Native host diagnostics** - If commands fail with socket/native-host errors, run `surf doctor` or `surf doctor --browser all` before guessing at reinstall steps
-15. **Animation capture** - Use `surf record --duration 2000 --fps 10 --output /tmp/anim.gif` when the agent needs to see motion; use `animate-audit` for numeric timelines and `perf-audit` for jank/layout-shift snapshots
-16. **Hard isolation** - Use separate browser/profile instances plus separate `SURF_SOCKET` values when agents must not share a host or target
-17. **Semantic locators** - `locate.role`, `locate.text`, `locate.label` for more robust element finding
-18. **Frame context** - Use `frame.switch` before interacting with iframe content
+15. **HTML export** - Use `surf page.html > artifact.html` to save Claude artifacts or any rendered page as static HTML
+16. **Animation capture** - Use `surf record --duration 2000 --fps 10 --output /tmp/anim.gif` when the agent needs to see motion; use `animate-audit` for numeric timelines and `perf-audit` for jank/layout-shift snapshots
+17. **Hard isolation** - Use separate browser/profile instances plus separate `SURF_SOCKET` values when agents must not share a host or target
+18. **Semantic locators** - `locate.role`, `locate.text`, `locate.label` for more robust element finding
+19. **Frame context** - Use `frame.switch` before interacting with iframe content
 
 ## Socket API
 

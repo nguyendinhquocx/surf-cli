@@ -2,8 +2,15 @@
 
 ## [Unreleased]
 
+## [2.12.0] - 2026-08-07
+
 ### Added
+- **Pi extension** - Added optional Pi browser tools backed by Surf's native-host socket, plus optional pi-subagents background reporting for session-owned oracle jobs.
+- **Rendered page HTML** - Added `surf page.html` to print and `surf page.save --output <path>` to save the current rendered document HTML, with `--selector <css>` and `--strip-scripts` for bounded static exports of Claude artifacts or other rendered pages.
 - **Playbook script strategies** - Added opt-in trusted read-op scripts with dynamic `tools.run`/`tools.all` Surf tool orchestration and workflow auto-waits.
+
+### Changed
+- **TypeScript boundary cleanup** - Replaced content element ref expandos with a WeakMap and validated native API stream response frames before dispatch.
 
 ## [2.11.0] - 2026-07-29
 
