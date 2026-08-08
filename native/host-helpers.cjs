@@ -77,8 +77,23 @@ function formatToolContent(result, log = () => {}, options = {}) {
     return text(output);
   }
   
-  // Handle Grok validation results
-  if (result.authenticated !== undefined && result.models !== undefined && result.expectedModels !== undefined) {
+      // Handle Kimi validation results (must precede the Grok branch - same field names)
+      if (result.kimiValidate) {
+        let output = "## Kimi Validation Results\n\n";
+        output += `**Authenticated:** ${result.authenticated ? 'Yes' : 'No'}\n`;
+        output += `**Input Field:** ${result.inputFound ? 'Found' : 'Not Found'}\n`;
+        output += `**Send Button:** ${result.sendButtonFound ? 'Found' : 'Not Found'}\n\n`;
+        output += `**Available Models:** ${result.models.length > 0 ? result.models.join(', ') : 'None found'}\n`;
+        output += `**Expected Models:** ${result.expectedModels.join(', ')}\n\n`;
+        if (result.errors && result.errors.length > 0) {
+          output += `**Errors:**\n${result.errors.map(e => `- ${e}`).join('\n')}\n\n`;
+        }
+        output += `*Completed in ${result.tookMs}ms*`;
+        return text(output);
+      }
+
+      // Handle Grok validation results
+      if (result.authenticated !== undefined && result.models !== undefined && result.expectedModels !== undefined) {
     let output = "## Grok Validation Results\n\n";
     output += `**Authenticated:** ${result.authenticated ? 'Yes' : 'No'}\n`;
     output += `**Premium:** ${result.premium ? 'Yes' : 'No'}\n`;
@@ -1200,6 +1215,22 @@ function mapToolToMessage(tool, args, tabId) {
         ...baseMsg,
       };
     }
+        case "kimi":
+          if (a.validate) {
+            return {
+              type: "KIMI_VALIDATE",
+              ...baseMsg
+            };
+          }
+          if (!a.query) throw new Error("query required");
+          return {
+            type: "KIMI_QUERY",
+            query: a.query,
+            model: a.model,
+            withPage: a["with-page"],
+            timeout: a.timeout ? parseInt(a.timeout, 10) * 1000 : 300000,
+            ...baseMsg
+          };
     case "window.new":
       return { 
         type: "WINDOW_NEW", 

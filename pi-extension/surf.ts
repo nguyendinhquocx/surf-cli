@@ -21,12 +21,16 @@ const { prepareRemoteTool, validateLocalToolPaths } = require("../native/file-tr
 
 const MAX_OUTPUT_CHARS = 20_000;
 const ORACLE_ACTIVE_STATES = new Set(["created", "dispatched", "awaiting"]);
+const ORACLE_TERMINAL_STATES = new Set(["captured", "failed"]);
+const ORACLE_FINISHED_CHANNEL = "surf-oracle:finished";
 const BACKGROUND_WORK_PROTOCOL_VERSION = 1;
 const BACKGROUND_WORK_REGISTRY_KEY = "pi-subagents.background-work.v1";
+const BACKGROUND_WORK_MODULE_SPECIFIER = "pi-subagents/background-work";
 
 type Pi = {
   registerTool(tool: Record<string, unknown>): void;
   on(event: "session_start" | "session_shutdown", handler: (event: unknown, ctx: unknown) => void | Promise<void>): void;
+  events?: { emit(event: string, data: unknown): void };
 };
 
 type SurfEndpoint = { kind?: string };
@@ -37,6 +41,12 @@ type BackgroundWorkProvider = {
   name: string;
   wakeChannels: string[];
   listActiveWork(): Array<{ id: string; sessionId: string }>;
+};
+
+type RegisterBackgroundWorkProvider = (provider: BackgroundWorkProvider) => () => void;
+
+type BackgroundWorkModule = {
+  registerBackgroundWorkProvider?: unknown;
 };
 
 type BackgroundWorkRegistry = {
@@ -52,21 +62,21 @@ function textResult(value: unknown, isError = false): ToolResult {
   return { content: [{ type: "text", text: bounded }], ...(isError ? { isError: true } : {}) };
 }
 
-function resultFromHost(response: Record<string, unknown>): ToolResult {
+export function resultFromHost(response: Record<string, unknown>): ToolResult {
   const error = response.error as { content?: Array<{ text?: string }> } | undefined;
   if (error) return textResult(error.content?.map((item) => item.text ?? "").join("\n") || "Surf request failed", true);
   const result = response.result as { content?: ToolResult["content"] } | undefined;
   if (!result?.content) return textResult(result ?? "OK");
-  const content = result.content.map((item) => item.type === "text" && item.text && item.text.length > MAX_OUTPUT_CHARS
-    ? { ...item, text: `${item.text.slice(0, MAX_OUTPUT_CHARS)}\n\n[Surf output truncated at ${MAX_OUTPUT_CHARS} characters]` }
-    : item);
-  const text = content.find((item) => item.type === "text")?.text;
+  const text = result.content.find((item) => item.type === "text")?.text;
   let details: unknown;
   try {
     details = text ? JSON.parse(text) : undefined;
   } catch {
     details = undefined;
   }
+  const content = result.content.map((item) => item.type === "text" && item.text && item.text.length > MAX_OUTPUT_CHARS
+    ? { ...item, text: `${item.text.slice(0, MAX_OUTPUT_CHARS)}\n\n[Surf output truncated at ${MAX_OUTPUT_CHARS} characters]` }
+    : item);
   return { content, details };
 }
 
@@ -128,10 +138,24 @@ export function registerGlobalBackgroundProvider(provider: BackgroundWorkProvide
   };
 }
 
-export function registerOptionalBackgroundProvider(sessionId: string, jobIds: Set<string>, listJobs: () => Array<{ id: string; state: string }>, register: (provider: BackgroundWorkProvider) => () => void) {
+export async function resolveBackgroundWorkRegister(
+  loadModule: () => Promise<BackgroundWorkModule> = () => import(BACKGROUND_WORK_MODULE_SPECIFIER) as Promise<BackgroundWorkModule>,
+): Promise<RegisterBackgroundWorkProvider> {
+  try {
+    const module = await loadModule();
+    if (typeof module.registerBackgroundWorkProvider === "function") {
+      return module.registerBackgroundWorkProvider as RegisterBackgroundWorkProvider;
+    }
+  } catch {
+    // The Pi bridge is optional. Surf also runs in other coding-agent harnesses and as a direct CLI.
+  }
+  return registerGlobalBackgroundProvider;
+}
+
+export function registerOptionalBackgroundProvider(sessionId: string, jobIds: Set<string>, listJobs: () => Array<{ id: string; state: string }>, register: RegisterBackgroundWorkProvider) {
   return register({
     name: "surf-oracle",
-    wakeChannels: ["surf-oracle:finished"],
+    wakeChannels: [ORACLE_FINISHED_CHANNEL],
     listActiveWork: () => listJobs()
       .filter((job) => jobIds.has(job.id) && ORACLE_ACTIVE_STATES.has(job.state))
       .map((job) => ({ id: job.id, sessionId })),
@@ -141,6 +165,15 @@ export function registerOptionalBackgroundProvider(sessionId: string, jobIds: Se
 export function rememberOracleJobForSession(jobIds: Set<string>, jobId: unknown, requestGeneration: number, currentGeneration: number, sessionActive: boolean): boolean {
   if (typeof jobId !== "string" || !sessionActive || requestGeneration !== currentGeneration) return false;
   jobIds.add(jobId);
+  return true;
+}
+
+export function emitOracleFinished(pi: Pi, job: unknown): boolean {
+  if (!job || typeof job !== "object" || Array.isArray(job)) return false;
+  const { id, state } = job as { id?: unknown; state?: unknown };
+  if (typeof id !== "string" || typeof state !== "string" || !ORACLE_TERMINAL_STATES.has(state)) return false;
+  if (!pi.events) return false;
+  pi.events.emit(ORACLE_FINISHED_CHANNEL, { id, state });
   return true;
 }
 
@@ -178,7 +211,21 @@ export default function surfExtension(pi: Pi) {
     tool: Type.String(), args: Type.Optional(Type.Record(Type.String(), Type.Unknown())), tabId: Type.Optional(Type.Number()),
   }), (args) => [args.tool as string, (args.args as Record<string, unknown>) ?? {}, args.tabId as number | undefined]);
   registerTool(pi, "surf_oracle_status", "Get the status of a Surf oracle job, or the newest job.", Type.Object({ id: Type.Optional(Type.String()) }), (args) => ["oracle.status", args, undefined]);
-  registerTool(pi, "surf_oracle_result", "Capture the result of a Surf oracle job.", Type.Object({ id: Type.String(), timeout: Type.Optional(Type.Number()) }), (args) => ["oracle.result", args, undefined]);
+  pi.registerTool({
+    name: "surf_oracle_result",
+    label: "surf_oracle_result",
+    description: "Capture the result of a Surf oracle job.",
+    parameters: Type.Object({ id: Type.String(), timeout: Type.Optional(Type.Number()) }),
+    async execute(_id: string, args: Record<string, unknown>) {
+      try {
+        const result = await requestSurf("oracle.result", args);
+        emitOracleFinished(pi, result.details ?? { id: args.id, state: result.isError ? "failed" : undefined });
+        return result;
+      } catch (error) {
+        return textResult(error instanceof Error ? error.message : String(error), true);
+      }
+    },
+  });
 
   const oracleJobIds = new Set<string>();
   let sessionGeneration = 0;
@@ -204,6 +251,7 @@ export default function surfExtension(pi: Pi) {
   let dispose: (() => void) | undefined;
   pi.on("session_start", (_event, ctx) => {
     sessionGeneration++;
+    const generation = sessionGeneration;
     sessionActive = false;
     dispose?.();
     dispose = undefined;
@@ -216,8 +264,22 @@ export default function surfExtension(pi: Pi) {
       const jobs = require("../native/oracle-jobs.cjs") as { listJobs(): Array<{ id: string; state: string }> };
       dispose = registerOptionalBackgroundProvider(sessionId, oracleJobIds, jobs.listJobs, registerGlobalBackgroundProvider);
       sessionActive = true;
+      void resolveBackgroundWorkRegister().then((register) => {
+        try {
+          if (register === registerGlobalBackgroundProvider || generation !== sessionGeneration) return;
+          const nextDispose = registerOptionalBackgroundProvider(sessionId, oracleJobIds, jobs.listJobs, register);
+          if (generation !== sessionGeneration) {
+            nextDispose();
+            return;
+          }
+          dispose?.();
+          dispose = nextDispose;
+        } catch {
+          // Keep the already-registered fallback provider.
+        }
+      });
     } catch {
-      // pi-subagents is optional. Browser tools work without it.
+      // The Pi bridge is optional. Browser tools work without pi-subagents.
     }
   });
   pi.on("session_shutdown", () => {

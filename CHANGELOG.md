@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+## [2.13.0] - 2026-08-08
+
+### Added
+- **Kimi AI integration** - Added `surf kimi` for Kimi browser-session queries and validation. Thanks to @jagaliano for #178.
+
+### Changed
+- **Pi extension background bridge** - Prefer the official `pi-subagents/background-work` helper when Pi loads Surf with pi-subagents available, while keeping the global fallback for Claude Code, Codex, Cursor, direct CLI use, and other non-Pi harnesses.
+
+### Fixed
+- **Pi skill discovery** - Added frontmatter to the packaged `skills/README.md` index so Pi no longer reports it as a root skill with a missing description. Thanks to @jagaliano for #177.
+- **Pi oracle wake channel** - Emit `surf-oracle:finished` when Surf observes a terminal oracle result so pi-subagents can wake without waiting for the next snapshot poll.
+
 ## [2.12.0] - 2026-08-07
 
 ### Added

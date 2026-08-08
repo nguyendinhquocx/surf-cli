@@ -490,6 +490,12 @@ surf aistudio "explain quantum computing"
 surf aistudio "redteam this" --with-page                      # Include page context
 surf aistudio "quick answer" --model gemini-3-flash-preview   # Model selection
 
+# Kimi (queries kimi.com - Moonshot K-series - using your browser login)
+surf kimi "explain quantum computing"
+surf kimi "summarize" --with-page                             # Include page context
+surf kimi "quick answer" --model thinking                     # Models: instant (default), thinking, high
+surf kimi --validate                                           # Check kimi.com UI and available models
+
 # AI Studio App Builder (generates full web apps from a prompt)
 surf aistudio.build "build a portfolio site"
 surf aistudio.build "todo app" --model gemini-3.1-pro-preview # Model override

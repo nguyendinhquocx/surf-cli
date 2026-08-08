@@ -22,6 +22,7 @@ const PROVIDER_DEFAULT_TIMEOUT_SECONDS = {
   chatgpt: 2700,
   gemini: 300,
   grok: 300,
+  kimi: 300,
   perplexity: 120,
   "oracle.result": 300,
   "playbook.run": 600,

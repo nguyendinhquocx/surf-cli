@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 
 // @ts-expect-error - CommonJS module without type definitions
 import * as parser from "../../native/do-parser.cjs";
+// @ts-expect-error - CommonJS module without type definitions
+import * as workflowDefinition from "../../native/workflow-definition.cjs";
 
 describe("parseDoCommands", () => {
   it("parses single command", () => {
@@ -220,5 +222,20 @@ describe("parseCommandLine", () => {
   it("applies alias in parseCommandLine", () => {
     const result = parser.parseCommandLine("snap");
     expect(result.cmd).toBe("screenshot");
+  });
+
+  it("maps Kimi prompts to query and redacts them in workflow metadata", () => {
+    expect(parser.parseCommandLine('kimi "summarize this page"')).toEqual({
+      cmd: "kimi",
+      args: { query: "summarize this page" },
+    });
+    expect(workflowDefinition.commandMetadata("kimi")).toMatchObject({
+      primaryArg: "query",
+      effect: "page-write",
+      sensitiveArgs: ["query"],
+    });
+    expect(workflowDefinition.redactCommandArgs("kimi", { query: "summarize this page" })).toEqual({
+      query: "<query>",
+    });
   });
 });

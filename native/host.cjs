@@ -12,6 +12,7 @@ const chatgptClient = require("./chatgpt-client.cjs");
 const geminiClient = require("./gemini-client.cjs");
 const perplexityClient = require("./perplexity-client.cjs");
 const grokClient = require("./grok-client.cjs");
+const kimiClient = require("./kimi-client.cjs");
 const aistudioClient = require("./aistudio-client.cjs");
 const aistudioBuild = require("./aistudio-build.cjs");
 const { mapToolToMessage, mapComputerAction, formatToolContent, formatToolError, buildProviderUploadMessage } = require("./host-helpers.cjs");
@@ -1237,13 +1238,115 @@ function handleToolRequest(msg, socket, requestContext = requestStorage.getStore
       }
       sendToolResponse(socket, originalId, result, null);
     }).catch((err) => {
-      sendToolResponse(socket, originalId, null, err.message);
-    });
-    
-    return;
-  }
+          sendToolResponse(socket, originalId, null, err.message);
+        });
 
-  if (extensionMsg.type === "AISTUDIO_QUERY") {
+        return;
+      }
+
+      if (extensionMsg.type === "KIMI_QUERY") {
+        const { query, model, withPage, timeout } = extensionMsg;
+
+        queueAiRequest(async () => {
+          // 1. Get page context if requested
+          let pageContext = null;
+          if (withPage) {
+            const pageResult = await requestCallExtension(
+              requestContext,
+              "get_page_text",
+              { type: "GET_PAGE_TEXT", tabId: extensionMsg.tabId },
+              45000,
+            );
+            if (pageResult && !pageResult.error) {
+              pageContext = {
+                url: pageResult.url,
+                text: pageResult.text || pageResult.pageContent || ""
+              };
+            }
+          }
+
+          // 2. Build full prompt
+          let fullPrompt = query || "";
+          if (pageContext) {
+            fullPrompt = `Page: ${pageContext.url}\n\n${pageContext.text}\n\n---\n\n${fullPrompt}`;
+          }
+
+          // 3. Call Kimi client (uses generic browser primitives, no provider CDP types)
+          const result = await kimiClient.query({
+            prompt: fullPrompt,
+            extractionPrompt: query,
+            signal: requestContext.signal,
+            model: model,
+            timeout: timeout || 300000,
+            createTab: () => requestCallExtension(
+              requestContext,
+              "create_tab",
+              { type: "NEW_TAB", url: "https://www.kimi.com/" },
+            ),
+            closeTab: (tabIdToClose) => requestCallExtension(requestContext, "close_tab", { type: "CLOSE_TAB", tabId: tabIdToClose }, 45000, true),
+            jsEval: (tabId, code) => requestCallExtension(
+              requestContext,
+              "js_eval",
+              { type: "EXECUTE_JAVASCRIPT", tabId, code },
+            ),
+            log: (msg) => log(`[kimi] ${msg}`)
+          });
+
+          return result;
+        }).then((result) => {
+          const response = {
+            response: result.response,
+            model: result.model,
+            tookMs: result.tookMs
+          };
+          if (result.partial) {
+            response.partial = true;
+          }
+          if (result.warnings && result.warnings.length > 0) {
+            response.warnings = result.warnings;
+          }
+          if (result.modelSelectionFailed) {
+            response.modelSelectionFailed = true;
+          }
+          if (result.url) {
+            response.url = result.url;
+          }
+          sendToolResponse(socket, originalId, response, null);
+        }).catch((err) => {
+          sendToolResponse(socket, originalId, null, err.message);
+        });
+
+        return;
+      }
+
+      if (extensionMsg.type === "KIMI_VALIDATE") {
+        queueAiRequest(async () => {
+          const result = await kimiClient.validate({
+            signal: requestContext.signal,
+            createTab: () => requestCallExtension(
+              requestContext,
+              "create_tab",
+              { type: "NEW_TAB", url: "https://www.kimi.com/" },
+            ),
+            closeTab: (tabIdToClose) => requestCallExtension(requestContext, "close_tab", { type: "CLOSE_TAB", tabId: tabIdToClose }, 45000, true),
+            jsEval: (tabId, code) => requestCallExtension(
+              requestContext,
+              "js_eval",
+              { type: "EXECUTE_JAVASCRIPT", tabId, code },
+            ),
+            log: (msg) => log(`[kimi] ${msg}`)
+          });
+          return result;
+        }).then((result) => {
+          sendToolResponse(socket, originalId, result, null);
+        }).catch((err) => {
+          sendToolResponse(socket, originalId, null, err.message);
+        });
+
+        return;
+      }
+
+      if (extensionMsg.type === "AISTUDIO_QUERY") {
     const { query, model, withPage, timeout } = extensionMsg;
     
     queueAiRequest(async () => {

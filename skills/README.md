@@ -1,3 +1,9 @@
+---
+name: surf-skills
+description: Package index for Surf skills. Use when you need install or layout notes for the Surf skill bundle.
+disable-model-invocation: true
+---
+
 # Surf Skills
 
 This directory contains skill files for AI coding agents:

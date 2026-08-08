@@ -290,6 +290,16 @@ const TOOL_SCHEMAS = {
       timeout: z.number().optional().describe("Timeout in seconds")
     }
   },
+  kimi: {
+    desc: "Ask Kimi AI (kimi.com, Moonshot K-series) through the browser session",
+    schema: {
+      query: z.string().optional().describe("Question or prompt"),
+      model: z.string().optional().describe("Model: instant (default), thinking, high, or any label in kimi.com's picker"),
+      "with-page": z.boolean().optional().describe("Include current page context"),
+      timeout: z.number().optional().describe("Timeout in seconds"),
+      validate: z.boolean().optional().describe("Check kimi.com UI and list available models")
+    }
+  },
   "network.export": {
     desc: "Export captured network requests",
     schema: {
