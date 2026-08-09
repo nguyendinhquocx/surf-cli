@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+## [2.13.1] - 2026-08-09
+
+### Changed
+- **Dependency maintenance** - Updated Vite to 8.2.1, Biome to 2.5.7, Puppeteer to 25.5.0, and Chrome types to 0.2.5.
+- **Real Chrome E2E** - Updated the pinned Chrome for Testing version to 151.0.7922.71 for Puppeteer 25.5.0.
+
+### Fixed
+- **Windows private state** - Skip unsupported POSIX permission-bit checks when reading private state files on Windows. Thanks to Andrey Oz (@ozand) for #181.
+- **Chrome test mocks** - Add the required tab `lastAccessed` value for the updated Chrome type definitions.
+
 ## [2.13.0] - 2026-08-08
 
 ### Added
