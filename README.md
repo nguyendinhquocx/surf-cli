@@ -458,7 +458,7 @@ Query AI models using your browser's logged-in session:
 # ChatGPT
 surf chatgpt "explain this code"
 surf chatgpt "summarize" --with-page     # Include page context
-surf chatgpt "analyze" --model gpt-4o    # Specify model
+surf chatgpt "analyze" --model gpt-5.5   # Specify model
 surf chatgpt "review" --file code.ts     # Attach file
 
 # Gemini
@@ -505,10 +505,10 @@ surf aistudio.build "game" --keep-open --timeout 600          # Keep tab open, 1
 
 #### Oracle
 
-Use `surf oracle` for a durable, local ChatGPT consult instead of a quick `surf chatgpt` one-shot. It persists jobs by conversation URL, supports repeatable file-context globs, and verifies requested model and reasoning effort before submission.
+Use `surf oracle` for a durable, local ChatGPT consult instead of a quick `surf chatgpt` one-shot. It persists jobs by conversation URL, supports repeatable file-context globs, and verifies requested model and reasoning effort before submission. ChatGPT model aliases include `instant`, `thinking`, `pro`, `gpt-5.5`, and `gpt-5.6-sol`.
 
 ```bash
-surf oracle ask "review this change" --files "src/**/*.ts" --model pro --effort extended --detach --json
+surf oracle ask "review this change" --files "src/**/*.ts" --model gpt-5.5 --effort pro --detach --json
 surf oracle status <job-id> --json
 surf oracle result <job-id> --wait --json
 surf oracle follow <job-id> "challenge that recommendation" --detach --json
@@ -968,6 +968,8 @@ pi -e /path/to/surf-cli/pi-extension/surf.ts
 ```
 
 It registers `surf_read`, `surf_screenshot`, `surf_click`, `surf_type`, `surf_tool`, and the `surf_oracle_*` tools. Browser calls use Surf's native-host socket, not shell commands. If `pi-subagents/background-work` is installed, the extension also reports active oracle jobs started by that Pi session. Pi still loads the browser tools when pi-subagents is not installed.
+
+The extension also registers a `surf-oracle` external-job provider when a Pi runtime exposes that provider bridge. The provider has `start`, `status`, `result`, `reattach`, and `follow` operations. Each operation returns Surf job metadata with the durable conversation URL, requested and verified ChatGPT model and effort, prompt digest, result text when captured, and failure details when present. Capacity stays fail-closed: Surf returns the blocking job id instead of silently queueing a second ChatGPT job.
 
 Surf agents share one browser session. Use read tools for parallel scouts when possible. `surf_click` and `surf_type` can interfere with another agent's browser actions. Browser leases are not available yet.
 
