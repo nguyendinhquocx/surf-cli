@@ -2,11 +2,13 @@
 
 ## [Unreleased]
 
+## [2.14.0] - 2026-08-18
+
 ### Added
-- **Surf Oracle external-job provider** - Register a stable `surf-oracle` external-job provider for Pi integrations, with durable start/status/result/reattach/follow operations backed by Surf Oracle job state.
+- **Surf Oracle provider for Pi** - Added a stable `surf-oracle` provider so Pi integrations can start, check, resume, follow, and collect Surf Oracle jobs through durable job state.
 
 ### Fixed
-- **ChatGPT Pro picker** - Resolve the advertised `--model pro` alias to the current GPT-5.6 Sol model, support explicit GPT-5.5 and GPT-5.6 Sol selection, and retain the Pro effort selector for ChatGPT Oracle dispatch.
+- **ChatGPT Pro model alias** - Fixed `surf oracle --model pro` so it selects and verifies the current GPT-5.6 Sol model. Explicit GPT-5.5 and GPT-5.6 Sol selection still work, and the Pro effort selector is unchanged.
 
 ## [2.13.1] - 2026-08-09
 
