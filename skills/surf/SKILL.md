@@ -47,6 +47,17 @@ surf --find <term>             # Search tools
 surf --help-topic <topic>      # Topic guide (refs, semantic, frames, devices, windows)
 ```
 
+## First Command for Independent Agents
+
+Before the first browser command in each independent agent shell, choose a unique valid session name and ensure its target exists:
+
+```bash
+export SURF_SESSION="$(basename "$PWD" | sed 's/[^A-Za-z0-9._-]/-/g')"
+surf session.ensure "$SURF_SESSION" about:blank
+```
+
+`session.ensure` is idempotent. It creates a missing session, reuses a live binding, and reopens a stale or closed tab. Keep `SURF_SESSION` set for every later tab-scoped command in that shell. Use a distinct worktree/directory name per agent; when agents share one directory, append a stable agent identifier. Use `surf session.info "$SURF_SESSION"` to inspect the target and queue state.
+
 ## Core Workflow
 
 ```bash
@@ -103,7 +114,9 @@ surf oracle result <job-id> --wait --json
 
 Treat Pro quota as scarce. Oracle never selects Pro implicitly; request it with `--model pro` or `--effort pro`. ChatGPT model aliases include `instant`, `thinking`, `pro`, `gpt-5.5`, and `gpt-5.6-sol`. Accepted `--effort` values are `light`, `standard`, `extended`, `heavy`, and `pro`. Requested model and effort selections are read back before submission, and an unverifiable selection fails with `model_verification_failed` instead of silently continuing. Capacity is one non-terminal oracle job. A `capacity` error includes the in-flight job ID; poll that job or wait for it to finish rather than submitting the same consult again.
 
-When loaded as a Pi extension, Surf also registers a `surf-oracle` external-job provider when the runtime exposes that bridge. The provider maps `start`, `status`, `result`, `reattach`, and `follow` to durable Surf Oracle jobs. It returns the conversation URL, requested and verified model and effort, prompt digest, result text, and failure details. `reattach` only harvests an existing job by ID; it never submits the prompt again.
+When loaded as a Pi extension, Surf also registers a `surf-oracle` external-job provider when the runtime exposes that bridge. The provider maps `start`, `status`, `result`, `reattach`, and `follow` to durable Surf Oracle jobs. It honors `options.model` and `options.effort` for starts and follows, so `model: pro` selects ChatGPT GPT-5.6 Sol Pro web mode through the browser. It returns the conversation URL, requested and verified model and effort, prompt digest, result text, and failure details. `reattach` only harvests an existing job by ID; it never submits the prompt again.
+
+When Surf is installed as a Pi package, it exposes an optional `gpt-pro` package agent for `pi-subagents`. That profile uses `runner.type: external-job`, provider `surf-oracle`, and `options.model: pro`. Surf remains useful without Pi or `pi-subagents`.
 
 Context comes from repeatable `--files` globs. Surf fails closed when a glob matches nothing or a matched file is unreadable, binary, or invalid UTF-8. It also blocks gitignored files and basenames matching `.env*`, `*.pem`, `*.key`, `id_rsa*`, `id_ed25519*`, `*.p12`, `*.pfx`, `credentials*`, or `secrets*`. Use `--allow-sensitive` only after intentionally reviewing those files; it overrides the block rather than redacting content. Context up to 60,000 evidence characters is inserted inline, while larger context becomes one private text attachment. The assembly manifest records each path, byte count, SHA-256, inline or bundle disposition, and deny-list outcome.
 
@@ -247,20 +260,27 @@ surf window.resize --id 123 --width 1920 --height 1080
 surf window.resize --id 123 --state maximized # States: normal, minimized, maximized, fullscreen
 ```
 
-**Multi-agent isolation:**
-```bash
-# Create a separate window for one agent and keep using its ID
-surf window.new "https://example.com"
-surf --window-id 123 tab.list
-surf --window-id 123 go "https://other.com"
+**Concurrent agent sessions:**
 
-# Pin work to a specific tab, or name it for easier handoff
-surf read --tab-id 456
-surf tab.name agent-a --tab-id 456
-surf tab.switch agent-a
+```bash
+# Required first command rule for each independent agent shell
+export SURF_SESSION="$(basename "$PWD" | sed 's/[^A-Za-z0-9._-]/-/g')"
+surf session.ensure "$SURF_SESSION" about:blank
+
+# Explicit form when an environment variable is inconvenient
+surf --session research go "https://example.com"
+surf --session research read
+
+# Inspect bindings and scheduler state
+surf session.list --refresh
+surf session.info research --refresh
 ```
 
-Use `window.new`, `--window-id`, `--tab-id`, and named tabs to keep parallel agents on separate targets. Surf serializes non-streaming browser CLI requests per socket with a file-based lock, so agents sharing one native host wait instead of interleaving commands. Use `--no-lock` only for intentional bypasses. For hard isolation, run separate browser/profile instances with separate native hosts and `SURF_SOCKET` values; each socket gets its own lock. Surf does not yet have `session.new`, session IDs, or independent per-agent CDP sessions.
+Each session owns one explicit tab and defaults to a separate unfocused window. Commands for the same tab are FIFO; different session tabs may run concurrently. Browser-wide writers wait for tab lanes to drain. `--no-wait` returns `tab_busy` or `browser_busy` immediately. On `tab_gone` or `session_epoch_stale`, run the exact command printed after `Recovery:`—normally `surf session.reopen <name>`.
+
+Browser-login provider commands (`chatgpt`, `gemini`, `perplexity`, `grok`, `kimi`, `aistudio`, and `oracle ask`) take exclusive browser access and print a warning before dispatch. Do not assume Surf is hung while that warning is visible; inspect `surf session.info <name>` from another shell to see the active writer.
+
+Sessions share cookies, authentication, same-origin storage, downloads, history, bookmarks, and other Chrome-profile state. Use separate browser/profile instances and `SURF_SOCKET` values only when hard isolation is required. Explicit `--tab-id`, `--window-id`, and named tabs remain available for one-off targeting.
 
 ## Input Methods
 
@@ -439,14 +459,16 @@ surf upload --ref e5 --files "/path/file1.txt,/path/file2.txt"
 
 ```bash
 surf frame.list                # List frames with IDs
-surf frame.switch "FRAME_ID"   # Switch to iframe context
+surf frame.switch --selector "#payment-iframe"
+surf frame.switch --name "checkout"
+surf frame.switch --index 0    # First iframe
 surf frame.main                # Return to main frame
-surf frame.js --id "FRAME_ID" --code "return document.title"
+surf frame.js "return document.title" --id "FRAME_ID"
 
 # After frame.switch, subsequent commands target that frame:
-surf frame.switch "iframe-1"
+surf frame.switch --selector "#payment-iframe"
 surf page.read                 # Reads iframe content
-surf click e5                  # Clicks in iframe
+surf click --selector "#pay"   # Clicks in iframe
 surf frame.main                # Back to main page
 ```
 
@@ -549,6 +571,9 @@ surf do 'go "https://example.com" | click e5 | screenshot'
 
 # Multi-step login flow
 surf do 'go "https://example.com/login" | type "user@example.com" --selector "#email" | type "pass" --selector "#password" | click --selector "button[type=submit]"'
+
+# JSON action batch. Uses SURF_SESSION when it is set.
+surf batch --actions '[{"type":"frame.switch","index":0},{"type":"click","selector":"#pay"}]'
 
 # Validate without executing
 surf do 'go "url" | click e5' --dry-run
@@ -683,9 +708,11 @@ surf wait.element ".missing" --auto-capture --timeout 2000
 ## Common Options
 
 ```bash
---tab-id <id>         # Target specific tab
---window-id <id>      # Target specific window
---json                # Raw JSON output  
+--session <name>      # Target a durable named session (or set SURF_SESSION)
+--tab-id <id>         # Target a specific tab
+--window-id <id>      # Target a specific window
+--no-wait             # Return tab_busy/browser_busy instead of queueing
+--json                # Raw JSON including target metadata
 --auto-capture        # Screenshot + console on error
 --timeout <ms>        # Override default timeout
 ```
@@ -703,12 +730,12 @@ surf wait.element ".missing" --auto-capture --timeout 2000
 9. **AI Studio for unrestricted Gemini** - `surf aistudio` gives less filtered responses than `surf gemini` for the same models
 10. **Use `surf do` for multi-step tasks** - Reduces token overhead and improves reliability
 11. **Dry-run workflows first** - `surf do '...' --dry-run` validates without executing
-12. **Window isolation** - Use `window.new` + `--window-id` or `--tab-id` to keep agent work separate from your browsing
-13. **Request lock** - Non-streaming browser CLI requests serialize per socket; use `--no-lock` only when you intentionally want to bypass it
+12. **Session first** - Set a unique `SURF_SESSION` and run `session.ensure` before the first browser command in every independent agent shell
+13. **Queue diagnostics** - `session.info` distinguishes the session's own tab queue, other active tabs, and browser-wide writers; use `--no-wait` for immediate busy errors
 14. **Native host diagnostics** - If commands fail with socket/native-host errors, run `surf doctor` or `surf doctor --browser all` before guessing at reinstall steps
 15. **HTML export** - Use `surf page.html > artifact.html` to save Claude artifacts or any rendered page as static HTML
 16. **Animation capture** - Use `surf record --duration 2000 --fps 10 --output /tmp/anim.gif` when the agent needs to see motion; use `animate-audit` for numeric timelines and `perf-audit` for jank/layout-shift snapshots
-17. **Hard isolation** - Use separate browser/profile instances plus separate `SURF_SOCKET` values when agents must not share a host or target
+17. **Hard isolation** - Sessions share a Chrome profile; use separate browser/profile instances plus separate `SURF_SOCKET` values when profile state must not be shared
 18. **Semantic locators** - `locate.role`, `locate.text`, `locate.label` for more robust element finding
 19. **Frame context** - Use `frame.switch` before interacting with iframe content
 

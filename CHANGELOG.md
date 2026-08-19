@@ -2,6 +2,29 @@
 
 ## [Unreleased]
 
+## [2.15.0] - 2026-08-19
+
+### Highlights
+- Named browser sessions: bind work to a specific tab with `session.new`, `--session`, or `SURF_SESSION`, and manage it with list/info/close/rebind/reopen commands.
+- Multiple sessions can now run commands at the same time, each tab keeping its own order.
+- Clearer errors: session and scheduler failures include a copy-paste recovery command.
+- Optional GPT Pro agent for Pi users: ask ChatGPT GPT-5.6 Sol Pro web mode through the packaged `gpt-pro` agent.
+
+### Added
+- **Durable browser sessions** - Added `session.new`, idempotent `session.ensure`, list/info/close/rebind/reopen commands, `--session`, and `SURF_SESSION` for explicit tab-bound work.
+- **Concurrent tab lanes** - Different session tabs can execute concurrently while each tab remains FIFO; browser-wide mutations and browser-login provider flows remain exclusive.
+- **GPT Pro package agent** - Surf now ships an optional `gpt-pro` agent for `pi-subagents` users, backed by ChatGPT GPT-5.6 Sol Pro web mode.
+
+### Changed
+- **Recovery guidance** - Session and scheduler errors now include copy-paste recovery commands, `session.info` reports queue blockers, and provider tools warn before taking exclusive browser access.
+- **Strict target safety** - Session commands never fall back to the active tab, and screenshot fallback refuses to capture a different visible tab.
+- **Surf skill guidance** - Updated iframe and batch examples for session-based workflows.
+- **Pi external-job options** - The `surf-oracle` provider now honors `options.model` and `options.effort`, so Pi agent profiles can request ChatGPT GPT-5.6 Sol Pro web mode with `model: pro`.
+- **Dependency maintenance** - Updated dev dependencies: `@types/node` 26.2.0, `@biomejs/biome` 2.5.8, and `typebox` 1.3.14.
+
+### Fixed
+- **Batch iframe targeting** - Selector clicks in a batch now use the selected session frame after `frame.switch`.
+
 ## [2.14.0] - 2026-08-18
 
 ### Added
@@ -91,7 +114,7 @@
 - **Animation recording** - Added `surf record --duration ... --fps ... --output ...` to capture screenshot bursts and assemble animated GIFs with ImageMagick. (@SeMmyT)
 - **Browser request lock** - Added per-socket CLI request serialization for multi-agent workflows, with `--no-lock` for intentional bypasses. (@SeMmyT)
 - **Animation audit** - Added `surf animate-audit --selector ... --duration ... --fps ...` for bounded JSON timelines of element rect/style samples. (@SeMmyT)
-- **Concurrency docs** - Documented the current multi-agent isolation contract: window/tab targeting, named tabs, `SURF_SOCKET` for separate browser/profile instances, and the absence of built-in session IDs or independent per-agent CDP sessions.
+- **Concurrency docs** - Documented the pre-session isolation contract available in 2.8.0: window/tab targeting, named tabs, and separate `SURF_SOCKET` instances.
 - **LLM context flag** - Added `surf --llm-context` as a compact, deterministic quick reference for AI agents. (@SeMmyT)
 - **CLI/native socket integration coverage** - Added CI-safe integration tests for Surf CLI request framing, fake native-host responses, host errors, and missing-socket diagnostics.
 - **Native host protocol integration coverage** - Added CI-safe tests for `native/host.cjs` native-messaging framing, CLI request forwarding, extension responses, and extension error propagation without real Chrome.

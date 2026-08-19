@@ -1,6 +1,6 @@
 {
   "name": "surf-cli",
-  "version": "2.14.0",
+  "version": "2.15.0",
   "description": "CLI for AI agents to control Chrome. Zero config, agent-agnostic, battle-tested.",
   "keywords": [
     "chrome",
@@ -33,6 +33,7 @@
     "playbooks/",
     "scripts/",
     "dist/",
+    "agents/",
     "skills/",
     "README.md",
     "LICENSE"
@@ -81,7 +82,12 @@
     ],
     "skills": [
       "./skills"
-    ]
+    ],
+    "subagents": {
+      "agents": [
+        "./agents"
+      ]
+    }
   },
   "peerDependencies": {
     "typebox": "*"
