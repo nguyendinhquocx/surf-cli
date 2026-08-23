@@ -1,6 +1,8 @@
 import { vi } from "vitest";
 // @ts-expect-error - CommonJS module without type definitions
 import * as chatgptClient from "../../native/chatgpt-client.cjs";
+// @ts-expect-error - CommonJS module without type definitions
+import * as chatgptClientUi from "../../native/chatgpt-client-ui.cjs";
 
 function createReadyChatGptEvaluate(
   loginStatus: Record<string, unknown> = { status: 200, hasLoginCta: false },
@@ -370,6 +372,18 @@ describe("chatgpt-client", () => {
 
     it.each([
       ["requested effort found", [effortOptions[2]], "extended", "Extended"],
+      [
+        "visible Pro label wins over unrelated test id metadata",
+        [{ role: "button", label: "Pro", testId: "thinking-time-standard" }],
+        "pro",
+        "Pro",
+      ],
+      [
+        "ambiguous visible label stays fail-closed",
+        [{ role: "button", label: "Pro Extended", testId: "thinking-time-pro" }],
+        "pro",
+        null,
+      ],
       ["requested effort missing", [effortOptions[1]], "extended", null],
       ["ambiguous effort state", [effortOptions[2], effortOptions[2]], "extended", null],
       [
@@ -382,6 +396,157 @@ describe("chatgpt-client", () => {
       expect(chatgptClient.verifyChatGPTEffortSelection(items, requested)?.label ?? null).toBe(
         expectedLabel,
       );
+    });
+
+    it("verifies Pro after opening a Thinking composer effort pill", async () => {
+      class FakeEventTarget {
+        dispatchEvent() {
+          return true;
+        }
+      }
+      class FakeButton extends FakeEventTarget {
+        tagName = "BUTTON";
+        textContent: string;
+        innerText: string;
+        attributes: Record<string, string>;
+
+        constructor(textContent: string, attributes: Record<string, string>) {
+          super();
+          this.textContent = textContent;
+          this.innerText = textContent;
+          this.attributes = attributes;
+        }
+
+        getAttribute(name: string) {
+          return this.attributes[name] ?? null;
+        }
+      }
+      class FakeMouseEvent {
+        constructor(
+          readonly type: string,
+          readonly init: unknown,
+        ) {}
+      }
+
+      const modelButton = new FakeButton("Pro", {
+        "aria-haspopup": "menu",
+        "data-testid": "model-switcher-dropdown-button",
+      });
+      const effortButton = new FakeButton("", {
+        "aria-haspopup": "menu",
+        "aria-labelledby": "effort-label",
+      });
+      let effortLabel = "Thinking";
+      const document = {
+        getElementById: (id: string) =>
+          id === "effort-label" ? { textContent: effortLabel } : null,
+        querySelectorAll: () => [modelButton, effortButton],
+      };
+
+      const cdp = async (expression: string) => {
+        if (expression.includes('const kind = "effort"')) {
+          return {
+            result: {
+              value: Function(
+                "document",
+                "EventTarget",
+                "MouseEvent",
+                "PointerEvent",
+                "window",
+                `return ${expression};`,
+              )(document, FakeEventTarget, FakeMouseEvent, undefined, {}),
+            },
+          };
+        }
+        if (expression.includes("const containers = Array.from")) {
+          return {
+            result: {
+              value: {
+                found: true,
+                items: [{ role: "menuitemradio", label: "Pro", testId: null, selected: false }],
+              },
+            },
+          };
+        }
+        if (expression.includes("const expectedLabel")) {
+          effortLabel = "Pro";
+          return { result: { value: true } };
+        }
+        throw new Error(`Unexpected expression: ${expression}`);
+      };
+
+      await expect(chatgptClientUi.selectEffort(cdp, "pro", 100)).resolves.toBe("Pro");
+    });
+
+    it("does not reopen the effort menu when Pro is already selected", async () => {
+      const cdp = async (expression: string) => {
+        if (expression.includes('const kind = "effort"')) {
+          return {
+            result: {
+              value: {
+                items: [{ role: "button", label: "Pro", displayLabel: "Pro", testId: null }],
+              },
+            },
+          };
+        }
+        throw new Error(`Unexpected expression: ${expression}`);
+      };
+
+      await expect(chatgptClientUi.selectEffort(cdp, "pro", 100)).resolves.toBe("Pro");
+    });
+
+    it("clears stale composer text before typing the prompt", async () => {
+      class FakeEventTarget {
+        dispatchEvent() {
+          return true;
+        }
+      }
+      class FakeInputEvent {
+        constructor(
+          readonly type: string,
+          readonly init: unknown,
+        ) {}
+      }
+      class FakeMouseEvent extends FakeInputEvent {}
+      let focused = false;
+      const textarea = new (class extends FakeEventTarget {
+        tagName = "TEXTAREA";
+        value = "stale text";
+        innerText = "";
+        textContent = "";
+        ownerDocument = {
+          getSelection: () => null,
+        };
+
+        focus() {
+          focused = true;
+        }
+      })();
+      const document = {
+        querySelector: (selector: string) => (selector === "#prompt-textarea" ? textarea : null),
+      };
+      const cdp = async (expression: string) => ({
+        result: {
+          value: Function(
+            "document",
+            "EventTarget",
+            "MouseEvent",
+            "PointerEvent",
+            "InputEvent",
+            "window",
+            `return ${expression};`,
+          )(document, FakeEventTarget, FakeMouseEvent, undefined, FakeInputEvent, {}),
+        },
+      });
+      const inputCdp = async (_method: string, params: { text: string }) => {
+        textarea.value += params.text;
+        return {};
+      };
+
+      await chatgptClientUi.typePrompt(cdp, inputCdp, "Reply with exactly: READY");
+
+      expect(textarea.value).toBe("Reply with exactly: READY");
+      expect(focused).toBe(true);
     });
 
     it("resolves effort options and accepts only the documented vocabulary", () => {

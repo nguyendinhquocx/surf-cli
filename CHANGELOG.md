@@ -2,6 +2,30 @@
 
 ## [Unreleased]
 
+## [2.16.1] - 2026-08-23
+
+### Highlights
+- GPT Pro jobs now clear stale composer text before submitting a prompt.
+- Pro effort verification now waits until ChatGPT has the real prompt in the composer.
+- Text-only GPT Pro runs and follow-ups are less fragile in reused ChatGPT tabs.
+
+### Fixed
+- **ChatGPT Pro effort verification** - Surf now clears stale composer text, types the prompt, and verifies the Pro effort from the composer picker before submitting.
+
+## [2.16.0] - 2026-08-23
+
+### Highlights
+- Pi integrations can now continue GPT Pro conversations through Surf Oracle follow-up jobs.
+- GPT Pro job polling is more reliable because status checks can observe finished jobs directly.
+- Cancelled GPT Pro jobs now stay cancelled instead of being reported as failed.
+
+### Added
+- **GPT Pro follow-ups** - Surf Oracle now records repeat-safe request IDs and follow-up lineage so Pi integrations can continue GPT Pro conversations.
+
+### Fixed
+- **Pi GPT Pro polling** - The `surf-oracle` provider now checks for completed jobs during status and reattach calls, so Pi can observe finished GPT Pro jobs without an extra result request.
+- **Pi GPT Pro cancellation** - Cancelled Surf Oracle requests now keep their cancellation state instead of being reported as failed jobs.
+
 ## [2.15.2] - 2026-08-22
 
 ### Highlights
