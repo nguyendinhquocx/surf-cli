@@ -2,8 +2,20 @@
 
 ## [Unreleased]
 
+## [2.17.0] - 2026-08-28
+
+### Highlights
+- GPT Pro Oracle runs can now include one local file as context.
+- GPT Pro follow-ups can attach a file without losing the current conversation.
+- Repository-aware GPT Pro runs can require ChatGPT's Chat mode and GitHub tool before Surf submits the prompt.
+
 ### Added
-- **GPT Pro Oracle context controls** - Surf Oracle can attach one local file and explicitly require ChatGPT's Chat tab with the GitHub tool for GPT Pro runs and follow-ups.
+- **GPT Pro Oracle attachments** - `surf oracle ask` and `surf oracle follow` now accept `--file <path>` to attach one local file to ChatGPT GPT Pro runs.
+- **GPT Pro GitHub context** - `surf oracle ask` and `surf oracle follow` now accept `--github` to require ChatGPT's Chat tab and connected GitHub tool before submission.
+- **Pi Oracle options** - Surf's Pi tool and external-job provider now forward explicit file and GitHub context options.
+
+### Fixed
+- **Attachment error reporting** - Oracle attachment failures now preserve clearer file access, selector, file chooser, and ChatGPT processing error details.
 
 ## [2.16.1] - 2026-08-23
 
