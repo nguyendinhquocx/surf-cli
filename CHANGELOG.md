@@ -2,10 +2,26 @@
 
 ## [Unreleased]
 
+## [2.18.0] - 2026-09-04
+
+### Highlights
+- Record long-running browser sessions as local WebM videos.
+- Use GPT-6 Astra with Pro effort through Surf Oracle and Pi's `gpt-pro` integration.
+- Clean up stale or idle Surf sessions with an optional dry run.
+- Share local Surf access with a dedicated user group while keeping private access as the default.
+
 ### Added
-- **Local WebM video recording** - Added local `surf video start|stop|status|restart` commands using ffmpeg/VP9; remote recording is rejected.
-- **One-shot session cleanup** - Added opt-in `surf session.cleanup --idle-after <duration> [--dry-run]` to remove gone or idle session bindings, closing only inactive Surf-created targets. Reported by @marcoatpaladin in #233.
-- **Opt-in local socket groups** - `surf install` can persist POSIX socket mode `660` and a configured group while keeping the default at `0600`. Thanks to [@marcoatpaladin](https://github.com/marcoatpaladin) for #225.
+- **Local WebM video recording** - Record browser sessions with `surf video start|stop|status|restart`. Requires ffmpeg with VP9 support and runs locally only. Existing GIF recording is unchanged.
+- **Session cleanup** - `surf session.cleanup --idle-after <duration> [--dry-run]` removes stale or idle session bindings and closes only inactive Surf-created tabs or windows. Thanks to [@marcoatpaladin](https://github.com/marcoatpaladin) for #233.
+- **Optional local socket sharing** - `surf install` can grant a configured POSIX group access with socket mode `660`. Private mode `0600` remains the default. Thanks to [@marcoatpaladin](https://github.com/marcoatpaladin) for #225.
+
+### Changed
+- **GPT Pro default** - Pi's packaged `gpt-pro` integration now uses GPT-6 Astra with Pro effort.
+- **ChatGPT selection options** - Model choices include `gpt-6-astra`, `latest`, `gpt-5.6-sol`, and `gpt-5.5`. Effort options are now `instant`, `medium`, `high`, `xhigh`/`extra-high`, and `pro`, replacing the previous effort names. Explicit GPT-6 Astra requests fail rather than silently switching models when ChatGPT hides the model version; use `latest` only when floating model selection is intended.
+- **Development dependencies** - Updated development tooling dependencies.
+
+### Fixed
+- **ChatGPT model and effort selection** - Surf works with ChatGPT's current model menu and effort slider, checks the selected values, and closes the menu between operations. The requested model is checked again before the prompt is sent.
 
 ## [2.17.0] - 2026-08-28
 
