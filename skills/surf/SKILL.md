@@ -7,6 +7,8 @@ description: Control Chrome browser via CLI for testing, automation, and debuggi
 
 Control Chrome browser via CLI or Unix socket.
 
+Ordinary socket-backed CLI commands report top-level host tool-response errors on stderr with a supplied `[code]` on the first line and exit 1. `--json` additionally writes `{error:{code,message,details?}}` on stdout (missing code becomes `"error"`). `--soft-fail` instead keeps the original stderr warning, empty stdout and exit 0, even with `--json`. This does not cover local validation, transport/parser failures or compound-command errors: do not assume every failure produces JSON. Connection failures remain stderr-only and exit 1, including with `--soft-fail`.
+
 ## Native Host / Socket Notes
 
 For WSL2 with Windows Chrome, run `surf install <extension-id>` inside WSL2. Surf detects WSL2 and writes the Windows-side native messaging manifest plus a wrapper that launches the WSL host. Use `surf install <extension-id> --target linux` only for Linux browsers running inside WSLg.
@@ -34,8 +36,17 @@ surf --remote 100.101.102.103:4321 \
   --remote-credential ~/.config/surf/agent-macbook.json \
   page.read
 
+# TLS is client-side and requires a TLS-terminating reverse proxy in front of SURF_LISTEN
+surf --remote surf.example.com:443 --remote-tls \
+  --remote-tls-ca ~/.config/surf/private-ca.pem \
+  --remote-credential ~/.config/surf/agent-macbook.json page.read
+
 surf remote revoke agent-macbook  # Run on the browser host
 ```
+
+Environment equivalents are `SURF_REMOTE_TLS=1`, `SURF_REMOTE_TLS_CA`, and
+`SURF_REMOTE_TLS_SERVER_NAME`. A custom CA replaces system roots; Ed25519 credentials remain
+mandatory after TLS validation.
 
 Remote paths are client-local by default. `local:./file` is explicit client-local syntax; only `remote:/absolute/path` accesses the browser host directly. Remote transfer supports one upload or ChatGPT/Gemini input and one screenshot, network-export, or Gemini image output. Limits are 256 MiB per file, 512 MiB and 32 files per connection, and 256 KiB decoded chunks. `record`, `aistudio.build`, smoke screenshot directories, directories, and multi-file inputs are not supported remotely. Successful action screenshots and failure `--auto-capture` diagnostics are transferred back to client-local paths.
 
@@ -321,6 +332,7 @@ surf page.text                 # Plain text content only
 surf page.html --strip-scripts # Rendered HTML without scripts
 surf page.save --selector "#artifact" --strip-scripts --output page.html # Save one static element
 surf page.state                # Modals, loading state, scroll info
+surf frame.diagnose            # Why a selector misses: DOM iframes (incl. open shadow roots) vs extension frames vs CDP tree, with warnings; out-of-process frames need frame.switch, not frame.js
 ```
 
 ### Export Rendered HTML
@@ -398,7 +410,13 @@ surf wait.network              # Wait for network idle
 surf wait.url "/success"       # Wait for URL pattern
 surf wait.dom --stable 100     # Wait for DOM stability
 surf wait.load                 # Wait for page load complete
+surf wait.ready --selector ".results"                 # Ready, or fail fast: login / challenge / not-found / error
+surf wait.ready --url-prefix "https://app.example.com/" --empty-text "No results"  # empty vs blocked
+surf wait.ready --accept login --json                 # Return the negative state instead of failing
+surf page.readiness --json     # Classify the current page once (state + evidence)
 ```
+
+Typed readiness states replace "the selector never appeared": exit codes carry `page_login`, `page_challenge`, `page_not_found`, `page_error` or `page_timeout`. Detection uses visible UI (a rendered password field, a login route, the page's wording, a URL outside `--url-prefix`), not site selectors.
 
 ## Dialog Handling
 

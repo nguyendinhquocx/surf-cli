@@ -23,7 +23,7 @@ const repo = process.cwd();
 const extensionKey =
   "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEArWZVsRzpoyzuyQFqRzGOnkxv9FNaX/SR/VMw2f9ld+DKmUMxJhi/14olehkLWRJQumFPYTzWr1oqb1LwwI2KhBtn9mbaqzPSrrRGQ1VobTx7ZmxU+ooppXNdb2KGh/WXVqahS0D1nsQplAE6hCqQWPjsPCnXnWjUIH/B0EsInIUDwA8PKfuMG8p2HDlLj8hEpmLwOA48W4aHbl2S6bZHu9O50Lbd0L94aSwJLBNLKuXpBt/kFwlnpHd3zoJme9DIbqnDU/nMNh9SlA+EXRT6FhyiKdo6ZBMdtJeUPLQI2uHeoF8wikkNhIXX/E2EXlBqtZJJaFEi895x2s40+j/iZQIDAQAB"; // gitleaks:allow -- public test manifest key
 const extensionId = "nionemkjcnknfdhdolfloigkhpjnifmf";
-const pinnedChromeVersion = "152.0.7977.54";
+const pinnedChromeVersion = "152.0.7977.75";
 const scratch = mkdtempSync(join(tmpdir(), "surf-real-chrome-"));
 const home = join(scratch, "home");
 const extensionDir = join(scratch, "extension");
@@ -34,6 +34,7 @@ const screenshotPath = join(scratch, "shot.png");
 const hostPidPath = join(scratch, "native-host.pid");
 let browser;
 let browserPid;
+let crossOriginServer;
 let chromeExecutablePath;
 let puppeteer;
 let server;
@@ -106,6 +107,82 @@ async function runSurf(...args) {
     maxBuffer: 10 * 1024 * 1024,
   });
   return result.stdout;
+}
+
+/** `--json` with an explicit target wraps the payload as {result, target, notice}. */
+function unwrapJson(stdout) {
+  const parsed = JSON.parse(stdout);
+  return parsed && typeof parsed === "object" && "result" in parsed && "target" in parsed ? parsed.result : parsed;
+}
+
+/** tab.new prints "Created tab <id>: <url>" even with --json. */
+function tabIdFromOutput(stdout) {
+  const match = stdout.match(/\btab\s+(\d+)\b/i);
+  if (!match) throw new Error(`tab.new did not report a tab id: ${stdout}`);
+  return Number(match[1]);
+}
+
+/** Run surf expecting a non-zero exit; returns stdout and stderr. */
+async function runSurfExpectingFailure(...args) {
+  try {
+    const stdout = await runSurf(...args);
+    throw new Error(`Expected \`surf ${args.join(" ")}\` to fail, but it printed: ${stdout}`);
+  } catch (error) {
+    if (typeof error.code !== "number" || error.code === 0) throw error;
+    return { code: error.code, stdout: error.stdout ?? "", stderr: error.stderr ?? "" };
+  }
+}
+
+function fixturePages(request, { crossOriginBase }) {
+  const url = new URL(request.url, "http://127.0.0.1");
+  if (url.pathname === "/frames") {
+    return `<!doctype html><html><head><title>Surf frames fixture</title></head>
+<body><h1>Frames</h1>
+<iframe id="same-origin" src="/fixture" width="300" height="120"></iframe>
+<iframe id="inline" srcdoc="<p>inline</p>" width="200" height="60"></iframe>
+<iframe id="cross-origin" src="${crossOriginBase}/fixture" width="300" height="120"></iframe>
+<iframe id="sandboxed" src="/fixture?sandboxed" sandbox="allow-forms" width="200" height="60"></iframe>
+<div id="host"></div>
+<script>document.getElementById("host").attachShadow({ mode: "open" }).innerHTML = '<iframe id="shadowed" src="/fixture?shadowed" width="200" height="60"></iframe>';</script>
+</body></html>`;
+  }
+  if (url.pathname === "/login") {
+    return `<!doctype html><html><head><title>Sign in - Surf fixture</title></head>
+<body><main><h1>Sign in</h1><form><label>Email <input type="email" name="email"></label>
+<label>Password <input type="password" name="password"></label><button type="submit">Sign in</button></form></main></body></html>`;
+  }
+  if (url.pathname === "/list") {
+    const empty = url.searchParams.get("empty") === "1";
+    const items = empty
+      ? '<p class="empty-state">No results for this search.</p>'
+      : [1, 2, 3]
+          .map((n) => `<article class="item" data-id="${n}"><h2>Item ${n}</h2><a href="/items/${n}">open</a></article>`)
+          .join("");
+    return `<!doctype html><html><head><title>Surf list fixture</title></head>
+<body><h1>List</h1><label>Tracked <input id="tracked" type="text"></label><output id="mirror"></output>
+<section id="results">${items}</section>
+<script>
+  // Emulates a framework value tracker: an own "value" property on the
+  // instance shadows the native accessor and records what it saw. On
+  // "input" the framework compares its tracked value with the DOM value
+  // and ignores the event when they match, exactly like a controlled input.
+  const tracked = document.querySelector("#tracked");
+  const native = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value");
+  let trackedValue = "";
+  Object.defineProperty(tracked, "value", {
+    configurable: true,
+    get() { return native.get.call(this); },
+    set(next) { trackedValue = String(next); native.set.call(this, next); },
+  });
+  tracked.addEventListener("input", () => {
+    const domValue = native.get.call(tracked);
+    if (domValue === trackedValue) return; // framework sees no change
+    trackedValue = domValue;
+    document.querySelector("#mirror").textContent = domValue;
+  });
+</script></body></html>`;
+  }
+  return null;
 }
 
 try {
@@ -190,7 +267,23 @@ try {
   mkdirSync(join(profileDir, "NativeMessagingHosts"), { recursive: true });
   cpSync(standardManifest, testingManifest);
 
+  crossOriginServer = createServer((_request, response) => {
+    response.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+    response.end("<!doctype html><html><head><title>Cross-origin fixture</title></head><body><p>cross-origin fixture</p></body></html>");
+  });
+  await new Promise((resolve, reject) => {
+    crossOriginServer.once("error", reject);
+    crossOriginServer.listen(0, "127.0.0.1", resolve);
+  });
+  const crossOriginBase = `http://127.0.0.1:${crossOriginServer.address().port}`;
+
   server = createServer((request, response) => {
+    const extraPage = fixturePages(request, { crossOriginBase });
+    if (extraPage !== null) {
+      response.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+      response.end(extraPage);
+      return;
+    }
     const hasSessionCookie = request.headers.cookie?.includes("surf_session=present") === true;
     response.writeHead(200, {
       "content-type": "text/html; charset=utf-8",
@@ -221,6 +314,7 @@ try {
   const address = server.address();
   const fixtureUrl = `http://127.0.0.1:${address.port}/fixture`;
   const navigationUrl = `${fixtureUrl}?navigated`;
+  const baseUrl = `http://127.0.0.1:${address.port}`;
 
   browser = await puppeteer.launch({
     headless: true,
@@ -337,6 +431,158 @@ try {
     "visual indicator",
   );
 
+  // js --file with a statement script (MV3 CSP)
+  const statementScript = join(scratch, "statement-script.js");
+  writeFileSync(
+    statementScript,
+    'const heading = document.querySelector("h1")?.textContent ?? "";\nreturn { title: document.title, heading };\n',
+  );
+  const statementResult = unwrapJson(
+    await runSurf("js", "--file", statementScript, "--tab-id", String(fixtureTab.id), "--json"),
+  );
+  if (statementResult?.title !== "Surf real Chrome fixture" || statementResult?.heading !== "Surf real Chrome fixture") {
+    throw new Error(`js --file with a leading declaration did not run: ${JSON.stringify(statementResult)}`);
+  }
+
+  // Page readiness
+  const readiness = unwrapJson(await runSurf("page.readiness", "--json", "--tab-id", String(fixtureTab.id)));
+  if (readiness.state !== "ready" || readiness.readyState !== "complete") {
+    throw new Error(`page.readiness did not report ready: ${JSON.stringify(readiness)}`);
+  }
+  const waited = unwrapJson(
+    await runSurf("wait.ready", "--json", "--tab-id", String(fixtureTab.id), "--selector", "#fixture-button", "--text", "Clicked by Surf"),
+  );
+  if (waited.state !== "ready" || typeof waited.polls !== "number" || waited.polls < 1) {
+    throw new Error(`wait.ready did not settle on ready: ${JSON.stringify(waited)}`);
+  }
+
+  const loginTab = { tabId: tabIdFromOutput(await runSurf("tab.new", `${baseUrl}/login`)) };
+  const loginFailure = await runSurfExpectingFailure(
+    "wait.ready", "--tab-id", String(loginTab.tabId), "--url-prefix", `${baseUrl}/fixture`, "--timeout", "5000",
+  );
+  if (!loginFailure.stderr.includes("login") || !loginFailure.stderr.includes("password field")) {
+    throw new Error(`wait.ready did not classify the login bounce: ${JSON.stringify(loginFailure)}`);
+  }
+  const acceptedLogin = unwrapJson(
+    await runSurf("wait.ready", "--json", "--tab-id", String(loginTab.tabId), "--url-prefix", `${baseUrl}/fixture`, "--accept", "login"),
+  );
+  if (acceptedLogin.state !== "login" || acceptedLogin.accepted !== true) {
+    throw new Error(`wait.ready --accept login did not return the state: ${JSON.stringify(acceptedLogin)}`);
+  }
+  await runSurf("tab.close", "--id", String(loginTab.tabId), "--json");
+
+  // frame.diagnose
+  const framesTab = { tabId: tabIdFromOutput(await runSurf("tab.new", `${baseUrl}/frames`)) };
+  await runSurf("wait.element", "#sandboxed", "--tab-id", String(framesTab.tabId), "--json");
+  await runSurf("wait.dom", "--tab-id", String(framesTab.tabId), "--json");
+  const diagnosis = unwrapJson(await runSurf("frame.diagnose", "--json", "--tab-id", String(framesTab.tabId)));
+  const byId = Object.fromEntries(diagnosis.domIframes.map((frame) => [frame.id, frame]));
+  if (diagnosis.counts.domIframes !== 5 || !byId["same-origin"] || !byId["inline"] || !byId["cross-origin"] || !byId["sandboxed"] || !byId["shadowed"]) {
+    throw new Error(`frame.diagnose did not list the five fixture iframes: ${JSON.stringify(diagnosis)}`);
+  }
+  if (byId["same-origin"].extensionFrameIds.length !== 1 || byId["same-origin"].cdpFrameIds.length !== 1) {
+    throw new Error(`same-origin iframe was not correlated: ${JSON.stringify(byId["same-origin"])}`);
+  }
+  if (byId["shadowed"].shadowHost !== "div#host" || byId["shadowed"].extensionFrameIds.length !== 1) {
+    throw new Error(`shadow-hosted iframe was not inventoried: ${JSON.stringify(byId["shadowed"])}`);
+  }
+  if (byId["inline"].cdpFrameIds.length !== 1) {
+    throw new Error(`srcdoc iframe was not matched to its CDP frame by id: ${JSON.stringify(byId["inline"])}`);
+  }
+  if (!byId["inline"].blank || byId["cross-origin"].crossOrigin !== true || byId["sandboxed"].scriptsBlocked !== true) {
+    throw new Error(`frame flags are wrong: ${JSON.stringify(byId)}`);
+  }
+  const sameOriginFrame = diagnosis.extensionFrames.find((frame) => frame.frameId === byId["same-origin"].extensionFrameIds[0]);
+  if (!sameOriginFrame?.contentScriptReachable) {
+    throw new Error(`content script PING did not reach the same-origin iframe: ${JSON.stringify(diagnosis.extensionFrames)}`);
+  }
+  if (!diagnosis.warnings.some((line) => line.includes("srcdoc")) || !diagnosis.warnings.some((line) => line.includes("allow-scripts"))) {
+    throw new Error(`frame.diagnose warnings missing: ${JSON.stringify(diagnosis.warnings)}`);
+  }
+  await runSurf("tab.close", "--id", String(framesTab.tabId), "--json");
+
+  // Native value setter
+  const listTab = { tabId: tabIdFromOutput(await runSurf("tab.new", `${baseUrl}/list`)) };
+  await runSurf("wait.element", "#tracked", "--tab-id", String(listTab.tabId), "--json");
+  await runSurf("type", "hello tracker", "--into", "#tracked", "--tab-id", String(listTab.tabId), "--no-screenshot", "--json");
+  const listPage = (await browser.pages()).find((page) => page.url() === `${baseUrl}/list`);
+  if (!listPage) throw new Error("Puppeteer could not find the list fixture page");
+  const mirror = await listPage.evaluate(() => document.querySelector("#mirror")?.textContent);
+  if (mirror !== "hello tracker") {
+    throw new Error(`framework-controlled input did not observe the typed value (mirror=${JSON.stringify(mirror)})`);
+  }
+  await runSurf("tab.close", "--id", String(listTab.tabId), "--json");
+
+  // js --file with statements and --options
+  const optionsScript = join(repo, "test/e2e/fixtures/list-items.js");
+  const listTabForJs = { tabId: tabIdFromOutput(await runSurf("tab.new", `${baseUrl}/list?q=js`)) };
+  await runSurf("wait.ready", "--json", "--tab-id", String(listTabForJs.tabId), "--selector", ".item");
+  const jsOutput = unwrapJson(
+    await runSurf("js", "--file", optionsScript, "--options", '{"limit": 1}', "--tab-id", String(listTabForJs.tabId), "--json"),
+  );
+  if (jsOutput?.query !== "js" || jsOutput?.total !== 1 || jsOutput?.rows?.[0]?.title !== "Item 1") {
+    throw new Error(`js --file with statements and --options did not return the script result: ${JSON.stringify(jsOutput)}`);
+  }
+  const optionsTabId = String(listTabForJs.tabId);
+  const inlineOptions = unwrapJson(await runSurf(
+    "js", "return {limit: SURF_OPTIONS.limit, frozen: Object.isFrozen(SURF_OPTIONS)};",
+    "--options", '{"limit":2}', "--tab-id", optionsTabId, "--json",
+  ));
+  if (inlineOptions.limit !== 2 || inlineOptions.frozen !== true) {
+    throw new Error(`js inline options failed: ${JSON.stringify(inlineOptions)}`);
+  }
+  await runSurf("js", `const frame = document.createElement('iframe'); frame.src = '${baseUrl}/list?q=frame'; document.body.append(frame);`, "--tab-id", optionsTabId);
+  let childFrame;
+  await waitFor(async () => {
+    const result = unwrapJson(await runSurf("frame.list", "--tab-id", optionsTabId, "--json"));
+    childFrame = result.find((frame) => frame.url === `${baseUrl}/list?q=frame`);
+    return Boolean(childFrame);
+  }, "options child frame");
+  const frameOutput = unwrapJson(await runSurf(
+    "frame.js", "--id", childFrame.frameId, "--file", optionsScript,
+    "--options", '{"limit":2}', "--tab-id", optionsTabId, "--json",
+  ));
+  if (frameOutput.query !== "frame" || frameOutput.total !== 2 || frameOutput.rows[1].title !== "Item 2") {
+    throw new Error(`frame.js file options failed: ${JSON.stringify(frameOutput)}`);
+  }
+  const frameInline = unwrapJson(await runSurf(
+    "frame.js", "--id", childFrame.frameId,
+    "return {query: new URL(location.href).searchParams.get('q'), frozen: Object.isFrozen(SURF_OPTIONS), limit: SURF_OPTIONS.limit};",
+    "--options", '{"limit":3}', "--tab-id", optionsTabId, "--json",
+  ));
+  if (frameInline.query !== "frame" || frameInline.frozen !== true || frameInline.limit !== 3) {
+    throw new Error(`frame.js inline options failed: ${JSON.stringify(frameInline)}`);
+  }
+  await runSurf("tab.close", "--id", optionsTabId, "--json");
+
+  // extract owned lifecycle
+  const pagesBeforeExtract = (await browser.pages()).length;
+  const extracted = JSON.parse(await runSurf(
+    "extract", `${baseUrl}/list?q=extract`, "--file", optionsScript,
+    "--options", '{"limit":2}', "--ready-selector", ".item", "--json",
+  ));
+  if (extracted.rowCount !== 2 || extracted.data?.query !== "extract" || extracted.rows?.[1]?.title !== "Item 2") {
+    throw new Error(`extract success contract failed: ${JSON.stringify(extracted)}`);
+  }
+  const acceptedEmpty = JSON.parse(await runSurf(
+    "extract", `${baseUrl}/list?empty=1`, "--file", optionsScript,
+    "--empty-text", "No results for this search.", "--json",
+  ));
+  if (acceptedEmpty.rowCount !== 0 || acceptedEmpty.readiness?.state !== "empty") {
+    throw new Error(`extract accepted-empty contract failed: ${JSON.stringify(acceptedEmpty)}`);
+  }
+  const rejectedEmpty = await runSurfExpectingFailure(
+    "extract", `${baseUrl}/list?empty=1`, "--file", optionsScript,
+    "--retry", "1", "--retry-delay-ms", "0", "--json",
+  );
+  const emptyError = JSON.parse(rejectedEmpty.stdout).error;
+  if (emptyError?.code !== "empty_result" || emptyError?.details?.attempts !== 2) {
+    throw new Error(`extract rejected-empty contract failed: ${JSON.stringify(emptyError)}`);
+  }
+  if ((await browser.pages()).length !== pagesBeforeExtract) {
+    throw new Error("extract leaked an owned tab");
+  }
+
   await runSurf("screenshot", "--output", screenshotPath);
   const png = readFileSync(screenshotPath);
   if (png.length < 100 || png.subarray(0, 8).toString("hex") !== "89504e470d0a1a0a") {
@@ -379,6 +625,9 @@ try {
         extensionId,
         platform: process.platform,
         result: "pass",
+        readiness: { fixture: readiness.state, loginAccepted: acceptedLogin.state },
+        frameDiagnoseWarnings: diagnosis.warnings.length,
+        scriptOptions: { js: jsOutput.total, frameJs: frameOutput.total, frozen: frameInline.frozen },
         screenshotBytes: png.length,
         serviceWorker: workerTarget.url(),
       },
@@ -410,6 +659,15 @@ try {
   if (server) {
     await new Promise((resolve, reject) => {
       server.close((error) => (error ? reject(error) : resolve()));
+    });
+  }
+} catch (error) {
+  cleanupErrors.push(error);
+}
+try {
+  if (crossOriginServer) {
+    await new Promise((resolve, reject) => {
+      crossOriginServer.close((error) => (error ? reject(error) : resolve()));
     });
   }
 } catch (error) {

@@ -135,6 +135,30 @@ SURF_REMOTE_CREDENTIAL=~/.config/surf/agent-macbook.json \
   surf tab.list
 ```
 
+For a TLS-terminating reverse proxy in front of the native host's existing clear-TCP
+listener, opt in on the client:
+
+```bash
+surf --remote surf.example.com:443 --remote-tls \
+  --remote-credential ~/.config/surf/agent-macbook.json tab.list
+
+# Private CA and an IP destination with a DNS certificate identity
+surf --remote 100.101.102.103:443 --remote-tls \
+  --remote-tls-ca ~/.config/surf/private-ca.pem \
+  --remote-tls-server-name surf.example.com \
+  --remote-credential ~/.config/surf/agent-macbook.json tab.list
+```
+
+`--remote-tls-ca` replaces Node's system roots rather than adding to them. DNS endpoints
+use their hostname for SNI and certificate validation; IP endpoints omit SNI and validate
+the certificate's IP SAN unless `--remote-tls-server-name` supplies a DNS identity. TLS
+certificate validation finishes before the mandatory Ed25519 authentication. Surf has no
+insecure mode, downgrade, or plaintext retry. `SURF_REMOTE_TLS=1` is the only accepted
+environment spelling; unset it to disable TLS. There is no CLI negation for env-enabled TLS.
+CLI values override `SURF_REMOTE_TLS_CA` and `SURF_REMOTE_TLS_SERVER_NAME` independently.
+`SURF_LISTEN` remains a plaintext listener behind the reverse proxy; Surf does not terminate
+TLS on the browser host.
+
 Surf performs mutual Ed25519 challenge-response with fresh nonces and checks authorization throughout the connection. A credential grants the same browser and host-file authority as a trusted local Surf user. Give each client its own credential, do not share it, and revoke it immediately if the client or file is lost:
 
 ```bash
@@ -162,7 +186,9 @@ Keep Tailscale policy restrictions as defense in depth. For example:
 }
 ```
 
-Adapt tags and ports to your Tailnet. Surf authentication does not replace Tailnet policy, and Surf does not add a separate TLS or SSH tunnel.
+Adapt tags and ports to your Tailnet. Surf authentication does not replace Tailnet policy.
+Optional outbound remote TLS protects the client-to-proxy connection; Surf does not add an
+SSH tunnel or a TLS listener.
 
 **Operations and troubleshooting**
 
@@ -278,6 +304,13 @@ surf type "4242" --into "#card-number"
 surf locate.role button --action click
 
 surf frame.main                     # Return to main page
+```
+
+When a selector never matches, `frame.diagnose` shows the three frame views side by side (DOM `<iframe>` elements, the extension's frames with content-script reachability, and the CDP frame tree) and explains the mismatches: `srcdoc`/`about:blank` frames (matched to their CDP frame by `name`/`id`), sandboxes without `allow-scripts`, cross-origin frames, out-of-process frames that the CDP tree does not list (`frame.js` cannot reach them; `frame.switch` and `page.read` can when the content script answers), and frames still loading. The DOM inventory walks open shadow roots, so frames rendered by custom elements are listed with their `shadowHost` path. The text report abbreviates long frame URLs; `--json` keeps them whole.
+
+```bash
+surf frame.diagnose                 # Human-readable report with warnings
+surf frame.diagnose --json          # Full inventories
 ```
 
 ### Interaction
@@ -569,12 +602,55 @@ surf wait 2                         # Wait 2 seconds
 surf wait.element ".loaded"         # Wait for element
 surf wait.network                   # Wait for network idle
 surf wait.url "/dashboard"          # Wait for URL pattern
+surf wait.ready --selector ".results"   # Wait for content, fail fast on a bounce
+surf page.readiness --json          # Classify the page once
 ```
+
+`wait.ready` polls with a bounded budget and reports a typed state instead of timing out silently: `ready`, `empty` (the page showed its own no-results message, `--empty-text`), or one of the negative states `login`, `challenge` (anti-bot interstitial), `not-found`, `error`. A negative state exits non-zero with codes `page_login`, `page_challenge`, `page_not_found`, `page_error`; `page_timeout` reports the last observed state. Pass `--accept login` to return a state to the caller instead. Detection uses visible UI state (a rendered password field, a login-looking route, the page's own wording, `--url-prefix` bounces), never site-specific selectors.
+
+```bash
+surf wait.ready --url-prefix "https://app.example.com/" --empty-text "No results"
+surf wait.ready --accept login --json   # {"state":"login","evidence":[...]} instead of an error
+```
+
+### Extracting structured data
+
+`surf extract` composes existing client-side tools: it opens an owned tab,
+waits for explicit readiness, runs a page script, validates its JSON result,
+and closes the tab. It prints concise Markdown by default or structured JSON
+with `--json`. Return an array, or an object containing a conventional row key
+such as `rows`, `items`, or `results`; use `--rows <key>` for another key.
+
+```bash
+surf extract "https://example.com/list" --file rows.js --ready-selector ".item"
+surf extract "https://example.com/search" --file rows.js --options '{"limit":20}' --empty-text "No results" --json
+surf extract --tab-id 42 --code 'return [...document.querySelectorAll("h2")].map(h => ({title: h.textContent}))'
+```
+
+Owned-tab failures always attempt cleanup. Zero rows retry unless
+`--allow-empty` is set or `--empty-text` identifies the page's accepted empty
+state. Fresh-tab retries are bounded (`--retry`, default 1, maximum 5) and are
+limited to readiness timeouts, zero rows, and lost tab/execution-context
+failures. Login, challenge, not-found, page-error, script/output, and cleanup
+failures do not retry. `--tab-id` and `--session` target an existing page and
+never retry or close it; `--keep-tab` preserves a successfully owned tab.
+
+Extract is intended for read-only or otherwise idempotent caller scripts.
+JavaScript is not inherently read-only: a retry can replay the script, so avoid
+mutations or make them idempotent.
 
 ### Other
 
+`js` and `frame.js` accept `--options '{"limit": 20}'` with inline code or
+`--file`. This defines `SURF_OPTIONS` by parsing the JSON and freezing the
+result; use an explicit `return` for the script's result. The freeze is shallow.
+Invalid JSON and non-object values are rejected before sending a request;
+`--options ''` defines an empty object. Without `--options`, code is unchanged.
+
 ```bash
 surf js "return document.title"     # Execute JavaScript
+surf js "piHelpers.setValue(document.querySelector('#q'), 'hello')"  # Native value setter + input/change events
+surf js --file script.js --options '{"limit": 20}'   # Script reads SURF_OPTIONS.limit
 surf record --duration 2000 --fps 10 --output /tmp/anim.gif      # Animated GIF capture
 surf animate-audit --selector ".thing" --duration 2000 --fps 10  # JSON animation timeline
 surf perf-audit --duration 3000 --output /tmp/perf.json           # PerformanceObserver snapshot
@@ -811,11 +887,31 @@ Generated manifests declare provenance and authentication environment inputs. Su
 --window-id <id>   # Target a specific window
 --no-wait          # Return tab_busy/browser_busy instead of queueing
 --json             # Raw JSON including resolved target metadata
---soft-fail        # Warn instead of error (exit 0) on restricted pages
+--soft-fail        # Host tool errors: stderr warning, exit 0, no JSON error output
 --no-lock          # Bypass the legacy lock for compound client-side commands
 --no-screenshot    # Skip auto-screenshot after actions
 --full             # Full resolution screenshots (skip resize)
 ```
+
+### Host tool-response errors
+
+For ordinary socket-backed commands, a host response with a top-level `error`
+exits 1 and prints `Error: ...` on stderr. A supplied code is appended as `[code]`
+to the first line unless already present there; subsequent recovery lines are
+preserved. Without a code, no suffix is added.
+
+`--json` additionally writes `{"error":{"code":"...","message":"...","details":{...}}}`
+to stdout, while retaining stderr and exit 1. The JSON code defaults to `"error"`;
+the message uses the host's message, or the first display line if absent. Optional
+details retain the host's fields except redundant `code` and `message` fields.
+
+`--soft-fail` takes precedence: the original host display text is printed as a
+stderr warning, without adding a code, stdout stays empty even with `--json`,
+and the command exits 0. This is **not a universal JSON error envelope**: local
+validation, transport/parser failures, compound commands and errors embedded in
+successful result payloads retain their existing behavior. In particular, a
+connection failure still prints stderr, leaves stdout empty and exits 1 with
+`--json`, even with `--soft-fail`.
 
 ## Environment Variables
 
@@ -826,6 +922,9 @@ SURF_SESSION              # Default named browser session for tab-scoped command
 SURF_SOCKET               # Socket path or named pipe (default: /tmp/surf.sock, Windows: //./pipe/surf)
 SURF_REMOTE               # Remote Surf endpoint as host:port (overrides SURF_SOCKET)
 SURF_REMOTE_CREDENTIAL    # Client Ed25519 credential for the selected remote endpoint
+SURF_REMOTE_TLS           # Exactly 1 enables TLS for a selected remote endpoint
+SURF_REMOTE_TLS_CA        # Custom CA bundle that replaces system roots
+SURF_REMOTE_TLS_SERVER_NAME # DNS SNI and certificate identity override
 SURF_REMOTE_STATE_DIR     # Host identity/authorization directory (default: ~/.surf/remote)
 SURF_LISTEN               # Native-host Tailnet bind address as <tailscale-ip>:<port>
 SURF_SOCKET_MODE          # Advanced POSIX local socket mode: 600 (default) or 660
@@ -841,6 +940,9 @@ SURF_EXTENSION_PATH       # Path to extension dist/ directory
 - `SURF_SOCKET`: Advanced socket override. Set it for both the native host and CLI when separate browser/profile instances need hard isolation.
 - `SURF_REMOTE`: Remote client endpoint. `--remote <host>:<port>` overrides it; both override `SURF_SOCKET`.
 - `SURF_REMOTE_CREDENTIAL`: Credential used for mutual remote authentication. `--remote-credential <path>` overrides it.
+- `SURF_REMOTE_TLS`: Set exactly `1` for TLS through a terminating reverse proxy; `--remote-tls` also enables it and cannot negate an env-enabled setting.
+- `SURF_REMOTE_TLS_CA`: CA bundle for remote TLS, replacing system roots. `--remote-tls-ca <path>` overrides it.
+- `SURF_REMOTE_TLS_SERVER_NAME`: DNS SNI and certificate identity override. `--remote-tls-server-name <name>` overrides it.
 - `SURF_REMOTE_STATE_DIR`: Advanced host-side override for the mode-0700 identity and client registry directory.
 - `SURF_LISTEN`: Native-host listener address on the browser machine. Use `surf install ... --listen <tailscale-ip>:<port>` to persist it in that host's wrapper.
 - `SURF_SOCKET_MODE` / `SURF_SOCKET_GROUP`: Advanced POSIX native-host settings. Use `surf install ... --socket-mode 660 --socket-group <group>` to persist group access; mode `660` grants full Surf authority to every member of that group.
@@ -938,11 +1040,11 @@ echo '{"type":"tool_request","method":"execute_tool","params":{"tool":"tab.list"
 | `window.*` | `new`, `list`, `focus`, `close`, `resize` |
 | `tab.*` | `list`, `new`, `switch`, `close`, `name`, `unname`, `named`, `group`, `ungroup`, `groups`, `reload` |
 | `scroll.*` | `top`, `bottom`, `to`, `info` |
-| `page.*` | `read`, `text`, `state` |
+| `page.*` | `read`, `text`, `state`, `readiness` |
 | `locate.*` | `role`, `text`, `label` |
 | `element.*` | `styles` |
-| `frame.*` | `list`, `switch`, `main`, `js` |
-| `wait.*` | `element`, `network`, `url`, `dom`, `load` |
+| `frame.*` | `list`, `diagnose`, `switch`, `main`, `js` |
+| `wait.*` | `element`, `network`, `url`, `dom`, `load`, `ready` |
 | `cookie` / `cookie.*` | `list`, `get`, `set`, `clear`, `delete` |
 | `bookmark.*` | `add`, `remove`, `list` |
 | `history.*` | `list`, `search` |

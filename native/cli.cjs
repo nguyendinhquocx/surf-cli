@@ -16,7 +16,9 @@ const {
   validateWorkflowArgs,
   validateWorkflowFile,
 } = require("./workflow-definition.cjs");
-const { executeDoSteps } = require("./do-executor.cjs");
+const { executeDoSteps, sendDoRequest } = require("./do-executor.cjs");
+const { runExtraction, renderExtractionMarkdown } = require("./extract.cjs");
+const { applyOptionsPrelude, parseScriptOptions } = require("./script-options.cjs");
 const { openClientTransport } = require("./client-transport.cjs");
 const { version: VERSION } = require("../package.json");
 const {
@@ -73,7 +75,7 @@ function positiveIdFlag(argv, flag) {
   return parsed;
 }
 
-function resolveEarlyTargetOptions(argv, { allowWindow = true } = {}) {
+function resolveEarlyTargetOptions(argv, { allowWindow = true, allowEnvironmentSession = true } = {}) {
   const explicitSession = flagValue(argv, "--session");
   const tabId = positiveIdFlag(argv, "--tab-id");
   const windowId = allowWindow ? positiveIdFlag(argv, "--window-id") : undefined;
@@ -82,7 +84,7 @@ function resolveEarlyTargetOptions(argv, { allowWindow = true } = {}) {
     process.exit(1);
   }
   const environmentSession = process.env.SURF_SESSION;
-  const session = explicitSession || (!tabId && !windowId ? environmentSession : undefined);
+  const session = explicitSession || (allowEnvironmentSession && !tabId && !windowId ? environmentSession : undefined);
   return {
     ...(session ? { session, sessionSource: explicitSession ? "explicit" : "environment" } : {}),
     ...(tabId ? { tabId } : {}),
@@ -721,6 +723,17 @@ const TOOLS = {
         examples: [{ cmd: "page.save --output page.html", desc: "Save current document HTML" }],
       },
       "page.state": { desc: "Get page state (modals, loading, etc.)", args: [] },
+      "page.readiness": {
+        desc: "Classify the page once: ready, empty, loading, login, challenge, not-found, error",
+        args: [],
+        opts: {
+          selector: "Visible CSS selector that marks a ready page",
+          text: "Page text that marks a ready page",
+          "url-prefix": "Expected URL prefix",
+          "empty-text": "Text of an explicit no-results render",
+        },
+        examples: [{ cmd: "page.readiness --json", desc: "State plus evidence as JSON" }]
+      },
     }
   },
   locate: {
@@ -824,6 +837,24 @@ const TOOLS = {
       },
       "wait.dom": { desc: "Wait for DOM to stabilize", args: [], opts: { stable: "Stability window in ms (default: 100)", timeout: "Max wait time in ms" } },
       "wait.load": { desc: "Wait for page to fully load", args: [], opts: { timeout: "Max wait time in ms (default: 30000)" } },
+      "wait.ready": {
+        desc: "Wait until the page is ready, or fail fast with a typed state (challenge, login, not-found, error)",
+        args: [],
+        opts: {
+          selector: "Visible CSS selector that marks a ready page",
+          text: "Page text that marks a ready page",
+          "url-prefix": "Expected URL prefix; anything else is a bounce",
+          "empty-text": "Text of an explicit no-results render (reports state 'empty')",
+          accept: "Negative states to return instead of fail (comma list)",
+          timeout: "Max wait time in ms (default: 20000, max: 120000)",
+          interval: "Poll interval in ms (default: 400)",
+        },
+        examples: [
+          { cmd: 'wait.ready --selector ".results"', desc: "Wait for content; fail fast on a login bounce" },
+          { cmd: 'wait.ready --url-prefix "https://app.example.com/" --empty-text "No results"', desc: "Distinguish empty from blocked" },
+          { cmd: "wait.ready --accept login --json", desc: "Return the login state to the caller" },
+        ]
+      },
     }
   },
   input: {
@@ -878,17 +909,52 @@ const TOOLS = {
       "drag": { desc: "Drag between points", args: [], opts: { from: "Start x,y", to: "End x,y" } },
     }
   },
+  extract: {
+    desc: "Scripted extraction in an owned tab",
+    commands: {
+      "extract": {
+        desc: "Open a URL in a fresh tab, wait until it is ready, run a page-side script that returns JSON, print rows",
+        args: ["url"],
+        opts: {
+          file: "Script file; must `return` JSON (an array, or an object with a rows/items/results array)",
+          code: "Inline script instead of --file",
+          options: "JSON object exposed to the script as SURF_OPTIONS",
+          "options-file": "Read the options object from a JSON file",
+          "ready-selector": "wait.ready --selector before extracting",
+          "ready-text": "wait.ready --text before extracting",
+          "ready-url-prefix": "wait.ready --url-prefix; a different URL is a bounce",
+          "empty-text": "wait.ready --empty-text; lets an explicit no-results page pass the zero-rows check",
+          "ready-timeout": "Readiness timeout in ms (default: 20000)",
+          "ready-interval": "Readiness polling interval in ms (default: 400)",
+          rows: "Key of the row array in the script result (default: auto)",
+          retry: "Fresh-tab retries on transient failures (default: 1, max: 5)",
+          "retry-delay-ms": "Delay between attempts (default: 500)",
+          "allow-empty": "Accept zero rows",
+          "keep-tab": "Leave the owned tab open on success and report its id",
+          "tab-id": "Extract from an existing tab instead (no fresh tab, no retry; navigates only if a URL is given)",
+          session: "Extract from a session's tab instead (same rules as --tab-id)",
+          json: "Print {data, rows, rowCount, attempts, readiness} as JSON",
+        },
+        examples: [
+          { cmd: 'extract "https://example.com/list" --file rows.js --ready-selector ".item"', desc: "Fresh tab, wait for items, print a Markdown table" },
+          { cmd: 'extract "https://example.com/search?q=x" --file rows.js --options \'{"limit": 20}\' --empty-text "No results" --json', desc: "Options prelude, explicit empty state, JSON output" },
+          { cmd: "extract --tab-id 42 --code 'return [...document.querySelectorAll(\"h2\")].map(h => ({ title: h.textContent }))'", desc: "Read an existing tab in place" },
+        ]
+      },
+    }
+  },
   js: {
     desc: "JavaScript execution",
     commands: {
       "js": {
         desc: "Execute JavaScript (use 'return' for values)",
         args: ["code"],
-        opts: { file: "Run JS from file" },
+        opts: { file: "Run JS from file", options: "JSON object exposed to the script as a frozen SURF_OPTIONS constant" },
         examples: [
           { cmd: 'js "return document.title"', desc: "Get title" },
           { cmd: 'js "document.body.style.background = \'red\'"', desc: "Run code" },
           { cmd: "js --file script.js", desc: "Run file" },
+          { cmd: 'js --file script.js --options \'{"limit": 20}\'', desc: "Run file with SURF_OPTIONS.limit" },
         ]
       },
     }
@@ -1156,7 +1222,7 @@ const TOOLS = {
       "frame.js": {
         desc: "Execute JS in specific frame",
         args: ["code"],
-        opts: { id: "Frame ID from frame.list", file: "Run JS from file" },
+        opts: { id: "Frame ID from frame.list", file: "Run JS from file", options: "JSON object exposed as SURF_OPTIONS" },
         examples: [
           { cmd: 'frame.js "return document.title" --id frame1', desc: "JS in specific frame" },
         ]
@@ -1614,7 +1680,8 @@ const ALL_SOCKET_TOOLS = [
   "tab.list", "tab.new", "tab.switch", "tab.close", "tab.move", "tab.name", "tab.unname", "tab.named",
   "tab.group", "tab.ungroup", "tab.groups", "tab.reload",
   "scroll.top", "scroll.bottom", "scroll.to", "scroll.info",
-  "wait.element", "wait.network", "wait.url", "wait.dom", "wait.load",
+  "wait.element", "wait.network", "wait.url", "wait.dom", "wait.load", "wait.ready",
+  "page.readiness",
   "click", "hover", "drag",
   "js", "console", "network",
   "network.get", "network.body", "network.curl", "network.origins",
@@ -1668,7 +1735,9 @@ const SEE_ALSO = {
   "animate-audit": ["screenshot", "record", "perf-audit", "js"],
   "perf-audit": ["record", "animate-audit", "perf.metrics", "console"],
   "search": ["locate.text", "page.read"],
-  "wait.element": ["wait.load", "wait.network"],
+  "wait.element": ["wait.load", "wait.network", "wait.ready"],
+  "wait.ready": ["page.readiness", "wait.element", "wait.url"],
+  "page.readiness": ["wait.ready", "page.state"],
   "wait.load": ["wait.element", "wait.network"],
   "wait.network": ["wait.load", "wait.element"],
   "scroll.to": ["click", "page.read"],
@@ -1722,6 +1791,9 @@ More Help:
   --no-wait                 Return tab_busy/browser_busy instead of queueing
   --remote <host>:<port>    Route requests to a remote native host
   --remote-credential <path>  Use a mode-0600 Ed25519 remote credential file
+  --remote-tls             Use TLS through a TLS-terminating reverse proxy
+  --remote-tls-ca <path>   Replace system roots with a custom CA bundle
+  --remote-tls-server-name <name>  Override TLS SNI and certificate identity
   surf remote authorize <label> --output <path>
   surf remote list | surf remote revoke <label>
   surf --help-full           All commands
@@ -1739,6 +1811,7 @@ Purpose: control Chrome from shell. Commands are \`surf <command> [args] [option
 Core loop: navigate -> wait/read -> act -> screenshot/read.
 Navigate: surf navigate "https://example.com"    # alias: surf go "..."
 Wait after navigation: surf wait 2                # or wait.load for load complete
+Wait for real content: surf wait.ready --selector ".results"   # fails fast with page_login / page_challenge / page_not_found; --accept login returns the state
 Read DOM/refs: surf page.read --depth 3 --compact # alias: surf read
 Refs: use e1/e2 refs from page.read; prefer refs over CSS when available.
 Click ref: surf click e5
@@ -1751,6 +1824,7 @@ Video recording: surf video start ./demo.webm --fps 30; surf video stop
 Animation audit: surf animate-audit --selector ".thing" --duration 2000 --fps 10
 Performance audit: surf perf-audit --duration 3000 --trigger "click:.cta" --output /tmp/perf.json
 JavaScript: surf js "return document.title"
+Frames: surf frame.list | surf frame.diagnose      # diagnose explains why a selector misses inside iframes (shadow roots, srcdoc, out-of-process)
 Scroll: surf scroll down 800 | surf scroll up 400 | surf scroll bottom | surf scroll top
 Find by semantics: surf locate.role button --name "Submit" --action click
 Device/viewport: surf emulate.device "iPhone 14" | surf resize 375 812
@@ -1793,14 +1867,24 @@ Playbooks:
 Options:
   --remote <host>:<port>       Route requests to a remote native host
   --remote-credential <path>   Use a mode-0600 Ed25519 remote credential file
+  --remote-tls                 Use TLS through a TLS-terminating reverse proxy
+  --remote-tls-ca <path>       Replace system roots with a custom CA bundle
+  --remote-tls-server-name <name>  Override TLS SNI and certificate identity
   --session <name>  Target a durable named session (or set SURF_SESSION)
   --tab-id <id>     Target specific tab
   --window-id <id>  Target specific window
   --no-wait         Return immediately when the tab/browser is busy
   --json            Output raw JSON including target metadata
   --auto-capture    On error: capture screenshot + console to /tmp
-  --soft-fail       On error: warn and exit 0 (for non-critical commands)
+  --soft-fail       Host tool errors: warn on stderr, exit 0, no JSON error output
   --no-lock         Bypass the legacy lock for compound client-side commands
+
+Host tool-response errors: stderr includes [code] on the first line when supplied;
+--json also writes {"error":{"code":"...","message":"..."}} to stdout; exit 1.
+Host details, when present, are included without redundant code/message fields.
+Missing codes use "error" in JSON. --soft-fail keeps the original warning text.
+This is not a universal error format: local validation, transport and parser
+failures keep their existing output/status; --soft-fail does not mask them.
 
 Remote Credentials (run on the browser host):
   surf remote authorize <label> --output <credential-file>
@@ -2570,6 +2654,150 @@ if (args[0] === "do") {
   return;
 }
 
+// Handle `surf extract`: a page-side script in an owned tab with a
+// readiness gate, bounded fresh-tab retry and the zero-rows invariant.
+if (args[0] === "extract") {
+  const extractArgs = args.slice(1);
+  const valueFlags = new Set([
+    "file", "code", "options", "options-file", "ready-selector", "ready-text", "ready-url-prefix",
+    "ready-timeout", "ready-interval", "empty-text", "rows", "retry", "retry-delay-ms",
+    "tab-id", "session",
+  ]);
+  const boolFlags = new Set(["allow-empty", "keep-tab", "json", "no-wait", "help"]);
+  const opts = {};
+  let url = null;
+  for (let i = 0; i < extractArgs.length; i++) {
+    const arg = extractArgs[i];
+    if (arg === "-f") {
+      opts.file = flagValue(extractArgs, arg);
+      i++;
+    } else if (arg.startsWith("--")) {
+      const key = arg.slice(2);
+      if (boolFlags.has(key)) opts[key] = true;
+      else if (valueFlags.has(key)) {
+        opts[key] = key === "options" && extractArgs[i + 1] === ""
+          ? ""
+          : flagValue(extractArgs, arg);
+        i++;
+      } else {
+        console.error(`Error: unknown extract option --${key}`);
+        process.exit(1);
+      }
+    } else if (url === null) {
+      url = arg;
+    } else {
+      console.error(`Error: unexpected argument ${arg}`);
+      process.exit(1);
+    }
+  }
+  if (opts.help) {
+    showToolHelp("extract");
+    process.exit(0);
+  }
+  const wantJson = opts.json === true;
+  const fail = (code, message, details) => {
+    if (wantJson) {
+      console.log(JSON.stringify({ error: { code, message, ...(details ? { details } : {}) } }, null, 2));
+    } else {
+      console.error(`Error: ${message}${code ? ` [${code}]` : ""}`);
+    }
+    process.exit(1);
+  };
+  if (opts.options !== undefined && opts["options-file"] !== undefined) {
+    fail("usage", "use either --options or --options-file, not both");
+  }
+
+  let code = null;
+  try {
+    if (opts.file && opts.code) fail("usage", "use either --file or --code, not both");
+    if (opts.file) code = fs.readFileSync(opts.file, "utf8");
+    else if (typeof opts.code === "string") code = opts.code;
+    else fail("usage", "an extraction script is required: --file script.js or --code 'return {...}'");
+  } catch (error) {
+    fail("usage", `Failed to read script: ${error.message}`);
+  }
+
+  let scriptOptions = {};
+  try {
+    if (opts["options-file"]) scriptOptions = parseScriptOptions(fs.readFileSync(opts["options-file"], "utf8"));
+    else scriptOptions = parseScriptOptions(opts.options);
+  } catch (error) {
+    fail("usage", error.message);
+  }
+
+  const toInt = (key, fallback) => {
+    if (opts[key] === undefined) return fallback;
+    const parsed = Number(opts[key]);
+    if (!/^\d+$/.test(opts[key]) || !Number.isSafeInteger(parsed)) {
+      fail("usage", `--${key} must be a non-negative integer`);
+    }
+    return parsed;
+  };
+
+  const targetOptions = resolveEarlyTargetOptions(extractArgs, {
+    allowWindow: false,
+    allowEnvironmentSession: false,
+  });
+  const hasTarget = Boolean(targetOptions.tabId || targetOptions.session);
+  if (!hasTarget && !url) fail("usage", "a URL is required unless --tab-id or --session names the page to read");
+
+  const settings = {
+    code,
+    url: url ?? undefined,
+    options: scriptOptions,
+    ready: {
+      selector: opts["ready-selector"],
+      text: opts["ready-text"],
+      urlPrefix: opts["ready-url-prefix"],
+      emptyText: opts["empty-text"],
+      timeout: toInt("ready-timeout", undefined),
+      interval: toInt("ready-interval", undefined),
+    },
+    retry: { count: toInt("retry", undefined), delayMs: toInt("retry-delay-ms", undefined) },
+    keepTab: opts["keep-tab"] === true,
+    allowEmpty: opts["allow-empty"] === true,
+    rowsKey: opts.rows,
+    target: hasTarget,
+  };
+
+  const runExtract = async () => {
+    let transport;
+    try {
+      transport = await openClientTransport(endpoint);
+      const baseContext = { ...targetOptions, endpoint, transport };
+      const executeTool = (toolName, toolArgs, ownedTabId) => {
+        const context = ownedTabId
+          ? { tabId: ownedTabId, admission: targetOptions.admission, endpoint, transport }
+          : baseContext;
+        return sendDoRequest(toolName, toolArgs, context);
+      };
+      const result = await runExtraction({
+        ...settings,
+        executeTool,
+        onEvent: (event) => {
+          if (wantJson) return;
+          if (event.type === "attempt" && event.of > 1) console.error(`[surf] extract attempt ${event.attempt}/${event.of}`);
+          if (event.type === "attempt-failed" && event.retryable) console.error(`[surf] attempt ${event.attempt} failed (${event.error}); retrying with a fresh tab`);
+        },
+      });
+      if (wantJson) {
+        console.log(JSON.stringify(result, null, 2));
+      } else {
+        console.log(renderExtractionMarkdown(result.data, result.rows, { title: url ? `Extraction from ${url}` : "Extraction" }));
+        if (result.tabId) console.error(`[surf] tab ${result.tabId} left open (--keep-tab)`);
+      }
+      return 0;
+    } catch (error) {
+      fail(error.code || "extraction_failed", error.message, error.details);
+    } finally {
+      await transport?.close();
+    }
+  };
+
+  runExtract().then((exitCode) => process.exit(exitCode));
+  return;
+}
+
 // Handle workflow management commands
 if (args[0] === "workflow.list") {
   const workflows = listWorkflows();
@@ -2977,6 +3205,17 @@ if ((tool === "js" || tool === "frame.js") && toolArgs.file) {
     delete toolArgs.file;
   } catch (e) {
     console.error(`Error: Failed to read file: ${e.message}`);
+    process.exit(1);
+  }
+}
+
+if ((tool === "js" || tool === "frame.js") && toolArgs.options !== undefined) {
+  try {
+    if (typeof toolArgs.code !== "string") throw new Error("--options needs code (inline or --file)");
+    toolArgs.code = applyOptionsPrelude(toolArgs.code, toolArgs.options);
+    delete toolArgs.options;
+  } catch (e) {
+    console.error(`Error: ${e.message}`);
     process.exit(1);
   }
 }
@@ -3630,7 +3869,25 @@ async function handleResponse(response) {
       socket.end();
       process.exit(0);
     }
-    console.error("Error:", errContent);
+    // Host tool-response errors carry codes separately from their display text.
+    const errorCode = typeof response.error.code === "string" ? response.error.code : null;
+    const [firstLine, ...restLines] = errContent.split("\n");
+    const display = errorCode && !firstLine.includes(`[${errorCode}]`)
+      ? [`${firstLine} [${errorCode}]`, ...restLines].join("\n")
+      : errContent;
+    console.error("Error:", display);
+    if (wantJson) {
+      // details repeats code/message when the error serialises itself; keep the rest.
+      const { code: _code, message: _message, ...details } =
+        response.error.details && typeof response.error.details === "object" ? response.error.details : {};
+      console.log(JSON.stringify({
+        error: {
+          code: errorCode || "error",
+          message: typeof response.error.message === "string" ? response.error.message : firstLine,
+          ...(Object.keys(details).length > 0 ? { details } : {}),
+        },
+      }, null, 2));
+    }
 
     if (autoCapture) {
       await performAutoCapture();
@@ -3822,6 +4079,62 @@ async function handleResponse(response) {
     }
     console.log("\nUsage: surf emulate.device \"<device name>\"");
     console.log('Reset:  surf emulate.device "reset"');
+  } else if (tool === "wait.ready" || tool === "page.readiness") {
+    const lines = [`state: ${data?.state ?? "unknown"}`];
+    if (data?.href) lines.push(`url: ${data.href}`);
+    if (data?.title) lines.push(`title: ${data.title}`);
+    if (typeof data?.waited === "number") lines.push(`waited: ${data.waited}ms (${data.polls} poll${data.polls === 1 ? "" : "s"})`);
+    if (data?.accepted) lines.push("accepted: negative state returned because of --accept");
+    for (const item of Array.isArray(data?.evidence) ? data.evidence : []) lines.push(`- ${item}`);
+    console.log(lines.join("\n"));
+  } else if (tool === "frame.diagnose" && data?.counts) {
+    // Keep frame URLs readable: embed runners carry kilobyte-long state
+    // parameters that bury the report (use --json for the full URLs).
+    const abbreviateUrl = (url, max = 100) => {
+      if (typeof url !== "string" || url.length <= max) return url;
+      try {
+        const parsed = new URL(url);
+        const base = `${parsed.origin}${parsed.pathname}`;
+        const trailing = url.length - base.length;
+        if (trailing > 0 && base.length <= max - 12) return `${base}?...(+${trailing} chars)`;
+      } catch {}
+      return `${url.slice(0, max - 3)}...`;
+    };
+    const lines = [];
+    lines.push(`Frame diagnosis for ${data.mainPage?.href ?? "?"}${data.mainPage?.title ? ` (${data.mainPage.title})` : ""}`);
+    lines.push(`DOM iframes: ${data.counts.domIframes}, extension frames: ${data.counts.extensionFrames} (incl. main), CDP frames: ${data.counts.cdpFrames}`);
+    if (Array.isArray(data.domIframes) && data.domIframes.length > 0) {
+      lines.push("", "DOM iframes:");
+      for (const f of data.domIframes) {
+        const flags = [
+          f.blank ? "blank" : null,
+          f.crossOrigin ? "cross-origin" : null,
+          f.scriptsBlocked ? "scripts-blocked" : null,
+          f.zeroSize ? "0-size" : null,
+        ].filter(Boolean).join(",");
+        const links = [
+          f.extensionFrameIds?.length ? `ext ${f.extensionFrameIds.join("/")}` : "ext -",
+          f.cdpFrameIds?.length ? `cdp ${f.cdpFrameIds.join("/")}` : "cdp -",
+        ].join(", ");
+        lines.push(`  [${f.domIndex}] ${f.srcdoc ? "srcdoc" : abbreviateUrl(f.src || "about:blank")} ${Math.round(f.rect?.width ?? 0)}x${Math.round(f.rect?.height ?? 0)}${f.name ? ` name=${f.name}` : f.id ? ` id=${f.id}` : ""}${f.sandbox !== null && f.sandbox !== undefined ? ` sandbox="${f.sandbox}"` : ""}${f.shadowHost ? ` in shadow root of ${f.shadowHost}` : ""}${flags ? ` [${flags}]` : ""} -> ${links}`);
+      }
+    }
+    if (Array.isArray(data.extensionFrames) && data.extensionFrames.length > 0) {
+      lines.push("", "Extension frames (frame.switch indexes, webNavigation ids):");
+      for (const f of data.extensionFrames) {
+        const reach = f.contentScriptReachable ? "content-script ok" : `content-script unreachable${f.contentScriptError ? ` (${f.contentScriptError})` : ""}`;
+        lines.push(`  ${f.isMain ? "main" : `[${f.switchIndex}]`} #${f.frameId}${f.isMain ? "" : ` parent ${f.parentFrameId}`} ${abbreviateUrl(f.url)}${f.crossOrigin ? " [cross-origin]" : ""} - ${reach}`);
+      }
+    }
+    if (Array.isArray(data.cdpFrames) && data.cdpFrames.length > 0) {
+      lines.push("", "CDP frames (frame.js ids):");
+      for (const f of data.cdpFrames) {
+        lines.push(`  ${f.frameId}${f.isMain ? " main" : ` parent ${f.parentId}`} ${abbreviateUrl(f.url)}${f.name ? ` name=${f.name}` : ""}${f.extensionFrameIds?.length ? ` -> ext ${f.extensionFrameIds.join("/")}` : ""}`);
+      }
+    }
+    lines.push("", Array.isArray(data.warnings) && data.warnings.length > 0 ? "Warnings:" : "No warnings.");
+    for (const w of Array.isArray(data.warnings) ? data.warnings : []) lines.push(`  - ${w}`);
+    console.log(lines.join("\n"));
   } else if (tool === "js") {
     if (data?.result !== undefined) {
       const val = data.result.value ?? data.result;

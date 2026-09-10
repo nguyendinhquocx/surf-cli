@@ -2,6 +2,41 @@
 
 ## [Unreleased]
 
+## [2.19.0] - 2026-09-10
+
+### Highlights
+- Extract data from pages with one command, including readiness checks, retries, and tab cleanup.
+- Tell whether a page is ready, empty, blocked by login or a challenge, missing, or broken.
+- Diagnose difficult iframe access problems across the page, extension, and Chrome DevTools views.
+- Connect securely to remote Surf hosts through TLS-terminating reverse proxies.
+
+### Added
+- **Remote TLS** - Remote endpoints can now use TLS through `--remote-tls`, `--remote-tls-ca`, and `--remote-tls-server-name`, or the matching `SURF_REMOTE_TLS*` environment variables. This supports TLS-terminating reverse proxies while keeping Ed25519 authentication. Thanks to [@marcoatpaladin](https://github.com/marcoatpaladin) for #259.
+- **`surf extract`** - Opens a page, waits for it to become usable, runs extraction JavaScript, and cleans up the tab in one command. It supports JSON or concise Markdown output, existing tabs, explicit empty results, and limited retries for transient failures. Use retries only for read-only or repeat-safe scripts because caller code may run again.
+- **`surf js --options`** - Pass a JSON object to `js` and `frame.js` scripts as the frozen `SURF_OPTIONS` constant.
+- **Typed page readiness** - `surf wait.ready` now reports `ready`, `empty`, `login`, `challenge`, `not-found`, or `error` instead of silently timing out. `surf page.readiness` performs a single classification, while `--accept` lets callers handle selected negative states themselves.
+- **`surf frame.diagnose`** - Compare DOM iframes, extension reachability, and Chrome's frame tree in one report. It identifies shadow-root frames, blank or restricted frames, cross-origin and out-of-process frames, loading problems, and count mismatches; `--json` preserves full URLs.
+
+Thanks to [@tryingET](https://github.com/tryingET) for #255.
+Thanks to [@tryingET](https://github.com/tryingET) for the `js`/`frame.js --options` split from #257.
+Thanks to [@tryingET](https://github.com/tryingET) for the extract work in #257 and extract cleanup in #258.
+
+### Changed
+- **Development dependencies** - Updated Biome, Chrome and Node.js types, Pi Subagents, Puppeteer, TypeBox, Vitest, and Zod.
+
+### Fixed
+- **Readable CDP errors** - Chrome debugger failures now show a readable message while preserving the CDP error code and method for structured handling.
+- **Framework-controlled inputs** - `type --ref`, `type --into`, and `form.fill` now update React, Angular, and Vue controlled inputs without the framework reverting the value. `piHelpers.setValue(el, value)` provides the same behavior to `surf js` scripts.
+- **Host tool-response errors** - Socket-backed commands now show the supplied error code on stderr and return a JSON error on stdout under `--json`. `--soft-fail` keeps its warning-only exit behavior. Thanks to [@tryingET](https://github.com/tryingET) (Markus) for the generic-error split from [#258](https://github.com/nicobailon/surf-cli/pull/258).
+- **Native host stalled replies** - The native host now processes every complete message received together, preventing the first request after startup from waiting until the client timeout.
+- **`js --file` statement scripts** - Files beginning with declarations such as `const` now run correctly under Chrome's extension security policy.
+- **Bounded screenshot capture** - Screenshot requests now finish cleanly when Chromium stops responding, preserving successful output and allowing queued work to continue. Thanks to [@Whamp](https://github.com/Whamp) for #250.
+
+Thanks to [@tryingET](https://github.com/tryingET) for #251 and #256.
+Thanks to [@tryingET](https://github.com/tryingET) for #252.
+Thanks to [@tryingET](https://github.com/tryingET) for #253.
+Thanks to [@tryingET](https://github.com/tryingET) for #254.
+
 ## [2.18.0] - 2026-09-04
 
 ### Highlights

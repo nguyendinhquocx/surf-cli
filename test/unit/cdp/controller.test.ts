@@ -1,5 +1,5 @@
-import { vi } from "vitest";
-import { CDPController } from "../../../src/cdp/controller";
+import { afterEach, vi } from "vitest";
+import { CDPController, describeDebuggerError } from "../../../src/cdp/controller";
 
 // Mock chrome.debugger API
 const mockChrome = {
@@ -15,7 +15,45 @@ const mockChrome = {
 // Set global chrome before tests
 vi.stubGlobal("chrome", mockChrome);
 
+describe("describeDebuggerError", () => {
+  it("unwraps the JSON-encoded CDP error chrome.debugger rejects with", () => {
+    const original = new Error('{"code":-32000,"message":"Inspected target navigated or closed"}');
+    const error = describeDebuggerError(original, "Runtime.evaluate");
+    expect(error.message).toBe("Inspected target navigated or closed");
+    expect(error).toMatchObject({ cdpCode: -32000, cdpMethod: "Runtime.evaluate" });
+    expect(error.cause).toBe(original);
+  });
+
+  it("passes plain errors and non-JSON messages through unchanged", () => {
+    const plain = new Error("Detached while handling command.");
+    expect(describeDebuggerError(plain, "Page.enable")).toBe(plain);
+    expect(describeDebuggerError("{not json", "Page.enable").message).toBe("{not json");
+    expect(describeDebuggerError('{"code":1}', "Page.enable").message).toBe('{"code":1}');
+  });
+});
+
 describe("CDPController", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  describe("send", () => {
+    it("rethrows CDP failures with the browser's message instead of a JSON blob", async () => {
+      const controller = new CDPController();
+      mockChrome.debugger.attach.mockResolvedValue(undefined);
+      mockChrome.debugger.sendCommand.mockRejectedValue(
+        new Error('{"code":-32000,"message":"Inspected target navigated or closed"}'),
+      );
+      await expect(
+        controller.sendCommand(7, "Runtime.evaluate", { expression: "1" }),
+      ).rejects.toMatchObject({
+        message: "Inspected target navigated or closed",
+        cdpCode: -32000,
+        cdpMethod: "Runtime.evaluate",
+      });
+    });
+  });
+
   beforeEach(() => {
     vi.clearAllMocks();
   });
@@ -479,6 +517,39 @@ describe("CDPController", () => {
         "Page.captureScreenshot",
         { format: "png", captureBeyondViewport: false },
       );
+    });
+
+    it("rejects when Page.captureScreenshot never settles", async () => {
+      vi.useFakeTimers();
+      mockChrome.debugger.sendCommand
+        .mockResolvedValueOnce({}) // Page.enable
+        .mockReturnValueOnce(
+          new Promise(() => {
+            /* intentionally pending */
+          }),
+        ); // captureScreenshot
+
+      const capture = controller.captureScreenshot(tabId);
+      const rejection = expect(capture).rejects.toMatchObject({
+        code: "screenshot_timeout",
+        message: "Screenshot capture timed out after 5000ms",
+      });
+      await vi.advanceTimersByTimeAsync(5000);
+
+      await rejection;
+    });
+
+    it("rejects when viewport lookup never settles", async () => {
+      vi.useFakeTimers();
+      mockChrome.debugger.sendCommand
+        .mockResolvedValueOnce({})
+        .mockResolvedValueOnce({ data: "base64" })
+        .mockReturnValueOnce(new Promise(() => undefined));
+
+      const capture = controller.captureScreenshot(tabId);
+      const rejection = expect(capture).rejects.toMatchObject({ code: "screenshot_timeout" });
+      await vi.advanceTimersByTimeAsync(5000);
+      await rejection;
     });
   });
 

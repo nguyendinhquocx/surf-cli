@@ -20,6 +20,7 @@ const { createOracleHost } = require("./oracle-host.cjs");
 
 const IS_WIN = process.platform === "win32";
 const { SOCKET_PATH, SURF_TMP } = require("./socket-path.cjs");
+const { takeFrames } = require("./stdin-frames.cjs");
 const { parseListenEndpoint } = require("./listener.cjs");
 const { getStateDir } = require("./remote-auth.cjs");
 const { createFrameParser, createServerAuthSession, createSocketWriter, isClientAuthorized, writeFrame, MAX_FRAME_BYTES } = require("./remote-transport.cjs");
@@ -1765,7 +1766,12 @@ function sendToolResponse(socket, id, result, error) {
     }
     if (request?.notice) response.notice = request.notice;
     if (formattedError) response.error = formattedError;
-    else response.result = { content: formatToolContent(output, log, { suppressImages: Boolean(context?.isRemote) }) };
+    else {
+      response.result = { content: formatToolContent(output, log, { suppressImages: Boolean(context?.isRemote) }) };
+      if (request?.tool === "tab.new" && Number.isInteger(output?.tabId) && output.tabId > 0) {
+        response.result.tabId = output.tabId;
+      }
+    }
     if (!context?.closed) await sendSocket(socket, response);
   })().catch((sendError) => log(`Error sending tool_response: ${sendError.message}`));
 }
@@ -2805,25 +2811,23 @@ function writeMessage(msg) {
 let inputBuffer = Buffer.alloc(0);
 
 function processInput() {
-  while (inputBuffer.length >= 4) {
-    const msgLen = inputBuffer.readUInt32LE(0);
-    if (inputBuffer.length < 4 + msgLen) break;
-    
-    const jsonStr = inputBuffer.slice(4, 4 + msgLen).toString("utf8");
-    inputBuffer = inputBuffer.slice(4 + msgLen);
-    
+  // Take every complete frame out of the buffer before dispatching: one
+  // chunk routinely carries a TARGET_EVENT and the reply to a tool request.
+  const { frames, rest } = takeFrames(inputBuffer);
+  inputBuffer = rest;
+  for (const jsonStr of frames) {
     try {
       const msg = JSON.parse(jsonStr);
       log(`Received from extension: ${msg.type || "unknown"}${msg.id !== undefined ? ` id=${msg.id}` : ""}`);
 
       if (msg.type === "EXTENSION_HELLO") {
         setBrowserIdentity(msg);
-        return;
+        continue;
       }
 
       if (msg.type === "TARGET_EVENT") {
         handleTargetEvent(msg);
-        return;
+        continue;
       }
       
       if (msg.type === "GET_AUTH") {
@@ -2847,12 +2851,12 @@ function processInput() {
             hint: "Failed to read auth credentials. Run 'pi --login anthropic' in terminal to authenticate."
           });
         }
-        return;
+        continue;
       }
       
       if (msg.type === "API_REQUEST") {
         handleApiRequest(msg, writeMessage);
-        return;
+        continue;
       }
 
       if (msg.type === "PLAYBOOK_WATCH_EVENT") {
@@ -2865,14 +2869,14 @@ function processInput() {
           tabId: msg.tabId,
           timestamp: msg.timestamp || new Date().toISOString(),
         });
-        return;
+        continue;
       }
 
       if (msg.type === "VIDEO_FRAME") {
         if (activeVideoRecorder && msg.recorderId === activeVideoRecorder.recorderId && msg.tabId === activeVideoRecorder.tabId) {
           activeVideoRecorder.recorder.addFrame(msg.data, Number.isFinite(msg.receivedAt) ? msg.receivedAt : Date.now());
         }
-        return;
+        continue;
       }
 
       if (msg.type === "VIDEO_ERROR") {
@@ -2882,7 +2886,7 @@ function processInput() {
             msg.error || "Video screencast failed",
           ));
         }
-        return;
+        continue;
       }
       
       if (msg.type === "STREAM_EVENT") {
@@ -2894,7 +2898,7 @@ function processInput() {
             stream.socket.destroy(error);
           });
         }
-        return;
+        continue;
       }
 
       if (msg.type === "STREAM_ERROR") {
@@ -2907,7 +2911,7 @@ function processInput() {
             })
             .finally(() => stopActiveStream(msg.streamId));
         }
-        return;
+        continue;
       }
       
       
@@ -2920,13 +2924,13 @@ function processInput() {
           if (topLevelResponse && request?.context) {
             completeOwnedRequest(request.context, request.id, "cleanup-settled");
           }
-          return;
+          continue;
         }
         handleFrameContextFailure(pending.request, msg);
         updateFrameContextFromResult(pending.request, pending.tool, msg);
         if (pending.resolve || pending.onComplete) {
           pendingToolRequests.resolve(msg.id, msg);
-          return;
+          continue;
         }
         pendingToolRequests.delete(msg.id);
         {
@@ -2935,7 +2939,11 @@ function processInput() {
           const tabId = storedTabId || msg._resolvedTabId;
           const failAutoScreenshot = (message) => pending.autoScreenshotOutput
             ? sendToolResponse(socket, originalId, null, `Auto-screenshot failed: ${message}`)
-            : sendToolResponse(socket, originalId, { ...msg, autoScreenshotError: message }, null);
+            : sendToolResponse(socket, originalId, {
+                ...msg,
+                screenshotError: message,
+                autoScreenshotError: message,
+              }, null);
           
           if (pending.networkExport && Array.isArray(msg.entries)) {
             try {
@@ -3026,7 +3034,7 @@ function processInput() {
                 }
               })
               .catch((error) => failAutoScreenshot(error.message));
-            return;
+            continue;
           } else if (autoScreenshot && pending.autoScreenshotOutput && !msg.error) {
             failAutoScreenshot(tabId ? "screenshot response was invalid" : "no tab available");
           } else if (msg.results && msg.savePath) {

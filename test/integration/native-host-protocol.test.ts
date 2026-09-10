@@ -190,6 +190,7 @@ async function runCli(args: string[], socketPath: string): Promise<CliResult> {
 type HostHarness = {
   child: ChildProcessLike;
   send(message: NativeMessage): void;
+  sendAll(messages: NativeMessage[]): void;
   socketPath: string;
   remoteCredentialPath?: string;
   remoteStateDir?: string;
@@ -365,6 +366,9 @@ async function startHostHarness(
     remoteStateDir,
     send(message) {
       child.stdin.write(encodeNativeMessage(message));
+    },
+    sendAll(framedMessages) {
+      child.stdin.write(Buffer.concat(framedMessages.map(encodeNativeMessage)));
     },
     socketPath,
     stderr() {
@@ -1104,6 +1108,54 @@ describe("native host protocol integration", () => {
     }
   });
 
+  it("preserves primary output and releases same-tab admission after an optional screenshot error", async () => {
+    const host = await startHostHarness();
+    const transport = await openClientTransport({
+      kind: "local",
+      connectionOptions: host.socketPath,
+    });
+    try {
+      const primaryResponse = transport.request({
+        type: "tool_request",
+        method: "execute_tool",
+        params: { tool: "click", args: { selector: "#go", autoScreenshot: true } },
+        tabId: 1,
+        id: "auto-screenshot-timeout",
+      });
+      const click = await host.waitForMessage(
+        (message) => message.type === "CLICK_SELECTOR",
+        "timed screenshot primary action",
+      );
+      host.send({ id: click.id, success: true });
+      const screenshot = await host.waitForMessage(
+        (message) => message.type === "EXECUTE_SCREENSHOT",
+        "timed optional screenshot",
+      );
+      host.send({ id: screenshot.id, error: "Screenshot capture timed out after 5000ms" });
+
+      const settled = await primaryResponse;
+      expect(settled.error).toBeUndefined();
+      expect(settled.result.content[0].text).toContain("OK");
+      expect(settled.result.content[0].text).toContain("Screenshot capture timed out after 5000ms");
+
+      const nextResponse = transport.request({
+        type: "tool_request",
+        method: "execute_tool",
+        params: { tool: "page.read", args: {} },
+        tabId: 1,
+        id: "same-tab-after-screenshot-timeout",
+      });
+      const next = await host.waitForMessage(
+        (message) => message.type === "READ_PAGE",
+        "same-tab request after screenshot timeout",
+      );
+      host.send({ id: next.id, pageContent: "next request admitted" });
+      expect((await nextResponse).error).toBeUndefined();
+    } finally {
+      await transport.close();
+    }
+  });
+
   it("fails remote auto-screenshot downloads without hanging or leaking staging", async () => {
     const reservation = net.createServer();
     await new Promise<void>((resolve) => reservation.listen(0, "127.0.0.1", resolve));
@@ -1665,6 +1717,47 @@ describe("native host protocol integration", () => {
     await new Promise<void>((resolve) => second.once("data", () => resolve()));
     host.send({ id: extensionRequest.id, tabs: [] });
     second.destroy();
+  });
+
+  it("dispatches every coalesced response after draining an abandoned request", async () => {
+    const host = await startHostHarness();
+    const abandoned = net.createConnection(host.socketPath);
+    await new Promise<void>((resolve) => abandoned.once("connect", resolve));
+    remoteTransport.writeFrame(abandoned, {
+      type: "tool_request",
+      method: "execute_tool",
+      params: { tool: "tab.list", args: {} },
+      id: "abandoned-coalesced",
+    });
+    const abandonedRequest = await host.waitForMessage(
+      (message) => message.type === "LIST_TABS",
+      "abandoned coalesced LIST_TABS",
+    );
+    abandoned.destroy();
+
+    const active = net.createConnection(host.socketPath);
+    await new Promise<void>((resolve) => active.once("connect", resolve));
+    remoteTransport.writeFrame(active, {
+      type: "tool_request",
+      method: "execute_tool",
+      params: { tool: "tab.list", args: {} },
+      id: "active-coalesced",
+    });
+    const activeRequest = await host.waitForMessage(
+      (message) => message.type === "LIST_TABS",
+      "active coalesced LIST_TABS",
+    );
+    const activeResponse = new Promise<string>((resolve) =>
+      active.once("data", (chunk: any) => resolve(chunk.toString("utf8"))),
+    );
+
+    host.sendAll([
+      { id: abandonedRequest.id, tabs: [] },
+      { id: activeRequest.id, tabs: [{ id: 7, title: "Handled", url: "https://example.test/" }] },
+    ]);
+
+    expect(await activeResponse).toContain('"id":"active-coalesced"');
+    active.destroy();
   });
 
   it("retains a nested provider tombstone until its late page response", async () => {

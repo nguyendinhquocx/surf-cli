@@ -13,6 +13,39 @@ class CDPControllerError extends Error {
   }
 }
 
+export interface DebuggerCommandError extends Error {
+  /** CDP error code (for example -32000) when the browser reported one. */
+  cdpCode?: number;
+  /** The CDP method that failed. */
+  cdpMethod?: string;
+}
+
+/**
+ * `chrome.debugger.sendCommand` rejects with the CDP error serialised as
+ * JSON in the message (`{"code":-32000,"message":"Inspected target navigated
+ * or closed"}`). Surface the message itself and keep the code as a property,
+ * so callers and users see "Inspected target navigated or closed" instead
+ * of a JSON blob. Anything that is not such a JSON object passes through.
+ */
+export function describeDebuggerError(err: unknown, method?: string): Error {
+  const raw = err instanceof Error ? err.message : String(err);
+  const trimmed = raw.trim();
+  if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
+    try {
+      const parsed = JSON.parse(trimmed) as { code?: unknown; message?: unknown };
+      if (parsed && typeof parsed.message === "string" && parsed.message.length > 0) {
+        const error = new Error(parsed.message, { cause: err }) as DebuggerCommandError;
+        if (typeof parsed.code === "number") error.cdpCode = parsed.code;
+        if (method) error.cdpMethod = method;
+        return error;
+      }
+    } catch {
+      // not JSON after all; fall through
+    }
+  }
+  return err instanceof Error ? err : new Error(raw);
+}
+
 interface ConsoleMessage {
   type: string;
   text: string;
@@ -148,6 +181,7 @@ const KEY_DEFINITIONS: Record<string, KeyDefinition> = {
 };
 
 export class CDPController {
+  private static readonly SCREENSHOT_TIMEOUT_MS = 5000;
   private targets = new Map<number, Debuggee>();
   private consoleMessages: Map<number, ConsoleMessage[]> = new Map();
   private networkRequests: Map<number, NetworkRequest[]> = new Map();
@@ -216,12 +250,18 @@ export class CDPController {
     } catch (e) {}
   }
 
-  async detach(tabId: number): Promise<void> {
+  isAttached(tabId: number): boolean {
+    return this.targets.has(tabId);
+  }
+
+  async detach(tabId: number): Promise<{ success: boolean; error?: string }> {
     const target = this.targets.get(tabId);
+    let error: string | undefined;
     if (target) {
       try {
         await chrome.debugger.detach(target);
       } catch (e) {
+        error = e instanceof Error ? e.message : String(e);
         console.warn("[CDPController] Error detaching:", e);
       }
       this.targets.delete(tabId);
@@ -242,6 +282,7 @@ export class CDPController {
       this.clearRequestStartTimes(tabId);
       this.detachReasons.delete(tabId);
     }
+    return error ? { success: false, error } : { success: true };
   }
 
   async detachAll(): Promise<void> {
@@ -1283,6 +1324,29 @@ export class CDPController {
     return this.send(tabId, "Page.stopScreencast");
   }
 
+  /**
+   * Parse `expression` in the page without running it. Lets the service
+   * worker check syntax although its own CSP forbids `new Function`.
+   */
+  async compileScript(tabId: number, expression: string): Promise<{ parses: boolean; error?: string }> {
+    await this.ensureAttached(tabId);
+    try {
+      await this.send(tabId, "Runtime.enable");
+    } catch (e) {}
+    const result = await this.send(tabId, "Runtime.compileScript", {
+      expression,
+      sourceURL: "",
+      persistScript: false,
+    });
+    if (result?.exceptionDetails) {
+      return {
+        parses: false,
+        error: result.exceptionDetails.exception?.description || result.exceptionDetails.text || "SyntaxError",
+      };
+    }
+    return { parses: true };
+  }
+
   async evaluateScript(tabId: number, expression: string): Promise<{
     result?: { value?: any; type?: string; description?: string };
     exceptionDetails?: { text?: string; exception?: { description?: string } };
@@ -1307,7 +1371,11 @@ export class CDPController {
   ): Promise<any> {
     await this.ensureAttached(tabId);
     const target = this.targets.get(tabId)!;
-    return chrome.debugger.sendCommand(target, method, params);
+    try {
+      return await chrome.debugger.sendCommand(target, method, params);
+    } catch (err) {
+      throw describeDebuggerError(err, method);
+    }
   }
 
   async sendCommand(
@@ -1345,12 +1413,30 @@ export class CDPController {
     width: number;
     height: number;
   }> {
-    const result = await this.send(tabId, "Page.captureScreenshot", {
-      format: "png",
-      captureBeyondViewport: false,
+    return this.withScreenshotDeadline(tabId, (async () => {
+      const result: { data: string } = await this.send(tabId, "Page.captureScreenshot", {
+        format: "png",
+        captureBeyondViewport: false,
+      });
+      const { width, height } = await this.getViewportSize(tabId);
+      return { base64: result.data, width, height };
+    })());
+  }
+
+  private async withScreenshotDeadline<T>(tabId: number, work: Promise<T>): Promise<T> {
+    let timeoutId: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<never>((_, reject) => {
+      timeoutId = setTimeout(() => reject(new CDPControllerError(
+        "screenshot_timeout",
+        `Screenshot capture timed out after ${CDPController.SCREENSHOT_TIMEOUT_MS}ms`,
+        { tabId, timeoutMs: CDPController.SCREENSHOT_TIMEOUT_MS },
+      )), CDPController.SCREENSHOT_TIMEOUT_MS);
     });
-    const { width, height } = await this.getViewportSize(tabId);
-    return { base64: result.data, width, height };
+    try {
+      return await Promise.race([work, timeout]);
+    } finally {
+      if (timeoutId !== undefined) clearTimeout(timeoutId);
+    }
   }
 
   async captureRegion(tabId: number, x: number, y: number, width: number, height: number): Promise<{
@@ -1358,10 +1444,13 @@ export class CDPController {
     width: number;
     height: number;
   }> {
-    const result = await this.send(tabId, "Page.captureScreenshot", {
-      format: "png",
-      clip: { x, y, width, height, scale: 1 },
-    });
+    const result: { data: string } = await this.withScreenshotDeadline(
+      tabId,
+      this.send(tabId, "Page.captureScreenshot", {
+        format: "png",
+        clip: { x, y, width, height, scale: 1 },
+      }),
+    );
     return { base64: result.data, width, height };
   }
 

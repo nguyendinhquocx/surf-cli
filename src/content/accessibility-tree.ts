@@ -1,3 +1,9 @@
+import { setNativeValue } from "./native-value";
+import {
+  createDomProbe,
+  InvalidReadinessSelectorError,
+  probePageReadiness,
+} from "./page-readiness-probe";
 import type { VisualIndicatorMessageType } from "./visual-indicator.ts";
 
 export {};
@@ -1227,15 +1233,10 @@ function setFormValue(ref: string, value: string | boolean | number): { success:
         input.checked = Boolean(value);
         input.dispatchEvent(new Event("change", { bubbles: true }));
       } else {
-        input.value = String(value);
-        input.dispatchEvent(new Event("input", { bubbles: true }));
-        input.dispatchEvent(new Event("change", { bubbles: true }));
+        setNativeValue(input, String(value));
       }
     } else if (tagName === "textarea") {
-      const textarea = element as HTMLTextAreaElement;
-      textarea.value = String(value);
-      textarea.dispatchEvent(new Event("input", { bubbles: true }));
-      textarea.dispatchEvent(new Event("change", { bubbles: true }));
+      setNativeValue(element as HTMLTextAreaElement, String(value));
     } else if (tagName === "select") {
       const select = element as HTMLSelectElement;
       const strValue = String(value);
@@ -1277,16 +1278,16 @@ function smartType(selector: string, text: string, clear = true, submit = false)
     const contentEditable = element.isContentEditable || !!contentEditableChild;
     target.focus();
 
-    if (clear) {
-      if (contentEditable) target.textContent = "";
-      else (target as HTMLInputElement | HTMLTextAreaElement).value = "";
+    if (contentEditable) {
+      if (clear) target.textContent = "";
+      target.textContent = text;
+      target.dispatchEvent(new Event("input", { bubbles: true }));
+      target.dispatchEvent(new Event("change", { bubbles: true }));
+    } else {
+      // Assigning a value always replaces the previous one, so `clear` only
+      // matters for the contenteditable branch above.
+      setNativeValue(target as HTMLInputElement | HTMLTextAreaElement, text);
     }
-
-    if (contentEditable) target.textContent = text;
-    else (target as HTMLInputElement | HTMLTextAreaElement).value = text;
-
-    target.dispatchEvent(new Event("input", { bubbles: true }));
-    target.dispatchEvent(new Event("change", { bubbles: true }));
 
     if (submit) {
       const form = element.closest("form");
@@ -1570,6 +1571,21 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     case "FORM_INPUT": {
       const result = setFormValue(message.ref, message.value);
       sendResponse(result);
+      break;
+    }
+    case "PAGE_READINESS": {
+      try {
+        sendResponse(probePageReadiness(createDomProbe(document, window), message.expect || {}));
+      } catch (err) {
+        sendResponse({
+          error: err instanceof Error ? err.message : String(err),
+          code: err instanceof InvalidReadinessSelectorError ? "invalid_selector" : "page_probe_error",
+        });
+      }
+      break;
+    }
+    case "PING": {
+      sendResponse({ success: true, href: location.href, readyState: document.readyState });
       break;
     }
     case "EVAL_IN_PAGE": {
@@ -2252,16 +2268,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
               el.dispatchEvent(new Event("change", { bubbles: true }));
             } else {
               el.focus();
-              el.value = String(value);
-              el.dispatchEvent(new Event("input", { bubbles: true }));
-              el.dispatchEvent(new Event("change", { bubbles: true }));
+              setNativeValue(el, String(value));
             }
             results.push({ ref, success: true });
           } else if (el instanceof HTMLTextAreaElement) {
             el.focus();
-            el.value = String(value);
-            el.dispatchEvent(new Event("input", { bubbles: true }));
-            el.dispatchEvent(new Event("change", { bubbles: true }));
+            setNativeValue(el, String(value));
             results.push({ ref, success: true });
           } else if (el instanceof HTMLSelectElement) {
             el.value = String(value);

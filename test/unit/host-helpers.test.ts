@@ -497,6 +497,26 @@ describe("formatToolContent", () => {
       });
       expect(result[0].text).not.toContain("_resolvedTabId");
     });
+
+    it("strips _resolvedWindowId from JSON output", () => {
+      const result = helpers.formatToolContent({
+        state: "ready",
+        evidence: [],
+        _resolvedTabId: 123,
+        _resolvedWindowId: 456,
+      });
+      expect(JSON.parse(result[0].text)).toEqual({ state: "ready", evidence: [] });
+    });
+
+    it("keeps public ids and hints while stripping internal window routing", () => {
+      const result = helpers.formatToolContent({
+        id: 7,
+        windowId: 456,
+        _resolvedWindowId: 456,
+        _hint: "Try another window",
+      });
+      expect(result[0].text).toBe('{"id":7,"windowId":456}\n[hint] Try another window');
+    });
   });
 
   describe("scroll responses", () => {
@@ -540,6 +560,74 @@ describe("formatToolContent", () => {
     it("returns OK for null/undefined", () => {
       expect(helpers.formatToolContent(null)[0].text).toBe("OK");
       expect(helpers.formatToolContent(undefined)[0].text).toBe("OK");
+    });
+  });
+});
+
+describe("frame.diagnose", () => {
+  it("maps to FRAME_DIAGNOSE with the tab id", () => {
+    expect(helpers.mapToolToMessage("frame.diagnose", {}, 9)).toEqual({
+      type: "FRAME_DIAGNOSE",
+      tabId: 9,
+    });
+  });
+});
+
+describe("readiness tools", () => {
+  it("maps wait.ready with CLI flag spelling", () => {
+    const msg = helpers.mapToolToMessage(
+      "wait.ready",
+      {
+        selector: ".x",
+        "url-prefix": "https://a/",
+        "empty-text": "None",
+        timeout: 5000,
+        interval: 200,
+        accept: "login",
+      },
+      7,
+    );
+    expect(msg).toEqual({
+      type: "WAIT_FOR_READY",
+      expect: { selector: ".x", urlPrefix: "https://a/", emptyText: "None" },
+      timeout: 5000,
+      interval: 200,
+      accept: "login",
+      tabId: 7,
+    });
+  });
+
+  it("maps page.readiness with socket API spelling and drops empty values", () => {
+    const msg = helpers.mapToolToMessage(
+      "page.readiness",
+      { urlPrefix: "https://a/", text: "  ", selector: "" },
+      7,
+    );
+    expect(msg).toEqual({ type: "PAGE_READINESS", expect: { urlPrefix: "https://a/" }, tabId: 7 });
+  });
+
+  it("renders wait.ready results as JSON rather than the generic page-loaded line", () => {
+    const content = helpers.formatToolContent({
+      state: "ready",
+      evidence: ["document.readyState is complete"],
+      readyState: "complete",
+      polls: 2,
+      waited: 410,
+      _resolvedTabId: 7,
+    });
+    expect(content).toHaveLength(1);
+    expect(JSON.parse(content[0].text)).toEqual({
+      state: "ready",
+      evidence: ["document.readyState is complete"],
+      readyState: "complete",
+      polls: 2,
+      waited: 410,
+    });
+  });
+
+  it("prefers camelCase over hyphenated spelling when both are present", () => {
+    expect(helpers.readinessExpectations({ urlPrefix: "a", "url-prefix": "b" })).toEqual({
+      urlPrefix: "a",
     });
   });
 });
