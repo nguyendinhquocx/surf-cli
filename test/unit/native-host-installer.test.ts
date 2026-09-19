@@ -13,10 +13,13 @@ const path = require("node:path");
 const { spawnSync } = require("node:child_process");
 const {
   createWrapper,
+  installManifest,
   writeManifest,
   assertListenTargetSupported,
   assertSocketAccessTargetSupported,
 } = require("../../scripts/install-native-host.cjs");
+const { removeManifest } = require("../../scripts/uninstall-native-host.cjs");
+const { runWindowsExecutable } = require("../../scripts/windows-interop.cjs");
 const { parseListenEndpoint } = require("../../native/listener.cjs");
 const {
   normalizeSocketConfig,
@@ -39,7 +42,202 @@ function envWithoutPersistedSettings() {
   return env;
 }
 
+function writeWslManifest(tempDir: string, relativeDir: string) {
+  const manifestPath = path.join(tempDir, relativeDir, "surf.browser.host.json");
+  fs.mkdirSync(path.dirname(manifestPath), { recursive: true });
+  fs.writeFileSync(manifestPath, "{}");
+  return manifestPath;
+}
+
+function wslRegistryFailure(tempDir: string, stderr: string) {
+  return {
+    execFileSync: (file: string, args: string[]) => {
+      if (file === "cmd.exe") {
+        return "C:\\Users\\Test\\AppData\\Local\r\n";
+      }
+      if (file === "wslpath" && args[0] === "-u") {
+        return `${tempDir}\n`;
+      }
+      throw Object.assign(new Error("reg delete failed"), { stderr });
+    },
+  };
+}
+
 describe("native host installer", () => {
+  it("uses a bare Windows tool when it is available", () => {
+    const calls: any[] = [];
+    const output = runWindowsExecutable("cmd.exe", ["/c", "echo", "ok"], {
+      allowWslFallback: true,
+      execFileSync: (file: string, args: string[]) => {
+        calls.push([file, args]);
+        return "ok\r\n";
+      },
+    });
+
+    expect(output).toBe("ok\r\n");
+    expect(calls).toEqual([["cmd.exe", ["/c", "echo", "ok"]]]);
+  });
+
+  it("resolves a missing bare Windows tool through wslpath", () => {
+    const calls: any[] = [];
+    const output = runWindowsExecutable("cmd.exe", ["/c", "echo", "ok"], {
+      allowWslFallback: true,
+      execFileSync: (file: string, args: string[]) => {
+        calls.push([file, args]);
+        if (file === "cmd.exe") {
+          throw Object.assign(new Error("spawn cmd.exe ENOENT"), { code: "ENOENT" });
+        }
+        if (file === "wslpath") {
+          return "/windows/System32/cmd.exe\n";
+        }
+        return "ok\r\n";
+      },
+    });
+
+    expect(output).toBe("ok\r\n");
+    expect(calls.map(([file]) => file)).toEqual([
+      "cmd.exe",
+      "wslpath",
+      "/windows/System32/cmd.exe",
+    ]);
+  });
+
+  it("reports both bare and fallback Windows tool lookup failures", () => {
+    expect(() =>
+      runWindowsExecutable("cmd.exe", ["/c", "echo", "ok"], {
+        allowWslFallback: true,
+        execFileSync: (file: string) => {
+          if (file === "cmd.exe") {
+            throw Object.assign(new Error("bare missing"), { code: "ENOENT" });
+          }
+          throw new Error("wslpath missing");
+        },
+      }),
+    ).toThrow(/cmd\.exe.*bare missing.*wslpath.*wslpath missing/);
+  });
+
+  it("does not fall back when the bare Windows tool fails for another reason", () => {
+    const calls: string[] = [];
+    expect(() =>
+      runWindowsExecutable("cmd.exe", ["/c", "exit", "1"], {
+        allowWslFallback: true,
+        execFileSync: (file: string) => {
+          calls.push(file);
+          throw Object.assign(new Error("access denied"), { code: "EACCES" });
+        },
+      }),
+    ).toThrow(/cmd\.exe.*access denied/);
+    expect(calls).toEqual(["cmd.exe"]);
+  });
+
+  it("registers a WSL Windows install and unregisters it on uninstall", () => {
+    const tempDir = makeTempDir();
+    const calls: any[] = [];
+    const manifestFsPath = path.join(
+      tempDir,
+      "BraveSoftware/Brave-Browser/User Data/NativeMessagingHosts/surf.browser.host.json",
+    );
+    const windowsManifestPath =
+      "C:\\Users\\Nico\\AppData\\Local\\BraveSoftware\\Brave-Browser\\User Data\\NativeMessagingHosts\\surf.browser.host.json";
+    const execFileSync = (file: string, args: string[]) => {
+      calls.push([file, args]);
+      if (file === "cmd.exe") {
+        return "C:\\Users\\Nico\\AppData\\Local\r\n";
+      }
+      if (file === "wslpath" && args[0] === "-u") {
+        return `${tempDir}\n`;
+      }
+      if (file === "wslpath" && args[0] === "-w") {
+        return `${windowsManifestPath}\r\n`;
+      }
+      if (file === "reg.exe") {
+        expect(fs.existsSync(manifestFsPath)).toBe(true);
+        return "completed";
+      }
+      throw new Error(`unexpected command: ${file} ${args.join(" ")}`);
+    };
+    const deps = { execFileSync };
+
+    const manifestPath = installManifest(
+      "brave",
+      extensionA,
+      "C:\\Users\\Nico\\AppData\\Local\\surf-cli\\host-wrapper-wsl.cmd",
+      "wsl-windows",
+      deps,
+    );
+    expect(manifestPath).toBe(manifestFsPath);
+    expect(fs.existsSync(manifestPath)).toBe(true);
+    expect(calls).toContainEqual([
+      "reg.exe",
+      [
+        "add",
+        "HKCU\\Software\\BraveSoftware\\Brave-Browser\\NativeMessagingHosts\\surf.browser.host",
+        "/ve",
+        "/t",
+        "REG_SZ",
+        "/d",
+        windowsManifestPath,
+        "/f",
+      ],
+    ]);
+
+    expect(removeManifest("brave", "wsl-windows", deps)).toBe(manifestPath);
+    expect(fs.existsSync(manifestPath)).toBe(false);
+    expect(calls).toContainEqual([
+      "reg.exe",
+      [
+        "delete",
+        "HKCU\\Software\\BraveSoftware\\Brave-Browser\\NativeMessagingHosts\\surf.browser.host",
+        "/f",
+      ],
+    ]);
+  });
+
+  it("removes a pre-fix WSL manifest when its registry key is already absent", () => {
+    const tempDir = makeTempDir();
+    const manifestPath = writeWslManifest(tempDir, "Google/Chrome/User Data/NativeMessagingHosts");
+    const deps = wslRegistryFailure(
+      tempDir,
+      "ERROR: The system was unable to find the specified registry key or value.\r\n",
+    );
+    const result = removeManifest("chrome", "wsl-windows", deps);
+
+    expect(result).toBe(manifestPath);
+    expect(fs.existsSync(manifestPath)).toBe(false);
+  });
+
+  it("keeps the WSL manifest when registry deletion is denied", () => {
+    const tempDir = makeTempDir();
+    const manifestPath = writeWslManifest(tempDir, "Google/Chrome/User Data/NativeMessagingHosts");
+    const deps = wslRegistryFailure(tempDir, "ERROR: Access is denied.\r\n");
+    const remove = () => removeManifest("chrome", "wsl-windows", deps);
+
+    expect(remove).toThrow(/reg\.exe.*Access is denied/);
+    expect(fs.existsSync(manifestPath)).toBe(true);
+  });
+
+  it("fails a WSL Windows install when registry registration fails", () => {
+    const tempDir = makeTempDir();
+    const execFileSync = (file: string, args: string[]) => {
+      if (file === "cmd.exe") {
+        return "C:\\Users\\Nico\\AppData\\Local\r\n";
+      }
+      if (file === "wslpath" && args[0] === "-u") {
+        return `${tempDir}\n`;
+      }
+      if (file === "wslpath" && args[0] === "-w") {
+        return "C:\\manifest.json\r\n";
+      }
+      throw new Error("registry access denied");
+    };
+
+    expect(() =>
+      installManifest("chrome", extensionA, "C:\\wrapper.cmd", "wsl-windows", {
+        execFileSync,
+      }),
+    ).toThrow(/reg\.exe.*registry access denied/);
+  });
+
   it("documents the Tailnet-only listener option", () => {
     const result = spawnSync(process.execPath, ["scripts/install-native-host.cjs", "--help"], {
       encoding: "utf8",
@@ -293,6 +491,88 @@ describe("native host installer", () => {
 
     expect(result.status).toBe(1);
     expect(result.stderr).toContain("--target linux is only supported on Linux or WSL2");
+  });
+
+  it("does not mutate the Windows registry for explicit Linux install or uninstall in WSL", ({
+    skip,
+  }) => {
+    if (process.platform !== "linux") {
+      skip();
+    }
+    const tempDir = makeTempDir();
+    const binDir = path.join(tempDir, "bin");
+    const marker = path.join(tempDir, "registry-called");
+    fs.mkdirSync(binDir);
+    const regPath = path.join(binDir, "reg.exe");
+    fs.writeFileSync(regPath, `#!/bin/sh\ntouch "${marker}"\n`);
+    fs.chmodSync(regPath, 0o755);
+    const env = {
+      ...process.env,
+      HOME: tempDir,
+      PATH: `${binDir}:${process.env.PATH}`,
+      WSL_DISTRO_NAME: "SurfTest",
+      SURF_NODE_PATH: process.execPath,
+      SURF_HOST_PATH: path.resolve("native/host.cjs"),
+    };
+
+    for (const args of [
+      ["scripts/install-native-host.cjs", extensionA, "--target", "linux"],
+      ["scripts/uninstall-native-host.cjs", "--target", "linux"],
+    ]) {
+      const result = spawnSync(process.execPath, args, { encoding: "utf8", env });
+      expect(result.status).toBe(0);
+      expect(fs.existsSync(marker)).toBe(false);
+    }
+  });
+
+  it("continues WSL --all cleanup when one browser registry key is already absent", ({ skip }) => {
+    if (process.platform !== "linux") {
+      skip();
+    }
+    const tempDir = makeTempDir();
+    const binDir = path.join(tempDir, "bin");
+    const wrapperDir = path.join(tempDir, "surf-cli");
+    const chromeManifest = writeWslManifest(
+      tempDir,
+      "Google/Chrome/User Data/NativeMessagingHosts",
+    );
+    const braveManifest = writeWslManifest(
+      tempDir,
+      "BraveSoftware/Brave-Browser/User Data/NativeMessagingHosts",
+    );
+    fs.mkdirSync(binDir);
+    fs.mkdirSync(wrapperDir);
+    fs.writeFileSync(path.join(wrapperDir, "host-wrapper-wsl.cmd"), "@echo off\r\n");
+    fs.writeFileSync(
+      path.join(binDir, "cmd.exe"),
+      "#!/bin/sh\nprintf '%s\\r\\n' 'C:\\Users\\Test\\AppData\\Local'\n",
+    );
+    fs.writeFileSync(path.join(binDir, "wslpath"), `#!/bin/sh\nprintf '%s\\n' '${tempDir}'\n`);
+    fs.writeFileSync(
+      path.join(binDir, "reg.exe"),
+      "#!/bin/sh\ncase \"$*\" in *'Google\\Chrome'*) echo 'ERROR: The system was unable to find the specified registry key or value.' >&2; exit 1;; esac\n",
+    );
+    for (const file of ["cmd.exe", "wslpath", "reg.exe"]) {
+      fs.chmodSync(path.join(binDir, file), 0o755);
+    }
+
+    const result = spawnSync(
+      process.execPath,
+      ["scripts/uninstall-native-host.cjs", "--all", "--target", "windows"],
+      {
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          PATH: `${binDir}:${process.env.PATH}`,
+          WSL_DISTRO_NAME: "SurfTest",
+        },
+      },
+    );
+
+    expect(result.status).toBe(0);
+    expect(fs.existsSync(chromeManifest)).toBe(false);
+    expect(fs.existsSync(braveManifest)).toBe(false);
+    expect(fs.existsSync(wrapperDir)).toBe(false);
   });
 
   it("rejects uninstall --target linux on non-Linux platforms", ({ skip }) => {
