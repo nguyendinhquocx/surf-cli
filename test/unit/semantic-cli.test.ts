@@ -10,6 +10,7 @@ const semantic = require("../../native/semantic-cli.cjs") as {
     inputs: Record<string, string>,
     allowWrite: boolean,
     allowRefs?: string[],
+    spentWrites?: Set<string>,
   ): Record<string, any>[];
   normalizeSemanticArgs(args: string[]): string[];
   parseSemanticArgs(args: string[]): Record<string, any> | null;
@@ -63,6 +64,10 @@ const observation = {
 
 function response(value: unknown) {
   return { result: { content: [{ type: "text", text: JSON.stringify(value) }] } };
+}
+
+function actionResponse(text: string) {
+  return { result: { content: [{ type: "text", text }] } };
 }
 
 function choice(answer: string, labels: string[]) {
@@ -135,6 +140,29 @@ describe("semantic CLI", () => {
     ).toBe(false);
   });
 
+  it("offers actions only where the observed role makes them applicable", () => {
+    const candidates = [
+      { ref: "text", role: "textbox", name: "Name", type: "text" },
+      { ref: "button", role: "button", name: "Save", type: "button" },
+      { ref: "link", role: "link", name: "Help", type: "a" },
+      { ref: "check", role: "checkbox", name: "Remember", type: "checkbox" },
+      { ref: "radio", role: "radio", name: "One", type: "radio" },
+    ];
+    const actions = semantic.buildActions(
+      { ...observation, candidates },
+      { value: "local-only" },
+      true,
+    );
+
+    expect(actions.filter((action) => action.ref === "text")).toEqual([
+      expect.objectContaining({ kind: "fill", slot: "value" }),
+    ]);
+    for (const ref of ["button", "link", "check", "radio"]) {
+      expect(actions).toContainEqual(expect.objectContaining({ kind: "click", ref }));
+      expect(actions.some((action) => action.kind === "fill" && action.ref === ref)).toBe(false);
+    }
+  });
+
   it("find returns only an observed candidate", async () => {
     const request = async () => response({ semanticObservation: observation });
     const evaluate = async (_state: unknown, questions: Record<string, any>) => {
@@ -161,7 +189,9 @@ describe("semantic CLI", () => {
       designatedIdentity?: Record<string, any>,
     ) => {
       requests.push({ tool, args, designatedIdentity });
-      return tool === "page.read" ? response({ semanticObservation: observation }) : response("OK");
+      return tool === "page.read"
+        ? response({ semanticObservation: observation })
+        : actionResponse("OK");
     };
     let call = 0;
     const evaluate = async (_state: unknown, questions: Record<string, any>) => {
@@ -191,6 +221,9 @@ describe("semantic CLI", () => {
       { request, evaluate, now: () => 0 },
     );
     expect(result).toMatchObject({ status: "complete", stopReason: "complete" });
+    expect(result.trace).toEqual([
+      expect.objectContaining({ kind: "fill", appliedThreshold: 0.65, result: "executed" }),
+    ]);
     expect(requests.filter((item) => item.tool === "form.fill")).toHaveLength(1);
     expect(requests.filter((item) => item.tool === "page.read")).toHaveLength(2);
     expect(JSON.stringify(result)).not.toContain("unique-secret");
@@ -210,7 +243,7 @@ describe("semantic CLI", () => {
     expect(call).toBe(2);
   });
 
-  it("never replays a write when verification is not satisfied", async () => {
+  it("never reoffers or replays a write when verification is not satisfied", async () => {
     let mutations = 0;
     const request = async (tool: string) => {
       if (tool === "page.read") {
@@ -219,11 +252,14 @@ describe("semantic CLI", () => {
       if (tool === "click") {
         mutations++;
       }
-      return response("OK");
+      return actionResponse("OK");
     };
     const evaluate = async (_state: unknown, questions: Record<string, any>) => {
       if (questions.action) {
-        return provider({ action: choice("click:e2", Object.keys(questions.action.criteria)) });
+        const labels = Object.keys(questions.action.criteria);
+        return provider({
+          action: choice(labels.includes("click:e2") ? "click:e2" : "stop", labels),
+        });
       }
       const answers: Record<string, any> = {
         verdict: choice("not_satisfied", ["satisfied", "not_satisfied"]),
@@ -244,9 +280,242 @@ describe("semantic CLI", () => {
       },
       { request, evaluate, now: () => 0 },
     );
-    expect(result).toMatchObject({ status: "stopped", stopReason: "blocked" });
+    expect(result).toMatchObject({ status: "stopped", stopReason: "uncertain" });
     expect(mutations).toBe(1);
     expect(result.trace).toHaveLength(1);
+  });
+
+  it("completes a login-like goal with three distinct writes", async () => {
+    const loginObservation = {
+      ...observation,
+      candidates: [
+        { ref: "user", role: "textbox", name: "Username", type: "text" },
+        { ref: "pass", role: "textbox", name: "Password", type: "password" },
+        { ref: "login", role: "button", name: "Login", type: "submit" },
+      ],
+    };
+    const offered: string[][] = [];
+    const mutations: string[] = [];
+    let actionIndex = 0;
+    let verificationIndex = 0;
+    const requestedActions = ["fill:user:username", "fill:pass:password", "click:login"];
+    const result = await semantic.runBrowserSemantic(
+      {
+        command: "semantic.act",
+        goal: "logged in",
+        allowWrite: true,
+        inputs: { username: "local-user", password: "local-password" },
+        maxSteps: 3,
+      },
+      {
+        request: async (tool: string, args: Record<string, any>) => {
+          if (tool === "page.read") {
+            return response({ semanticObservation: loginObservation });
+          }
+          mutations.push(tool === "form.fill" ? `fill:${args.data[0].ref}` : `click:${args.ref}`);
+          return actionResponse("OK");
+        },
+        evaluate: async (_state: unknown, questions: Record<string, any>) => {
+          if (questions.action) {
+            const labels = Object.keys(questions.action.criteria);
+            offered.push(labels);
+            return provider({ action: choice(requestedActions[actionIndex++], labels) });
+          }
+          const verdict = verificationIndex++ === 2 ? "satisfied" : "not_satisfied";
+          return provider({
+            verdict: choice(verdict, ["satisfied", "not_satisfied"]),
+            evidence: choice("c1", Object.keys(questions.evidence.criteria)),
+          });
+        },
+        now: () => 0,
+      },
+    );
+
+    expect(result).toMatchObject({ status: "complete", stopReason: "complete" });
+    expect(mutations).toEqual(["fill:user", "fill:pass", "click:login"]);
+    expect(result.trace).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ kind: "fill", appliedThreshold: 0.95 }),
+        expect.objectContaining({ kind: "click", appliedThreshold: 0.95 }),
+      ]),
+    );
+    expect(offered[1]).not.toContain("fill:user:username");
+    expect(offered[1]).not.toContain("fill:user:password");
+    expect(offered[2]).not.toContain("fill:pass:username");
+    expect(offered[2]).not.toContain("fill:pass:password");
+  });
+
+  it("allows the same ref for a different logical write on a different full URL", async () => {
+    const first = {
+      ...observation,
+      candidates: [{ ref: "e2", role: "button", name: "Continue", type: "button" }],
+    };
+    const second = {
+      ...first,
+      identity: { ...first.identity, fullUrl: "https://example.test/next", documentToken: "next" },
+    };
+    let reads = 0;
+    let writes = 0;
+    let verifications = 0;
+    const result = await semantic.runBrowserSemantic(
+      { command: "semantic.act", goal: "finished", allowWrite: true, inputs: {}, maxSteps: 2 },
+      {
+        request: async (tool: string) => {
+          if (tool === "page.read") {
+            return response({ semanticObservation: reads++ ? second : first });
+          }
+          writes++;
+          return actionResponse("OK");
+        },
+        evaluate: async (_state: unknown, questions: Record<string, any>) => {
+          if (questions.action) {
+            const labels = Object.keys(questions.action.criteria);
+            return provider({ action: choice("click:e2", labels) });
+          }
+          const verdict = verifications++ ? "satisfied" : "not_satisfied";
+          return provider({
+            verdict: choice(verdict, ["satisfied", "not_satisfied"]),
+            evidence: choice("c1", Object.keys(questions.evidence.criteria)),
+          });
+        },
+        now: () => 0,
+      },
+    );
+    expect(result.status).toBe("complete");
+    expect(writes).toBe(2);
+  });
+
+  it("stops after a provider verification failure without retrying a confirmed write", async () => {
+    let writes = 0;
+    const result = await semantic.runBrowserSemantic(
+      { command: "semantic.act", goal: "saved", allowWrite: true, inputs: {}, maxSteps: 3 },
+      {
+        request: async (tool: string) => {
+          if (tool === "page.read") {
+            return response({ semanticObservation: observation });
+          }
+          writes++;
+          return actionResponse("OK");
+        },
+        evaluate: async (_state: unknown, questions: Record<string, any>) => {
+          if (!questions.action) {
+            throw new Error("provider disconnected");
+          }
+          return provider({ action: choice("click:e2", Object.keys(questions.action.criteria)) });
+        },
+        now: () => 0,
+      },
+    );
+    expect(result).toMatchObject({ status: "stopped", stopReason: "verification_failed" });
+    expect(writes).toBe(1);
+  });
+
+  it("stops on a resolved host-serialized write failure without spending or retrying it", async () => {
+    let attempts = 0;
+    let reads = 0;
+    const result = await semantic.runBrowserSemantic(
+      { command: "semantic.act", goal: "saved", allowWrite: true, inputs: {}, maxSteps: 3 },
+      {
+        request: async (tool: string) => {
+          if (tool === "page.read") {
+            reads++;
+            return response({ semanticObservation: observation });
+          }
+          attempts++;
+          return actionResponse(
+            JSON.stringify({
+              success: false,
+              error: "Element is not fillable",
+              code: "fill_failed",
+            }),
+          );
+        },
+        evaluate: async (_state: unknown, questions: Record<string, any>) =>
+          provider({ action: choice("click:e2", Object.keys(questions.action.criteria)) }),
+        now: () => 0,
+      },
+    );
+    expect(result).toMatchObject({ status: "stopped", stopReason: "action_failed" });
+    expect(attempts).toBe(1);
+    expect(reads).toBe(1);
+  });
+
+  it.each([
+    ["missing success", { filled: 1, failed: 0, results: [{ ref: "e1", success: true }] }],
+    ["malformed text", "not-json-or-a-success-marker"],
+  ])("stops on a resolved host-serialized %s action outcome", async (_name, outcome) => {
+    let attempts = 0;
+    let verificationCalls = 0;
+    const result = await semantic.runBrowserSemantic(
+      { command: "semantic.act", goal: "saved", allowWrite: true, inputs: {}, maxSteps: 3 },
+      {
+        request: async (tool: string) => {
+          if (tool === "page.read") {
+            return response({ semanticObservation: observation });
+          }
+          attempts++;
+          return actionResponse(typeof outcome === "string" ? outcome : JSON.stringify(outcome));
+        },
+        evaluate: async (_state: unknown, questions: Record<string, any>) => {
+          if (!questions.action) {
+            verificationCalls++;
+          }
+          return provider({ action: choice("click:e2", Object.keys(questions.action.criteria)) });
+        },
+        now: () => 0,
+      },
+    );
+    expect(result).toMatchObject({ status: "stopped", stopReason: "outcome_unknown" });
+    expect(attempts).toBe(1);
+    expect(verificationCalls).toBe(0);
+  });
+
+  it("refreshes a stale pre-execution identity with zero mutation", async () => {
+    let reads = 0;
+    let mutationCount = 0;
+    let selections = 0;
+    const withoutField = {
+      ...observation,
+      candidates: observation.candidates.filter((item) => item.ref !== "e1"),
+    };
+    const result = await semantic.runBrowserSemantic(
+      {
+        command: "semantic.act",
+        goal: "saved",
+        allowWrite: true,
+        inputs: { email: "local-only" },
+        maxSteps: 2,
+      },
+      {
+        request: async (tool: string) => {
+          if (tool === "page.read") {
+            return response({ semanticObservation: reads++ ? withoutField : observation });
+          }
+          if (tool !== "form.fill") {
+            mutationCount++;
+          }
+          return actionResponse(
+            JSON.stringify({
+              success: false,
+              error: "stale_observation",
+              code: "stale_observation",
+              filled: 0,
+              failed: 1,
+              results: [],
+            }),
+          );
+        },
+        evaluate: async (_state: unknown, questions: Record<string, any>) => {
+          const labels = Object.keys(questions.action.criteria);
+          return provider({ action: choice(selections++ ? "stop" : "fill:e1:email", labels) });
+        },
+        now: () => 0,
+      },
+    );
+    expect(result.status).toBe("stopped");
+    expect(result.trace).toEqual([expect.objectContaining({ kind: "fill", result: "stale" })]);
+    expect(mutationCount).toBe(0);
+    expect(reads).toBe(2);
   });
 
   it("reserves fixed actions and every narrowed ref at the 64-candidate boundary", () => {
@@ -276,8 +545,8 @@ describe("semantic CLI", () => {
         expect.objectContaining({ id: "scroll:bottom" }),
         expect.objectContaining({ id: "wait:500" }),
         expect.objectContaining({ id: "wait:1500" }),
-        expect.objectContaining({ id: "click:e1" }),
-        expect.objectContaining({ id: "click:e64" }),
+        expect.objectContaining({ id: "fill:e1:slot0" }),
+        expect.objectContaining({ id: "fill:e64:slot0" }),
       ]),
     );
     expect(
