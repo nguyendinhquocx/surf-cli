@@ -17,6 +17,9 @@ class FakeElement extends FakeNode {
   parentElement: FakeElement | null = null;
   offsetWidth = 10;
   offsetHeight = 10;
+  clientHeight = 0;
+  scrollHeight = 0;
+  scrollTop = 0;
   selectedIndex = -1;
   options: FakeElement[] = [];
   value = "";
@@ -25,6 +28,7 @@ class FakeElement extends FakeNode {
   checked = false;
   focused = false;
   clicked = false;
+  listeners = new Map<string, Array<() => void>>();
   isContentEditable = false;
 
   private attrs = new Map<string, string>();
@@ -93,6 +97,12 @@ class FakeElement extends FakeNode {
 
   dispatchEvent(_event: Event): boolean {
     return true;
+  }
+
+  addEventListener(type: string, listener: () => void): void {
+    const listeners = this.listeners.get(type) || [];
+    listeners.push(listener);
+    this.listeners.set(type, listeners);
   }
 
   getBoundingClientRect(): { top: number; bottom: number; left: number; right: number } {
@@ -181,6 +191,47 @@ describe("accessibility tree", () => {
     expect(response).toEqual({ success: true });
   });
 
+  it("does not classify listener-backed anchors as mutation-safe or suppress authorized clicks", () => {
+    const anchor = element("a", { href: "/account" });
+    anchor.append(text("Account"));
+    anchor.addEventListener("click", () => {
+      anchor.clicked = true;
+    });
+    (document.body as unknown as FakeElement).append(anchor);
+    window.__piElementMap = {
+      account: {
+        element: new WeakRef(anchor as unknown as Element),
+        role: "link",
+        name: "Account",
+      },
+    };
+
+    let response: any;
+    messageHandler?.(
+      {
+        type: "GENERATE_ACCESSIBILITY_TREE",
+        options: { filter: "interactive", semanticObservation: true },
+      },
+      {},
+      (result) => {
+        response = result;
+      },
+    );
+
+    const candidate = response.semanticObservation.candidates.find(
+      (item: Record<string, any>) => item.ref === "account",
+    );
+    expect(candidate).toMatchObject({ role: "link", href: "/account" });
+    expect(candidate).not.toHaveProperty("safeNavigation");
+
+    const { buildActions } = require("../../native/semantic-cli.cjs");
+    const readonly = buildActions(response.semanticObservation, {}, false);
+    const writable = buildActions(response.semanticObservation, {}, true);
+    expect(readonly).toContainEqual(expect.objectContaining({ kind: "navigate" }));
+    expect(readonly.some((action: Record<string, any>) => action.kind === "click")).toBe(false);
+    expect(writable).toContainEqual(expect.objectContaining({ kind: "click", ref: "account" }));
+  });
+
   it("reports when the visual indicator content script is not loaded", () => {
     window.__piVisualIndicatorMessageHandler = undefined;
     let response: any;
@@ -217,6 +268,240 @@ describe("accessibility tree", () => {
     expect(response.pageContent).toContain('link "Read docs"');
     expect(response.pageContent).toContain('button "Save changes"');
   });
+
+  it("returns a bounded value-free semantic observation only when requested", () => {
+    const password = new FakeInputElement("input");
+    password.setAttribute("type", "password");
+    password.setAttribute("aria-label", "Account password");
+    password.value = "unique-password-sentinel";
+    const button = new FakeButtonElement("button");
+    button.append(text("Continue"));
+    (document.body as unknown as FakeElement).append(password, button, text("Public nearby copy"));
+
+    let ordinary: any;
+    messageHandler?.(
+      { type: "GENERATE_ACCESSIBILITY_TREE", options: { filter: "interactive" } },
+      {},
+      (result) => {
+        ordinary = result;
+      },
+    );
+    expect(ordinary.semanticObservation).toBeUndefined();
+
+    let response: any;
+    messageHandler?.(
+      {
+        type: "GENERATE_ACCESSIBILITY_TREE",
+        options: { filter: "interactive", semanticObservation: true },
+      },
+      {},
+      (result) => {
+        response = result;
+      },
+    );
+
+    expect(response.semanticObservation.identity).toMatchObject({
+      fullUrl: "https://example.test/page",
+    });
+    expect(response.semanticObservation.candidates).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ role: "textbox", name: "Account password", type: "password" }),
+        expect.objectContaining({ role: "button", name: "Continue", type: "button" }),
+      ]),
+    );
+    const observedRefs = response.semanticObservation.candidates.map(
+      (candidate: any) => candidate.ref,
+    );
+    expect(response.semanticObservation.chunks).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ refs: expect.arrayContaining(observedRefs) }),
+      ]),
+    );
+    expect(JSON.stringify(response.semanticObservation)).not.toContain("unique-password-sentinel");
+    expect(
+      new TextEncoder().encode(JSON.stringify(response.semanticObservation)).length,
+    ).toBeLessThanOrEqual(24 * 1024);
+  });
+
+  it("rejects stale guarded clicks without executing the action", () => {
+    const button = new FakeButtonElement("button");
+    button.append(text("Continue"));
+    window.__piElementMap = {
+      target: {
+        element: new WeakRef(button as unknown as Element),
+        role: "button",
+        name: "Continue",
+      },
+    };
+
+    let response: any;
+    messageHandler?.(
+      {
+        type: "CLICK_ELEMENT",
+        ref: "target",
+        button: "left",
+        expectedIdentity: {
+          fullUrl: "https://example.test/old",
+          documentToken: "old-document",
+          ref: "target",
+          role: "button",
+          name: "Continue",
+          type: "button",
+        },
+      },
+      {},
+      (result) => {
+        response = result;
+      },
+    );
+
+    expect(response).toEqual({ error: "stale_observation", code: "stale_observation" });
+    expect(button.clicked).toBe(false);
+  });
+
+  it("rejects stale guarded fills without changing the control value", () => {
+    const input = new FakeInputElement("input");
+    input.setAttribute("type", "email");
+    input.setAttribute("aria-label", "Email");
+    input.value = "original";
+    window.__piElementMap = {
+      target: { element: new WeakRef(input as unknown as Element), role: "textbox", name: "Email" },
+    };
+
+    let response: any;
+    messageHandler?.(
+      {
+        type: "FORM_FILL",
+        data: [{ ref: "target", value: "replacement" }],
+        expectedIdentity: {
+          fullUrl: "https://example.test/page",
+          documentToken: "stale-document",
+          ref: "target",
+          role: "textbox",
+          name: "Email",
+          type: "email",
+        },
+      },
+      {},
+      (result) => {
+        response = result;
+      },
+    );
+
+    expect(response).toMatchObject({ success: false, code: "stale_observation", filled: 0 });
+    expect(input.value).toBe("original");
+  });
+
+  it.each([
+    { type: "SEMANTIC_NAVIGATE", url: "https://example.test/next" },
+    { type: "SEMANTIC_SCROLL", deltaX: 0, deltaY: 600 },
+  ])("rejects stale guarded $type without acting on a replacement document", (message) => {
+    const scrollBy = vi.fn();
+    const scrollTo = vi.fn();
+    (window as any).scrollBy = scrollBy;
+    (window as any).scrollTo = scrollTo;
+    let response: any;
+    messageHandler?.(
+      {
+        ...message,
+        expectedIdentity: {
+          fullUrl: "https://example.test/replaced",
+          documentToken: "old-document",
+        },
+      },
+      {},
+      (result) => {
+        response = result;
+      },
+    );
+    expect(response).toEqual({ error: "stale_observation", code: "stale_observation" });
+    expect(window.location.href).toBe("https://example.test/page");
+    expect(scrollBy).not.toHaveBeenCalled();
+    expect(scrollTo).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { type: "SCROLL_TO_POSITION", position: "top" },
+    { type: "SCROLL_TO_POSITION", position: "bottom" },
+    { type: "SEMANTIC_SCROLL", position: "top" },
+    { type: "SEMANTIC_SCROLL", position: "bottom" },
+  ])("$type $position uses the largest scrollable container", ({ type, position }) => {
+    const viewport = new FakeElement("html");
+    viewport.clientHeight = 768;
+    viewport.scrollHeight = 768;
+    const overflow = new FakeElement("main");
+    overflow.clientHeight = 400;
+    overflow.scrollHeight = 2_000;
+    overflow.scrollTop = position === "top" ? 800 : 0;
+    (overflow as any).style = { overflow: "auto" };
+    (document as any).documentElement = viewport;
+    (document as any).querySelectorAll = () => [viewport, overflow];
+
+    let observation: any;
+    messageHandler?.(
+      {
+        type: "GENERATE_ACCESSIBILITY_TREE",
+        options: { filter: "interactive", semanticObservation: true },
+      },
+      {},
+      (result) => {
+        observation = result.semanticObservation;
+      },
+    );
+
+    let response: any;
+    messageHandler?.(
+      {
+        type,
+        position,
+        ...(type === "SEMANTIC_SCROLL" ? { expectedIdentity: observation.identity } : {}),
+      },
+      {},
+      (result) => {
+        response = result;
+      },
+    );
+
+    expect(overflow.scrollTop).toBe(position === "top" ? 0 : overflow.scrollHeight);
+    expect(response).toMatchObject({
+      scrollTop: overflow.scrollTop,
+      scrollHeight: 2_000,
+      clientHeight: 400,
+    });
+    expect(viewport.scrollTop).toBe(0);
+  });
+
+  it.each(["top", "bottom"])(
+    "stale guarded semantic scroll.%s does not mutate the selected container",
+    (position) => {
+      const overflow = new FakeElement("main");
+      overflow.clientHeight = 400;
+      overflow.scrollHeight = 2_000;
+      overflow.scrollTop = 500;
+      const querySelectorAll = vi.fn(() => [overflow]);
+      (document as any).querySelectorAll = querySelectorAll;
+
+      let response: any;
+      messageHandler?.(
+        {
+          type: "SEMANTIC_SCROLL",
+          position,
+          expectedIdentity: {
+            fullUrl: "https://example.test/replaced",
+            documentToken: "old-document",
+          },
+        },
+        {},
+        (result) => {
+          response = result;
+        },
+      );
+
+      expect(response).toEqual({ error: "stale_observation", code: "stale_observation" });
+      expect(overflow.scrollTop).toBe(500);
+      expect(querySelectorAll).not.toHaveBeenCalled();
+    },
+  );
 
   it("caps visible text in compact mode", () => {
     (document.body as unknown as FakeElement).append(text("abcdef"));

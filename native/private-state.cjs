@@ -30,6 +30,19 @@ function assertWithin(root, targetPath) {
   return resolvedTarget;
 }
 
+function assertPrivatePath(targetPath, root, allowMissing) {
+  const resolvedRoot = path.resolve(root);
+  const resolvedTarget = assertWithin(resolvedRoot, targetPath);
+  const relative = path.relative(resolvedRoot, resolvedTarget);
+  let current = resolvedRoot;
+  for (const segment of ["", ...relative.split(path.sep).filter(Boolean)]) {
+    if (segment) current = path.join(current, segment);
+    const stat = assertNotSymlink(current, allowMissing);
+    if (!stat) return null;
+  }
+  return fs.lstatSync(resolvedTarget);
+}
+
 function ensurePrivateDir(dirPath, root = getPrivateStateRoot()) {
   const resolvedRoot = path.resolve(root);
   const resolvedDir = assertWithin(resolvedRoot, dirPath);
@@ -129,11 +142,21 @@ function readPrivateFile(filePath, options = {}) {
   const resolved = path.resolve(filePath);
   const root = options.root || getPrivateStateRoot();
   assertWithin(root, resolved);
-  const stat = assertNotSymlink(resolved, options.allowMissing === true);
+  const stat = assertPrivatePath(resolved, root, options.allowMissing === true);
   if (!stat) return options.fallback;
   if (!stat.isFile()) throw new Error(`private state path is not a file: ${resolved}`);
   if (process.platform !== "win32" && (stat.mode & 0o077) !== 0) throw new Error(`private state file permissions are too broad: ${resolved}`);
   return fs.readFileSync(resolved, options.encoding || null);
+}
+
+function removePrivateFile(filePath, options = {}) {
+  const resolved = path.resolve(filePath);
+  const root = options.root || getPrivateStateRoot();
+  const stat = assertPrivatePath(resolved, root, true);
+  if (!stat) return false;
+  if (!stat.isFile()) throw new Error(`private state path is not a file: ${resolved}`);
+  fs.unlinkSync(resolved);
+  return true;
 }
 
 function readPrivateJson(filePath, fallback = null, options = {}) {
@@ -152,5 +175,6 @@ module.exports = {
   privateStatePath,
   readPrivateFile,
   readPrivateJson,
+  removePrivateFile,
   writePrivateFileExclusive,
 };

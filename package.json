@@ -50,6 +50,7 @@
     "test": "vitest run",
     "test:package": "node test/package-artifact.mjs",
     "test:e2e:chrome": "node test/e2e/real-chrome.mjs",
+    "eval:jev": "node test/eval/real-jev.mjs",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
     "test:ui": "vitest --ui",
@@ -59,6 +60,7 @@
   "dependencies": {
     "@google/generative-ai": "^0.24.1",
     "@modelcontextprotocol/sdk": "^1.26.0",
+    "@typesafe-ai/sdk": "0.6.0",
     "buffer": "^6.0.3",
     "crypto-browserify": "^3.12.1",
     "events": "^3.3.0",

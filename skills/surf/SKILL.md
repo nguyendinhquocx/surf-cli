@@ -94,6 +94,32 @@ surf screenshot --full-page --output /tmp/shot.png
 surf animate-audit --selector ".thing" --duration 2000 --fps 10
 ```
 
+## Optional semantic decisions
+
+Only `semantic.*` sends bounded, value-free page text to TypeSafe.
+
+```bash
+surf semantic.find "the settings control"
+surf semantic.verify "Settings were saved" --json
+surf semantic.filter "settings"
+surf semantic.act "Open settings" --max-steps 5
+surf semantic.act "Fill email" --input email="$EMAIL" --allow-write --allow-ref e3
+printf '%s\n' "$TYPESAFE_KEY" | surf semantic auth set
+surf semantic auth status
+surf semantic auth clear
+```
+
+Every click/fill requires `--allow-write`; repeat `--allow-ref` to narrow it.
+Broad writes use threshold `0.95`; exactly one allowed ref with one applicable
+write uses `0.65`. The applied threshold is included in decision/trace output.
+`TYPESAFE_API_KEY` is the ephemeral/CI override.
+The shared credential schema is `{"version":1,"apiKey":"..."}` at
+`${XDG_CONFIG_HOME:-~/.config}/typesafe/credentials.json` (Unix/macOS) or
+`%APPDATA%\TypeSafe\credentials.json` (Windows), independent of Surf state and
+the project. POSIX directories/files use `0700`/`0600`; Windows relies on the
+current user's profile ACL. `TYPESAFE_API_KEY` wins. Status reveals only source
+and fingerprint; clear affects all clients using the shared file.
+
 ## AI Assistants (No API Keys)
 
 Query AI models using your browser's logged-in session. Must be logged into the respective service in Chrome.
