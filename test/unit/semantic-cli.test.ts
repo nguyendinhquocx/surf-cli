@@ -12,6 +12,10 @@ const semantic = require("../../native/semantic-cli.cjs") as {
     allowRefs?: string[],
     spentWrites?: Set<string>,
   ): Record<string, any>[];
+  buildLogicalCandidates(
+    observation: Record<string, any>,
+    candidates?: Record<string, any>[],
+  ): Record<string, any>[];
   normalizeSemanticArgs(args: string[]): string[];
   parseSemanticArgs(args: string[]): Record<string, any> | null;
   providerState(observation: Record<string, any>): Record<string, any>;
@@ -70,9 +74,12 @@ function actionResponse(text: string) {
   return { result: { content: [{ type: "text", text }] } };
 }
 
-function choice(answer: string, labels: string[]) {
+function choice(answer: string, labels: string[], selectedProbability = 0.99) {
   const probabilities = Object.fromEntries(
-    labels.map((label) => [label, label === answer ? 0.99 : 0.01 / (labels.length - 1)]),
+    labels.map((label) => [
+      label,
+      label === answer ? selectedProbability : (1 - selectedProbability) / (labels.length - 1),
+    ]),
   );
   if (labels.length === 1) {
     probabilities[answer] = 1;
@@ -82,6 +89,17 @@ function choice(answer: string, labels: string[]) {
 
 function provider(answers: Record<string, any>) {
   return { model: "jev-test", usage: { input_tokens: 1, output_tokens: 1 }, answers };
+}
+
+function linkCandidates(count = 64) {
+  return Array.from({ length: count }, (_, index) => ({
+    ref: `e${index + 1}`,
+    role: "link",
+    name: `Product ${index + 1}`,
+    type: "a",
+    nearbyText: `Product card ${index + 1}`,
+    href: `/product/${index + 1}`,
+  }));
 }
 
 describe("semantic CLI", () => {
@@ -167,13 +185,149 @@ describe("semantic CLI", () => {
     const request = async () => response({ semanticObservation: observation });
     const evaluate = async (_state: unknown, questions: Record<string, any>) => {
       const labels = Object.keys(questions.target.criteria);
-      return provider({ target: choice("e3", labels) });
+      const stateCandidates = Object.keys(questions.target.criteria);
+      const selected = stateCandidates.find((label) => label.startsWith("target:"));
+      if (!selected) {
+        throw new Error("expected grouped navigation target");
+      }
+      return provider({ target: choice(selected, labels) });
     };
     const result = await semantic.runBrowserSemantic(
       { command: "semantic.find", goal: "profile" },
       { request, evaluate },
     );
     expect(result).toMatchObject({ status: "found", candidate: { id: "e3" } });
+  });
+
+  it("groups duplicate image/title product links before find confidence gating and resolves the named ref", async () => {
+    const products = {
+      ...observation,
+      candidates: [
+        {
+          ref: "image",
+          role: "link",
+          name: "Sauce Labs Backpack",
+          type: "a",
+          nearbyText: "Sauce Labs Backpack product card",
+          representation: "image",
+          href: "/item/4",
+        },
+        {
+          ref: "title",
+          role: "link",
+          name: "Sauce Labs Backpack",
+          type: "a",
+          nearbyText: "Sauce Labs Backpack product card",
+          representation: "text",
+          href: "https://example.test/item/4",
+        },
+        {
+          ref: "other",
+          role: "link",
+          name: "Sauce Labs Backpack",
+          type: "a",
+          nearbyText: "Featured",
+          href: "/item/5",
+        },
+      ],
+    };
+    let offered: string[] = [];
+    const result = await semantic.runBrowserSemantic(
+      { command: "semantic.find", goal: "Sauce Labs Backpack" },
+      {
+        request: async () => response({ semanticObservation: products }),
+        evaluate: async (state: Record<string, any>, questions: Record<string, any>) => {
+          offered = Object.keys(questions.target.criteria);
+          expect(state.candidates).toHaveLength(2);
+          const target = state.candidates[0];
+          return provider({ target: choice(target.id, offered, 0.7) });
+        },
+      },
+    );
+
+    expect(offered).toHaveLength(3); // two logical destinations plus none
+    expect(result).toMatchObject({
+      status: "found",
+      candidate: { id: "title" },
+      logicalCandidate: { refs: ["title", "image"], probability: 0.7 },
+      concreteDecision: { ref: "title", probability: 0.7 },
+    });
+    expect(result.logicalCandidate.id).toMatch(/^target:[a-f0-9]{56}$/);
+  });
+
+  it("preserves non-equivalent same-name controls and destinations", () => {
+    const candidates = [
+      { ref: "one", role: "button", name: "Open", type: "button", nearbyText: "First" },
+      { ref: "two", role: "button", name: "Open", type: "button", nearbyText: "Second" },
+      {
+        ref: "three",
+        role: "link",
+        name: "Open",
+        type: "a",
+        nearbyText: "First",
+        href: "/one",
+      },
+      {
+        ref: "four",
+        role: "link",
+        name: "Open",
+        type: "a",
+        nearbyText: "First",
+        href: "/two",
+      },
+      {
+        ref: "header",
+        role: "link",
+        name: "Account",
+        type: "a",
+        nearbyText: "Header account shortcut",
+        href: "/account",
+      },
+      {
+        ref: "danger",
+        role: "link",
+        name: "Account",
+        type: "a",
+        nearbyText: "Danger-zone account action",
+        href: "/account",
+      },
+    ];
+    const groups = semantic.buildLogicalCandidates({ ...observation, candidates });
+    expect(groups).toHaveLength(6);
+    expect(
+      groups.map((group) =>
+        group.concreteCandidates.map((candidate: Record<string, any>) => candidate.id),
+      ),
+    ).toEqual([["one"], ["two"], ["three"], ["four"], ["header"], ["danger"]]);
+  });
+
+  it("canonicalizes only duplicate direct navigation actions and preserves authorized clicks", () => {
+    const candidates = [
+      { ref: "image", role: "link", name: "", type: "a", href: "/item/4" },
+      {
+        ref: "title",
+        role: "link",
+        name: "Backpack",
+        type: "a",
+        href: "/item/4",
+      },
+      {
+        ref: "mutate",
+        role: "link",
+        name: "Add Backpack",
+        type: "a",
+        href: "/item/4",
+      },
+    ];
+    const readonly = semantic.buildActions({ ...observation, candidates }, {}, false);
+    expect(readonly.filter((action) => action.kind === "navigate")).toEqual([
+      expect.objectContaining({ concreteRef: "title", url: "https://example.test/item/4" }),
+    ]);
+    const writable = semantic.buildActions({ ...observation, candidates }, {}, true);
+    expect(writable.filter((action) => action.kind === "navigate")).toHaveLength(1);
+    expect(writable).toContainEqual(expect.objectContaining({ kind: "click", ref: "image" }));
+    expect(writable).toContainEqual(expect.objectContaining({ kind: "click", ref: "title" }));
+    expect(writable).toContainEqual(expect.objectContaining({ kind: "click", ref: "mutate" }));
   });
 
   it("executes an authorized write once, refreshes, verifies, and redacts the local value from its trace", async () => {
@@ -557,6 +711,136 @@ describe("semantic CLI", () => {
         ),
       ),
     ).toBe(true);
+  });
+
+  it("keeps all fixed and deduplicated navigation actions at the read-only 64-link boundary", () => {
+    const actions = semantic.buildActions(
+      { ...observation, candidates: linkCandidates() },
+      {},
+      false,
+    );
+    expect(actions).toHaveLength(SEMANTIC_POLICY.limits.actionChoices);
+    expect(actions.filter((action) => action.kind === "navigate")).toHaveLength(64);
+    expect(actions.some((action) => action.kind === "click" || action.kind === "fill")).toBe(false);
+    expect(actions.slice(0, 6).map((action) => action.id)).toEqual([
+      "scroll:down_600",
+      "scroll:up_600",
+      "scroll:top",
+      "scroll:bottom",
+      "wait:500",
+      "wait:1500",
+    ]);
+  });
+
+  it("fairly bounds broad navigation and click variants at the 64-link boundary", () => {
+    const actions = semantic.buildActions(
+      { ...observation, candidates: linkCandidates() },
+      {},
+      true,
+    );
+    expect(actions).toHaveLength(SEMANTIC_POLICY.limits.actionChoices);
+    expect(actions.filter((action) => action.kind === "navigate")).toHaveLength(32);
+    expect(actions.filter((action) => action.kind === "click")).toHaveLength(32);
+    expect(
+      actions.slice(0, 6).every((action) => action.kind === "scroll" || action.kind === "wait"),
+    ).toBe(true);
+  });
+
+  it("prioritizes a late exact allow-ref write before navigation truncation", () => {
+    const candidates = linkCandidates();
+    const actions = semantic.buildActions({ ...observation, candidates }, {}, true, ["e63"]);
+    expect(actions).toHaveLength(SEMANTIC_POLICY.limits.actionChoices);
+    expect(actions[6]).toMatchObject({ id: "click:e63", kind: "click", ref: "e63" });
+    expect(actions.filter((action) => action.kind === "click")).toEqual([
+      expect.objectContaining({ ref: "e63" }),
+    ]);
+    expect(actions.filter((action) => action.kind === "navigate")).toHaveLength(63);
+  });
+
+  it("preserves every mandatory multiple-allow-ref write before bounded navigation", () => {
+    const candidates = linkCandidates();
+    const allowRefs = ["e2", "e32", "e63", "e64"];
+    const actions = semantic.buildActions({ ...observation, candidates }, {}, true, allowRefs);
+    expect(actions).toHaveLength(SEMANTIC_POLICY.limits.actionChoices);
+    expect(actions.slice(6, 10).map((action) => action.ref)).toEqual(allowRefs);
+    expect(actions.filter((action) => action.kind === "click").map((action) => action.ref)).toEqual(
+      allowRefs,
+    );
+    expect(actions.filter((action) => action.kind === "navigate")).toHaveLength(60);
+  });
+
+  it("fairly reserves broad navigation, click, and fill classes", () => {
+    const candidates = [
+      ...linkCandidates(32),
+      ...Array.from({ length: 16 }, (_, index) => ({
+        ref: `b${index + 1}`,
+        role: "button",
+        name: `Button ${index + 1}`,
+        type: "button",
+      })),
+      ...Array.from({ length: 16 }, (_, index) => ({
+        ref: `f${index + 1}`,
+        role: "textbox",
+        name: `Field ${index + 1}`,
+        type: "text",
+      })),
+    ];
+    const actions = semantic.buildActions(
+      { ...observation, candidates },
+      { value: "local-only" },
+      true,
+    );
+    expect(actions).toHaveLength(SEMANTIC_POLICY.limits.actionChoices);
+    for (const kind of ["navigate", "click", "fill"]) {
+      expect(actions.filter((action) => action.kind === kind).length).toBeGreaterThan(0);
+    }
+    expect(actions.some((action) => action.kind === "click" && action.ref.startsWith("b"))).toBe(
+      true,
+    );
+    expect(actions.some((action) => action.kind === "fill" && action.ref.startsWith("f"))).toBe(
+      true,
+    );
+  });
+
+  it("retains exact-ref threshold applicability for a late bounded link click", async () => {
+    const candidates = linkCandidates();
+    let reads = 0;
+    const result = await semantic.runBrowserSemantic(
+      {
+        command: "semantic.act",
+        goal: "opened product 63",
+        allowWrite: true,
+        allowRefs: ["e63"],
+        inputs: {},
+        maxSteps: 1,
+      },
+      {
+        request: async (tool: string) => {
+          if (tool === "page.read") {
+            reads++;
+            return response({ semanticObservation: { ...observation, candidates } });
+          }
+          return actionResponse("OK");
+        },
+        evaluate: async (_state: unknown, questions: Record<string, any>) => {
+          if (questions.action) {
+            return provider({
+              action: choice("click:e63", Object.keys(questions.action.criteria), 0.65),
+            });
+          }
+          return provider({
+            verdict: choice("satisfied", ["satisfied", "not_satisfied"]),
+            evidence: choice("c1", Object.keys(questions.evidence.criteria)),
+          });
+        },
+        now: () => 0,
+      },
+    );
+    expect(result).toMatchObject({
+      status: "complete",
+      trace: [expect.objectContaining({ ref: "e63", appliedThreshold: 0.65 })],
+    });
+    expect(reads).toBe(2);
   });
 
   it("fails explicitly before provider selection when mandatory authorized actions exceed the hard bound", async () => {
