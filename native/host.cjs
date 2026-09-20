@@ -15,7 +15,7 @@ const grokClient = require("./grok-client.cjs");
 const kimiClient = require("./kimi-client.cjs");
 const aistudioClient = require("./aistudio-client.cjs");
 const aistudioBuild = require("./aistudio-build.cjs");
-const { mapToolToMessage, mapComputerAction, formatToolContent, formatToolError, buildProviderUploadMessage } = require("./host-helpers.cjs");
+const { mapToolToMessage, mapComputerAction, formatToolContent, formatToolError, buildProviderUploadMessage, applySemanticExpectedIdentity } = require("./host-helpers.cjs");
 const { createOracleHost } = require("./oracle-host.cjs");
 
 const IS_WIN = process.platform === "win32";
@@ -844,7 +844,7 @@ function currentFrameContext(request) {
 function applyFrameContextToMessage(request, extensionMessage) {
   if (!extensionMessage || !FRAME_CONTEXT_MESSAGE_TYPES.has(extensionMessage.type)) return;
   const context = currentFrameContext(request);
-  if (context) extensionMessage.frameId = context.frameId;
+  if (context && !Number.isInteger(extensionMessage.frameId)) extensionMessage.frameId = context.frameId;
 }
 
 function persistFrameContext(request, frameId, url) {
@@ -1497,6 +1497,7 @@ async function executeMappedHostTool(request, tool, args, tabId) {
   if (!extensionMsg) throw new Error(`Unknown tool: ${tool}`);
   if (request.target?.strict) extensionMsg.strictTarget = true;
   applyFrameContextToMessage(request, extensionMsg);
+  applySemanticExpectedIdentity(request, extensionMsg, args);
   if (extensionMsg.type === "UNSUPPORTED_ACTION") throw new Error(extensionMsg.message);
   if (extensionMsg.type === "LOCAL_WAIT") {
     await abortableDelay(extensionMsg.seconds * 1000, request.signal);
@@ -1720,6 +1721,9 @@ function sendToolResponse(socket, id, result, error) {
     let output = result;
     try {
       if (!error) output = await sendRequestDownloads(context, request, result);
+      if (!error && output?.semanticObservation?.identity && request?.target) {
+        output.semanticObservation.identity.browserEpoch = request.target.browserEpoch;
+      }
     } catch (transferFailure) {
       finalError = transferFailure.message;
     }
@@ -1905,6 +1909,12 @@ function handleToolRequest(msg, socket, requestContext = requestStorage.getStore
   }
   if (requestContext.target?.strict) extensionMsg.strictTarget = true;
   applyFrameContextToMessage(requestContext, extensionMsg);
+  try {
+    applySemanticExpectedIdentity(requestContext, extensionMsg, args);
+  } catch (error) {
+    sendToolResponse(socket, originalId, null, error);
+    return;
+  }
   
   if (extensionMsg.type === "UNSUPPORTED_ACTION") {
     sendToolResponse(socket, originalId, null, extensionMsg.message);

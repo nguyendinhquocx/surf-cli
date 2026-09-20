@@ -1277,6 +1277,14 @@ export async function handleMessage(
       if (!tabId) throw new Error("No tabId provided");
       const deltaX = message.deltaX || 0;
       const deltaY = message.deltaY || 0;
+      if (message.expectedIdentity) {
+        return await chrome.tabs.sendMessage(tabId, {
+          type: "SEMANTIC_SCROLL",
+          deltaX,
+          deltaY,
+          expectedIdentity: message.expectedIdentity,
+        }, { frameId: getFrameIdForTab(tabId, message) });
+      }
 
       const scrollScript = (dx: number, dy: number) => {
         const before = { x: window.scrollX, y: window.scrollY };
@@ -1325,6 +1333,13 @@ export async function handleMessage(
     case "EXECUTE_NAVIGATE": {
       if (!tabId) throw new Error("No tabId provided");
       if (!message.url) throw new Error("No url provided");
+      if (message.expectedIdentity) {
+        return await chrome.tabs.sendMessage(tabId, {
+          type: "SEMANTIC_NAVIGATE",
+          url: message.url,
+          expectedIdentity: message.expectedIdentity,
+        }, { frameId: getFrameIdForTab(tabId, message) });
+      }
 
       const navigationPromise = new Promise<void>((resolve) => {
         navigationResolvers.set(tabId, resolve);
@@ -1404,6 +1419,10 @@ export async function handleMessage(
           };
         }
       }
+      if (result?.semanticObservation?.identity) {
+        result.semanticObservation.identity.tabId = tabId;
+        result.semanticObservation.identity.frameId = readFrameId;
+      }
       return result;
     }
 
@@ -1462,6 +1481,21 @@ export async function handleMessage(
       const position = message.position;
       if (position === undefined) throw new Error("position required (\"top\", \"bottom\", or number)");
       const selector = message.selector;
+      if (message.expectedIdentity) {
+        return await chrome.tabs.sendMessage(tabId, {
+          type: "SEMANTIC_SCROLL",
+          position,
+          expectedIdentity: message.expectedIdentity,
+        }, { frameId: getFrameIdForTab(tabId, message) });
+      }
+
+      try {
+        return await chrome.tabs.sendMessage(tabId, {
+          type: "SCROLL_TO_POSITION",
+          position,
+          selector,
+        }, { frameId: getFrameIdForTab(tabId, message) });
+      } catch {}
 
       const scrollScript = (pos: string | number, sel: string | null) => {
         const findScrollable = (): Element => {
@@ -1742,8 +1776,9 @@ export async function handleMessage(
           type: "CLICK_ELEMENT",
           ref: message.ref,
           button: message.button || "left",
+          expectedIdentity: message.expectedIdentity,
         }, { frameId: getFrameIdForTab(tabId, message) });
-        if (result.error) return { error: result.error };
+        if (result.error) return { error: result.error, code: result.code };
         return { success: true };
       } catch (err) {
         return { error: "Content script not loaded. Try refreshing the page." };
@@ -2255,6 +2290,7 @@ export async function handleMessage(
       const response = await chrome.tabs.sendMessage(tabId, {
         type: "FORM_FILL",
         data: message.data,
+        expectedIdentity: message.expectedIdentity,
       }, { frameId: getFrameIdForTab(tabId, message) });
       return response;
     }
