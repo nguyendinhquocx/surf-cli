@@ -35,6 +35,14 @@ function sendDoRequest(toolName, toolArgs, context = {}) {
   })();
 }
 
+function semanticRequestContext(context, timeoutMs, identity) {
+  return {
+    ...context,
+    timeoutMs,
+    ...(identity ? { tabId: identity.tabId, windowId: undefined, session: undefined } : {}),
+  };
+}
+
 function summarizeArgs(step) {
   return Object.entries(step.args || {})
     .map(([key, value]) => typeof value === "string" && value.length > 40 ? `${key}="${value.slice(0, 37)}..."` : `${key}=${JSON.stringify(value)}`)
@@ -63,14 +71,32 @@ function printProgress(event) {
 
 async function executeDoSteps(steps, options = {}) {
   const context = options.context || {};
-  return runtime.executeWorkflow(steps, {
-    ...options,
-    executeTool: options.executeTool || ((tool, args) => sendDoRequest(tool, args, context)),
-    onProgress: options.quiet ? options.onProgress : (event) => {
-      printProgress(event);
-      options.onProgress?.(event);
-    },
-  });
+  let semanticExecutor;
+  const executeSemanticStep = steps.some((step) => step.cmd === "semantic.step")
+    ? async (step, semanticContext, executionOptions) => {
+      if (!semanticExecutor) {
+        semanticExecutor = options.executeSemanticStep;
+        if (!semanticExecutor && typeof options.createSemanticExecutor === "function") {
+          semanticExecutor = await options.createSemanticExecutor({ context });
+        }
+        if (typeof semanticExecutor !== "function") throw new Error("semantic.step requires an injected semantic executor");
+      }
+      return semanticExecutor(step, semanticContext, executionOptions);
+    }
+    : undefined;
+  try {
+    return await runtime.executeWorkflow(steps, {
+      ...options,
+      executeTool: options.executeTool || ((tool, args) => sendDoRequest(tool, args, context)),
+      ...(executeSemanticStep ? { executeSemanticStep } : {}),
+      onProgress: options.quiet ? options.onProgress : (event) => {
+        printProgress(event);
+        options.onProgress?.(event);
+      },
+    });
+  } finally {
+    await semanticExecutor?.close?.();
+  }
 }
 
 module.exports = {
@@ -83,6 +109,7 @@ module.exports = {
   extractStepOutput: runtime.extractStepOutput,
   getAutoWaitCommand: runtime.getAutoWaitCommand,
   resolveVar: runtime.resolveVar,
+  semanticRequestContext,
   sendDoRequest,
   shouldAutoWait: runtime.shouldAutoWait,
   substituteVars: runtime.substituteVars,

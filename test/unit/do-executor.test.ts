@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 // @ts-expect-error - CommonJS module without type definitions
 import * as executor from "../../native/do-executor.cjs";
@@ -128,5 +128,59 @@ describe("AUTO_WAIT_MAP", () => {
 
   it("does not include type (not an auto-wait command)", () => {
     expect(executor.AUTO_WAIT_MAP.type).toBeUndefined();
+  });
+});
+
+describe("do executor semantic dispatch", () => {
+  it("pins semantic follow-up requests while preserving admission and the shared transport", async () => {
+    const transport = { request: vi.fn(async () => ({ result: { content: [] } })) };
+    const context = executor.semanticRequestContext(
+      { session: "checkout", windowId: 8, transport, admission: { wait: false } },
+      1_234,
+      { tabId: 42 },
+    );
+    expect(context).toEqual({
+      session: undefined,
+      windowId: undefined,
+      tabId: 42,
+      timeoutMs: 1_234,
+      admission: { wait: false },
+      transport,
+    });
+    await executor.sendDoRequest("page.read", {}, context);
+    expect(transport.request).toHaveBeenCalledWith(
+      expect.objectContaining({ tabId: 42, admission: { wait: false } }),
+      1_234,
+      expect.anything(),
+    );
+  });
+
+  it("lazily creates the semantic executor and never forwards semantic.step to executeTool", async () => {
+    const executeTool = vi.fn();
+    const semanticExecutor = vi.fn(async () => ({ status: "completed" }));
+    const createSemanticExecutor = vi.fn(async () => semanticExecutor);
+
+    const ordinary = await executor.executeDoSteps([{ cmd: "page.read", args: {} }], {
+      executeTool,
+      createSemanticExecutor,
+      quiet: true,
+      stepDelay: 0,
+    });
+    expect(ordinary.status).toBe("completed");
+    expect(createSemanticExecutor).not.toHaveBeenCalled();
+
+    const semantic = await executor.executeDoSteps(
+      [{ id: "find", cmd: "semantic.step", args: { op: "find", target: { query: "x" } } }],
+      { executeTool, createSemanticExecutor, quiet: true, stepDelay: 0 },
+    );
+    expect(semantic.status).toBe("completed");
+    expect(createSemanticExecutor).toHaveBeenCalledOnce();
+    expect(semanticExecutor).toHaveBeenCalledOnce();
+    expect(executeTool).toHaveBeenCalledTimes(1);
+    expect(executeTool).not.toHaveBeenCalledWith(
+      "semantic.step",
+      expect.anything(),
+      expect.anything(),
+    );
   });
 });
