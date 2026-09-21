@@ -96,7 +96,24 @@ surf animate-audit --selector ".thing" --duration 2000 --fps 10
 
 ## Optional semantic decisions
 
-Only `semantic.*` sends bounded, value-free page text to TypeSafe.
+`semantic.act` is a bounded, goal-driven website controller. It repeatedly
+observes the page, lets Jev select the next action from Surf's allowed menu,
+validates and executes that action, and checks the overall goal:
+
+```text
+goal -> observe -> choose -> validate + act -> verify
+           ^                              |
+           +-------- incomplete ----------+
+```
+
+It returns when the goal is complete, a decision is uncertain, or a configured
+budget is exhausted. Use `semantic.find` for one control, `semantic.filter` for
+relevant page regions, and
+`semantic.verify` for one outcome. Use Jev when the page or happy path is
+unfamiliar; once the path is stable, prefer deterministic Surf commands for
+repeated runs. The agent owns the goal and final confirmation, while Surf retains
+execution authority. Only `semantic.*` sends bounded, value-free page text to
+TypeSafe.
 
 ```bash
 surf semantic.find "the settings control"
@@ -108,6 +125,37 @@ printf '%s\n' "$TYPESAFE_KEY" | surf semantic auth set
 surf semantic auth status
 surf semantic auth clear
 ```
+
+For reusable bounded recipes, put only linear `semantic.step` operations in a
+workflow with `"semantic":{"version":1}`. Check it offline with
+`surf workflow.validate flow.json` or `surf do --file flow.json --dry-run`, then
+run with `--allow-semantic`; declared fill/check/click operations also require
+`--allow-write`. Supply private fill slots as a bounded JSON object on stdin:
+
+```bash
+printf '%s' '{"quantity":"2"}' | SURF_SESSION=shopping surf do --file flow.json \
+  --inputs-stdin --allow-semantic --allow-write --json
+```
+
+The closed operations are `find`, same-origin direct `open`, `ensureChecked`,
+`fill`, one-shot `click` with an explicit expectation, and `assert`. Search is
+bounded overlapping coverage, not global ranking. Unknown write outcomes stop
+without replay; a later new run can still repeat an external effect. Input
+values never enter provider state, workflow variables, events, or checkpoints.
+
+Required argument shapes:
+
+```text
+find           target (+ optional search), usually save with "as"
+open           target
+ensureChecked  target + checked
+fill           target + input
+click          target + expect
+assert         mode + claim (semantic) or predicate (local)
+```
+
+The complete valid six-operation example in the README uses these shapes; start
+from it instead of inventing fields.
 
 Every click/fill requires `--allow-write`; repeat `--allow-ref` to narrow it.
 Broad writes use threshold `0.95`; exactly one allowed ref with one applicable

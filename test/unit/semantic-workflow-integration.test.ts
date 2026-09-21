@@ -1,0 +1,117 @@
+import { describe, expect, it, vi } from "vitest";
+
+const { createConcreteSemanticExecutor } = require("../../native/semantic-workflow-executor.cjs");
+const { executeDoSteps } = require("../../native/do-executor.cjs");
+
+const identity = {
+  browserEpoch: "epoch",
+  tabId: 1,
+  frameId: 0,
+  fullUrl: "https://example.test/shop",
+  documentToken: "doc",
+};
+const envelope = (value: unknown) => ({
+  result: { content: [{ type: "text", text: JSON.stringify(value) }] },
+});
+
+describe("semantic workflow integration seam", () => {
+  it.each([
+    { label: "default", search: undefined, observationLimit: 12 },
+    { label: "declared override", search: { maxObservations: 2 }, observationLimit: 2 },
+  ])("reports the $label per-step observation limit", async ({ search, observationLimit }) => {
+    const request = vi.fn(async (tool: string, _args: Record<string, unknown>) => {
+      if (tool === "page.read") {
+        return envelope({
+          semanticObservation: {
+            identity,
+            page: { title: "Shop", readyState: "complete", modals: [] },
+            candidates: [
+              { ref: "e2", role: "link", name: "Blue bottle", type: "a", href: "/bottle" },
+            ],
+            chunks: [{ id: "c1", text: "Blue bottle", refs: ["e2"] }],
+            omitted: { candidates: 0, chunks: 0 },
+          },
+        });
+      }
+      expect(tool).toBe("semantic.scrollScope");
+      return envelope({
+        success: true,
+        scopeToken: "scope",
+        geometry: {
+          scrollTop: 0,
+          scrollHeight: 800,
+          clientHeight: 800,
+          intervalStart: 0,
+          intervalEnd: 800,
+          atTop: true,
+          atBottom: true,
+        },
+      });
+    });
+    const evaluate = vi.fn(async () => ({
+      model: "jev-test",
+      usage: { input_tokens: 2, output_tokens: 1 },
+      answers: {
+        target: {
+          type: "choice",
+          choice: "e2",
+          confidence: 0.2,
+          probabilities: { e2: 0.99, none: 0.01 },
+        },
+      },
+    }));
+    const attemptStore = {
+      acquire: vi.fn(),
+      checkpoint: vi.fn(),
+      release: vi.fn(),
+    };
+    const workflow = {
+      semantic: { version: 1 },
+      steps: [
+        {
+          id: "find",
+          tool: "semantic.step",
+          as: "product",
+          args: {
+            op: "find",
+            target: { query: "Blue bottle", role: "link" },
+            ...(search ? { search } : {}),
+          },
+        },
+      ],
+    };
+
+    const result = await executeDoSteps(
+      [{ id: "find", cmd: "semantic.step", as: "product", args: workflow.steps[0].args }],
+      {
+        quiet: true,
+        stepDelay: 0,
+        executeTool: vi.fn(() => {
+          throw new Error("semantic step reached generic transport");
+        }),
+        createSemanticExecutor: () =>
+          createConcreteSemanticExecutor({ request, evaluate, attemptStore, workflow }),
+      },
+    );
+
+    expect(result.status).toBe("completed");
+    expect(result.semantic).toMatchObject({
+      stepId: "find",
+      usage: { providerCalls: 1, inputTokens: 2, outputTokens: 1 },
+      limits: {
+        maxProviderCalls: 32,
+        maxSearchObservations: observationLimit,
+        maxSearchObservationsCeiling: 32,
+      },
+    });
+    expect(result.vars.product.binding).toMatchObject({
+      handle: "product",
+      role: "link",
+      name: "Blue bottle",
+    });
+    expect(evaluate).toHaveBeenCalledOnce();
+    expect(attemptStore.release).toHaveBeenCalledWith(
+      expect.objectContaining({ state: "completed" }),
+    );
+  });
+});

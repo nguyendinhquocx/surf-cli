@@ -141,7 +141,6 @@ function buildLogicalCandidates(observation, candidates = providerState(observat
     const semanticIdentity = [
       normalizedSemanticPart(candidate.role),
       normalizedSemanticPart(candidate.type),
-      normalizedName,
       normalizedContext,
     ].join("\u001f");
     const groupingIdentity = `${destination}\u001e${semanticIdentity}`;
@@ -522,4 +521,17 @@ function formatSemanticOutput(result) {
   return JSON.stringify(result.value, null, 2);
 }
 
-module.exports = { buildActions, buildLogicalCandidates, formatSemanticOutput, handleSemanticCli, normalizeSemanticArgs, parseSemanticArgs, providerState, runBrowserSemantic };
+module.exports = {
+  buildActions,
+  buildLogicalCandidates,
+  canonicalSameOriginDestination,
+  confirmedActionResponse,
+  expectedIdentity,
+  formatSemanticOutput,
+  handleSemanticCli,
+  normalizeSemanticArgs,
+  parseSemanticArgs,
+  providerState,
+  runBrowserSemantic,
+  semanticObservationFrom,
+};

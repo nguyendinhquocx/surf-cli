@@ -726,6 +726,9 @@ surf do 'go "url" | click e5 | screenshot' --dry-run
 - `--step-delay <ms>` - Delay between steps (default: 100, use 0 to disable)
 - `--no-auto-wait` - Disable automatic waits between steps
 - `--json` - Output structured JSON result
+- `--allow-semantic` - Opt in to bounded TypeSafe decisions for a semantic workflow
+- `--allow-write` - Additionally authorize declared `fill`, `ensureChecked`, and `click` steps
+- `--inputs-stdin` - Read one bounded JSON object of private local input slots from stdin
 - `--<arg> <value>` - Pass arguments to workflow (e.g., `--url "..."`)
 
 **Auto-waits:** Commands that trigger page changes automatically wait for completion:
@@ -820,7 +823,67 @@ surf workflow.info my-workflow
 surf workflow.validate ./my-workflow.json
 ```
 
-**Supported commands:** All surf commands work in workflows. Use aliases (`go`, `snap`, `read`) or full names (`navigate`, `screenshot`, `page.read`).
+#### Bounded semantic workflow steps
+
+Semantic workflow files declare `"semantic": { "version": 1 }` and use only
+linear `semantic.step` operations: `find`, `open`, `ensureChecked`, `fill`,
+`click`, and `assert`. Validate or dry-run them offline, then opt in explicitly:
+
+```bash
+surf workflow.validate ./product.json
+surf do --file product.json --dry-run
+printf '%s' '{"quantity":"2"}' | SURF_SESSION=shopping surf do \
+  --file product.json --inputs-stdin --allow-semantic --allow-write --json
+```
+
+```json
+{
+  "name": "configure-matching-product",
+  "semantic": { "version": 1, "deadlineMs": 60000, "maxProviderCalls": 32 },
+  "steps": [
+    { "id": "find-product", "tool": "semantic.step", "as": "product", "args": {
+      "op": "find", "target": { "query": "The in-stock blue insulated bottle", "role": "link" },
+      "search": { "mode": "scroll", "maxObservations": 12 }
+    } },
+    { "id": "open-product", "tool": "semantic.step", "args": {
+      "op": "open", "target": { "binding": "product" }
+    } },
+    { "id": "select-gift-wrap", "tool": "semantic.step", "args": {
+      "op": "ensureChecked", "target": { "query": "Gift wrap", "role": "checkbox" },
+      "checked": true
+    } },
+    { "id": "set-quantity", "tool": "semantic.step", "args": {
+      "op": "fill", "target": { "query": "Quantity", "role": "spinbutton" },
+      "input": "quantity"
+    } },
+    { "id": "add-to-cart", "tool": "semantic.step", "args": {
+      "op": "click", "target": { "query": "Add to cart", "role": "button" },
+      "expect": { "kind": "visible", "target": { "query": "Remove from cart", "role": "button" } }
+    } },
+    { "id": "verify-cart", "tool": "semantic.step", "args": {
+      "op": "assert", "mode": "semantic",
+      "claim": "The cart contains the selected product with gift wrap enabled",
+      "bindings": ["product"]
+    } }
+  ]
+}
+```
+
+This example includes every supported operation and the required `claim` for a
+semantic `assert`. Use it as a valid starting shape, then remove steps the task
+does not need.
+
+`open` performs freshly validated same-origin HTTP(S) navigation; it never falls
+back to a click. Model-derived writes retain the `0.95` gate, dispatch at most
+once in a run, and require local/read-only verification. A stopped or uncertain
+step fails the workflow. Search reports bounded overlapping coverage and does
+not prove global ranking or absence outside that scope. Local input values are
+sent only to their browser fill/compare operation, not to TypeSafe, workflow
+variables, events, output, or checkpoints. A new run can repeat an external
+effect: Surf does not claim exactly-once server behavior or automatic resume.
+
+**Supported commands:** Ordinary workflows support all Surf commands. Semantic
+v1 workflows intentionally support only the six closed operations above.
 
 ### Playbooks
 
@@ -914,6 +977,42 @@ connection failure still prints stderr, leaves stdout empty and exits 1 with
 `--json`, even with `--soft-fail`.
 
 ## Optional Jev semantic commands
+
+`semantic.act` is a bounded, goal-driven website controller. Give it an outcome
+and it repeatedly observes the current page, asks Jev to select the next action
+from Surf's allowed menu, validates and executes that action, then checks whether
+the overall goal is complete. It stops when the goal is satisfied, a decision is
+uncertain, or a step, provider-call, or time budget is exhausted.
+
+```text
+agent goal
+    |
+    v
+Surf observes -> Jev selects -> Surf validates + acts -> Jev checks goal
+    ^                                                        |
+    +---------------- goal incomplete -----------------------+
+                                                             |
+                                      complete / uncertain / budget reached
+                                                             |
+                                                             v
+                                                        return result
+```
+
+The other semantic commands expose individual parts of that loop:
+
+```text
+semantic.find     select one control matching a goal
+semantic.filter   rank the page regions relevant to a goal
+semantic.verify   check whether one outcome is visible
+semantic.act      run the bounded observe/choose/act/verify loop
+```
+
+This is most useful when the agent does not yet know a site's structure or happy
+path: Jev handles next-action selection and goal verification while Surf builds
+the allowed action menu and enforces permissions, confidence thresholds, and
+element freshness. The agent owns the goal and final confirmation. Once the path
+is known and stable, deterministic Surf commands are usually faster and more
+reliable for repeated execution.
 
 Semantic commands are an explicit remote-AI boundary: only `surf semantic.*`
 sends a bounded, value-free current-page observation to TypeSafe. Existing Surf
