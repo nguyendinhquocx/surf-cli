@@ -10,7 +10,7 @@ const semantic = require("../../native/semantic-cli.cjs") as {
     inputs: Record<string, string>,
     allowWrite: boolean,
     allowRefs?: string[],
-    spentWrites?: Set<string>,
+    spentWrites?: Array<{ base: string; context: string }>,
   ): Record<string, any>[];
   buildLogicalCandidates(
     observation: Record<string, any>,
@@ -19,6 +19,7 @@ const semantic = require("../../native/semantic-cli.cjs") as {
   normalizeSemanticArgs(args: string[]): string[];
   parseSemanticArgs(args: string[]): Record<string, any> | null;
   providerState(observation: Record<string, any>): Record<string, any>;
+  semanticObservationFrom(response: Record<string, any>): Record<string, any>;
   runBrowserSemantic(
     options: Record<string, any>,
     dependencies: Record<string, any>,
@@ -87,8 +88,47 @@ function choice(answer: string, labels: string[], selectedProbability = 0.99) {
   return { type: "choice", choice: answer, probabilities, confidence: 0.7 };
 }
 
-function provider(answers: Record<string, any>) {
-  return { model: "jev-test", usage: { input_tokens: 1, output_tokens: 1 }, answers };
+function provider(answers: Record<string, any>, questions?: Record<string, any>) {
+  let result = answers;
+  if (answers.action && questions?.prerequisites && !answers.prerequisites) {
+    const evidenceLabels = Object.keys(questions.prerequisite_evidence.criteria);
+    result = {
+      ...answers,
+      prerequisites: choice("supported", Object.keys(questions.prerequisites.criteria)),
+      prerequisite_evidence: choice(evidenceLabels[0], evidenceLabels),
+    };
+  }
+  return { model: "jev-test", usage: { input_tokens: 1, output_tokens: 1 }, answers: result };
+}
+
+function actionProvider(
+  questions: Record<string, any>,
+  answer: string,
+  selectedProbability = 0.99,
+  prerequisite: "supported" | "blocked" | "uncertain" = "supported",
+  prerequisiteProbability = 0.99,
+) {
+  const evidenceLabels = Object.keys(questions.prerequisite_evidence.criteria);
+  return provider({
+    action: choice(answer, Object.keys(questions.action.criteria), selectedProbability),
+    prerequisites: choice(
+      prerequisite,
+      Object.keys(questions.prerequisites.criteria),
+      prerequisiteProbability,
+    ),
+    prerequisite_evidence: choice(evidenceLabels[0], evidenceLabels),
+  });
+}
+
+function invalidProviderChoice(name: string, labels: string[]) {
+  return provider({
+    [name]: {
+      type: "choice",
+      choice: labels[0],
+      probabilities: Object.fromEntries(labels.map((label) => [label, 0])),
+      confidence: 0,
+    },
+  });
 }
 
 function linkCandidates(count = 64) {
@@ -103,6 +143,26 @@ function linkCandidates(count = 64) {
 }
 
 describe("semantic CLI", () => {
+  it("preserves computed checked state from the matching accessibility-tree ref", () => {
+    const observed = semantic.semanticObservationFrom(
+      response({
+        pageContent: 'radio "M" [e30] [checked] [cursor=pointer] type="button"',
+        semanticObservation: {
+          ...observation,
+          candidates: [{ ref: "e30", role: "radio", name: "M", type: "button" }],
+          chunks: [{ id: "sizes", text: "Available sizes", refs: ["e30"] }],
+        },
+      }),
+    );
+
+    expect(observed.candidates).toEqual([
+      expect.objectContaining({ ref: "e30", state: { checked: true } }),
+    ]);
+    expect(observed.chunks).toEqual([
+      { id: "sizes", text: 'Available sizes\nradio "M" [checked]', refs: ["e30"] },
+    ]);
+  });
+
   it("normalizes grouped commands and parses repeatable authorization without exposing input values in identifiers", () => {
     expect(semantic.normalizeSemanticArgs(["semantic", "auth", "status"])).toEqual([
       "semantic.auth.status",
@@ -133,9 +193,84 @@ describe("semantic CLI", () => {
     ).toThrow("duplicate");
   });
 
+  it("parses only applicable per-run semantic threshold overrides", () => {
+    expect(
+      semantic.parseSemanticArgs([
+        "semantic.act",
+        "complete checkout",
+        "--allow-write",
+        "--threshold",
+        "find=0.6",
+        "--threshold",
+        "write=0.85",
+        "--threshold",
+        "exact-ref-write=0.7",
+        "--threshold",
+        "verify-positive=0.8",
+        "--threshold",
+        "verify-negative=1.0",
+        "--threshold",
+        "prerequisite-supported=0.75",
+        "--threshold",
+        "prerequisite-blocked=0.9",
+      ]),
+    ).toMatchObject({
+      thresholds: {
+        find: 0.6,
+        write: 0.85,
+        exactRefWrite: 0.7,
+        verifyPositive: 0.8,
+        verifyNegative: 1,
+        prerequisiteSupported: 0.75,
+        prerequisiteBlocked: 0.9,
+      },
+    });
+    expect(
+      semantic.parseSemanticArgs(["semantic.find", "target", "--threshold", "find=0"]),
+    ).toMatchObject({ thresholds: { find: 0 } });
+    expect(
+      semantic.parseSemanticArgs(["semantic.filter", "target", "--threshold", "filter=1"]),
+    ).toMatchObject({ thresholds: { filter: 1 } });
+    expect(
+      semantic.parseSemanticArgs([
+        "semantic.verify",
+        "done",
+        "--threshold",
+        "verify-positive=0.8",
+        "--threshold",
+        "verify-negative=0.9",
+      ]),
+    ).toMatchObject({ thresholds: { verifyPositive: 0.8, verifyNegative: 0.9 } });
+
+    for (const args of [
+      ["semantic.act", "goal", "--threshold", "unknown=0.5"],
+      ["semantic.act", "goal", "--threshold", "write=.85"],
+      ["semantic.act", "goal", "--threshold", "write=1.1"],
+      ["semantic.act", "goal", "--threshold", "write=NaN"],
+      ["semantic.act", "goal", "--threshold", "write=0.8", "--threshold", "write=0.9"],
+      ["semantic.find", "goal", "--threshold", "write=0.8"],
+      ["semantic.act", "goal", "--threshold", "filter=0.8"],
+      ["semantic.verify", "goal", "--threshold", "find=0.8"],
+    ]) {
+      expect(() => semantic.parseSemanticArgs(args)).toThrow();
+    }
+  });
+
   it("keeps provider state value-free and constructs no click/fill candidates without write authorization", () => {
     const state = semantic.providerState(observation);
     expect(JSON.stringify(state)).not.toContain("secret-value");
+    const stateful = semantic.providerState({
+      ...observation,
+      candidates: [
+        {
+          ...observation.candidates[1],
+          value: "secret-value",
+          state: { checked: true, selected: false, value: "secret-value" },
+        },
+      ],
+    });
+    expect(stateful.candidates[0].state).toEqual({ checked: true, selected: false });
+    expect(JSON.stringify(stateful)).not.toContain("secret-value");
     const readonly = semantic.buildActions(observation, { email: "secret-value" }, false);
     expect(readonly.some((action) => action.kind === "click" || action.kind === "fill")).toBe(
       false,
@@ -330,6 +465,25 @@ describe("semantic CLI", () => {
     expect(writable).toContainEqual(expect.objectContaining({ kind: "click", ref: "mutate" }));
   });
 
+  it("omits exact self-navigation while preserving distinct paths, queries, fragments, and clicks", () => {
+    const candidates = [
+      { ref: "self", role: "link", name: "Current", type: "a", href: "/settings" },
+      { ref: "path", role: "link", name: "Profile", type: "a", href: "/profile" },
+      { ref: "query", role: "link", name: "Filtered", type: "a", href: "/settings?view=all" },
+      { ref: "fragment", role: "link", name: "Details", type: "a", href: "/settings#details" },
+    ];
+    const readonly = semantic.buildActions({ ...observation, candidates }, {}, false);
+    expect(
+      readonly.filter((action) => action.kind === "navigate").map((action) => action.url),
+    ).toEqual([
+      "https://example.test/profile",
+      "https://example.test/settings?view=all",
+      "https://example.test/settings#details",
+    ]);
+    const writable = semantic.buildActions({ ...observation, candidates }, {}, true);
+    expect(writable).toContainEqual(expect.objectContaining({ kind: "click", ref: "self" }));
+  });
+
   it("executes an authorized write once, refreshes, verifies, and redacts the local value from its trace", async () => {
     const requests: Array<{
       tool: string;
@@ -351,9 +505,12 @@ describe("semantic CLI", () => {
     const evaluate = async (_state: unknown, questions: Record<string, any>) => {
       call++;
       if (questions.action) {
-        return provider({
-          action: choice("fill:e1:email", Object.keys(questions.action.criteria)),
-        });
+        return provider(
+          {
+            action: choice("fill:e1:email", Object.keys(questions.action.criteria)),
+          },
+          questions,
+        );
       }
       const answers: Record<string, any> = {
         verdict: choice("satisfied", ["satisfied", "not_satisfied"]),
@@ -379,7 +536,8 @@ describe("semantic CLI", () => {
       expect.objectContaining({ kind: "fill", appliedThreshold: 0.65, result: "executed" }),
     ]);
     expect(requests.filter((item) => item.tool === "form.fill")).toHaveLength(1);
-    expect(requests.filter((item) => item.tool === "page.read")).toHaveLength(2);
+    expect(requests.filter((item) => item.tool === "page.read")).toHaveLength(7);
+    expect(requests.filter((item) => item.tool === "wait")).toHaveLength(5);
     expect(JSON.stringify(result)).not.toContain("unique-secret");
     expect(
       requests.find((item) => item.tool === "form.fill")?.args.semanticExpectedIdentity,
@@ -397,6 +555,606 @@ describe("semantic CLI", () => {
     expect(call).toBe(2);
   });
 
+  it("stops a prerequisite-blocked write before browser mutation", async () => {
+    let reads = 0;
+    let writes = 0;
+    const result = await semantic.runBrowserSemantic(
+      {
+        command: "semantic.act",
+        goal: "Select unavailable Sea Salt and delete the account",
+        allowWrite: true,
+        allowRefs: [],
+        inputs: {},
+        thresholds: { write: 0.85 },
+        maxSteps: 1,
+      },
+      {
+        request: async (tool: string) => {
+          if (tool === "page.read") {
+            reads++;
+            return response({ semanticObservation: observation });
+          }
+          writes++;
+          return actionResponse("OK");
+        },
+        evaluate: async (_state: unknown, questions: Record<string, any>) =>
+          actionProvider(questions, "click:e2", 0.99, "blocked", 0.99),
+        now: () => 0,
+      },
+    );
+
+    expect(result).toMatchObject({
+      status: "stopped",
+      stopReason: "prerequisite_blocked",
+      trace: [],
+      providerCalls: 1,
+      prerequisiteStatus: "blocked",
+      prerequisiteEvidence: observation.chunks[0],
+    });
+    expect({ reads, writes }).toEqual({ reads: 1, writes: 0 });
+  });
+
+  it("settles past an early delta and target disappearance to delayed cart evidence", async () => {
+    const earlyDelta = {
+      ...observation,
+      page: { ...observation.page, title: "Adding item" },
+      candidates: observation.candidates.filter((candidate) => candidate.ref !== "e2"),
+    };
+    const hydrated = {
+      ...observation,
+      chunks: [{ id: "cart", text: "My cart (1) Alpha jacket size M", refs: ["e2"] }],
+    };
+    const observations = [
+      observation,
+      observation,
+      earlyDelta,
+      earlyDelta,
+      earlyDelta,
+      hydrated,
+      hydrated,
+    ];
+    let reads = 0;
+    let writes = 0;
+    const waitDurations: number[] = [];
+    let verifications = 0;
+    let verificationState: Record<string, any> | undefined;
+    const options = semantic.parseSemanticArgs([
+      "semantic.act",
+      "one Alpha jacket is in the cart",
+      "--allow-write",
+      "--threshold",
+      "write=0.85",
+      "--max-steps",
+      "1",
+    ]);
+    if (!options) {
+      throw new Error("expected semantic options");
+    }
+    const result = await semantic.runBrowserSemantic(options, {
+      request: async (tool: string, args: Record<string, any>) => {
+        if (tool === "page.read") {
+          const current = observations[Math.min(reads++, observations.length - 1)];
+          return response({ semanticObservation: current });
+        }
+        if (tool === "click") {
+          writes++;
+        }
+        if (tool === "wait") {
+          waitDurations.push(args.duration);
+        }
+        return actionResponse("OK");
+      },
+      evaluate: async (state: Record<string, any>, questions: Record<string, any>) => {
+        if (questions.action) {
+          return provider(
+            { action: choice("click:e2", Object.keys(questions.action.criteria), 0.85) },
+            questions,
+          );
+        }
+        verifications++;
+        verificationState = state;
+        return provider({
+          verdict: choice("satisfied", ["satisfied", "not_satisfied"]),
+          evidence: choice("cart", Object.keys(questions.evidence.criteria)),
+        });
+      },
+      now: () => 0,
+    });
+
+    expect(result).toMatchObject({
+      status: "complete",
+      stopReason: "complete",
+      trace: [expect.objectContaining({ appliedThreshold: 0.85 })],
+      verification: expect.objectContaining({ appliedThreshold: 0.85 }),
+    });
+    expect(verificationState?.chunks).toEqual([
+      expect.objectContaining({ id: "cart", text: expect.stringContaining("My cart (1)") }),
+    ]);
+    expect({ reads, writes, verifications }).toEqual({
+      reads: 7,
+      writes: 1,
+      verifications: 1,
+    });
+    expect(waitDurations).toEqual([0.5, 1, 2, 4, 2]);
+  });
+
+  it("settles delayed checked candidate state before verifying a confirmed write once", async () => {
+    const unchecked = {
+      ...observation,
+      candidates: observation.candidates.map((candidate) =>
+        candidate.ref === "e2"
+          ? { ...candidate, role: "radio", name: "M", type: "radio", state: { checked: false } }
+          : candidate,
+      ),
+    };
+    const checked = {
+      ...unchecked,
+      candidates: unchecked.candidates.map((candidate) =>
+        candidate.ref === "e2" ? { ...candidate, state: { checked: true } } : candidate,
+      ),
+    };
+    let reads = 0;
+    let writes = 0;
+    let waits = 0;
+    let verifications = 0;
+    let verificationState: Record<string, any> | undefined;
+    const result = await semantic.runBrowserSemantic(
+      {
+        command: "semantic.act",
+        goal: "the option is checked",
+        allowWrite: true,
+        allowRefs: ["e2"],
+        inputs: {},
+        maxSteps: 1,
+      },
+      {
+        request: async (tool: string) => {
+          if (tool === "page.read") {
+            const current = reads++ < 2 ? unchecked : checked;
+            return response({ semanticObservation: current });
+          }
+          if (tool === "click") {
+            writes++;
+          }
+          if (tool === "wait") {
+            waits++;
+          }
+          return actionResponse("OK");
+        },
+        evaluate: async (state: Record<string, any>, questions: Record<string, any>) => {
+          if (questions.action) {
+            return provider(
+              { action: choice("click:e2", Object.keys(questions.action.criteria)) },
+              questions,
+            );
+          }
+          verifications++;
+          verificationState = state;
+          return provider({
+            verdict: choice("satisfied", ["satisfied", "not_satisfied"]),
+            evidence: choice("c1", Object.keys(questions.evidence.criteria)),
+          });
+        },
+        now: () => 0,
+      },
+    );
+
+    expect(result).toMatchObject({ status: "complete", stopReason: "complete" });
+    expect(verificationState?.candidates).toContainEqual(
+      expect.objectContaining({ id: "e2", state: { checked: true } }),
+    );
+    expect({ reads, writes, waits, verifications }).toEqual({
+      reads: 3,
+      writes: 1,
+      waits: 1,
+      verifications: 1,
+    });
+  });
+
+  it.each([
+    ["full URL", { fullUrl: "https://example.test/replaced", documentToken: "doc" }],
+    ["document token", { fullUrl: observation.identity.fullUrl, documentToken: "replacement-doc" }],
+  ])(
+    "does not settle early for a checked transition after a %s change",
+    async (_name, changedIdentity) => {
+      const unchecked = {
+        ...observation,
+        candidates: observation.candidates.map((candidate) =>
+          candidate.ref === "e2"
+            ? { ...candidate, role: "radio", name: "M", type: "radio", state: { checked: false } }
+            : candidate,
+        ),
+      };
+      const replacement = {
+        ...unchecked,
+        identity: { ...unchecked.identity, ...changedIdentity },
+        candidates: unchecked.candidates.map((candidate) =>
+          candidate.ref === "e2" ? { ...candidate, state: { checked: true } } : candidate,
+        ),
+      };
+      let reads = 0;
+      let waits = 0;
+      const result = await semantic.runBrowserSemantic(
+        {
+          command: "semantic.act",
+          goal: "M is selected",
+          allowWrite: true,
+          allowRefs: ["e2"],
+          inputs: {},
+          maxSteps: 1,
+        },
+        {
+          request: async (tool: string) => {
+            if (tool === "page.read") {
+              return response({ semanticObservation: reads++ ? replacement : unchecked });
+            }
+            if (tool === "wait") {
+              waits++;
+            }
+            return actionResponse("OK");
+          },
+          evaluate: async (_state: unknown, questions: Record<string, any>) => {
+            if (questions.action) {
+              return provider(
+                { action: choice("click:e2", Object.keys(questions.action.criteria)) },
+                questions,
+              );
+            }
+            return provider({
+              verdict: choice("satisfied", ["satisfied", "not_satisfied"]),
+              evidence: choice("c1", Object.keys(questions.evidence.criteria)),
+            });
+          },
+          now: () => 0,
+        },
+      );
+      expect(result.status).toBe("complete");
+      expect({ reads, waits }).toEqual({ reads: 7, waits: 5 });
+    },
+  );
+
+  it("uses an observed radio transition to preserve budget for a second hydrated write", async () => {
+    const radio = {
+      ref: "size-m",
+      role: "radio",
+      name: "M",
+      type: "radio",
+      state: { checked: false },
+    };
+    let current: Record<string, any> = {
+      ...observation,
+      candidates: [...observation.candidates, radio],
+    };
+    let nowMs = 0;
+    let cartWrite = false;
+    let actionIndex = 0;
+    let verifications = 0;
+    let waits = 0;
+    const writes: string[] = [];
+    const requestedActions = ["click:size-m", "click:e2"];
+    const result = await semantic.runBrowserSemantic(
+      {
+        command: "semantic.act",
+        goal: "select M and add the jacket",
+        allowWrite: true,
+        allowRefs: [],
+        inputs: {},
+        thresholds: { write: 0.85, verifyNegative: 0.8 },
+        maxSteps: 2,
+      },
+      {
+        request: async (tool: string, args: Record<string, any>) => {
+          if (tool === "page.read") {
+            return response({ semanticObservation: current });
+          }
+          if (tool === "click") {
+            writes.push(args.ref);
+            if (args.ref === "size-m") {
+              current = {
+                ...current,
+                candidates: current.candidates.map((candidate: Record<string, any>) =>
+                  candidate.ref === "size-m"
+                    ? { ...candidate, state: { checked: true } }
+                    : candidate,
+                ),
+              };
+            } else {
+              cartWrite = true;
+            }
+          }
+          if (tool === "wait") {
+            waits++;
+            nowMs += args.duration * 1_000;
+            if (cartWrite && nowMs >= 9_500) {
+              current = {
+                ...current,
+                chunks: [{ id: "cart", text: "Shopping Bag 1 Alpha jacket M", refs: ["e2"] }],
+              };
+            }
+          }
+          return actionResponse("OK");
+        },
+        evaluate: async (_state: Record<string, any>, questions: Record<string, any>) => {
+          if (questions.action) {
+            const probability = actionIndex === 0 ? 0.9 : 0.97;
+            return provider(
+              {
+                action: choice(
+                  requestedActions[actionIndex++],
+                  Object.keys(questions.action.criteria),
+                  probability,
+                ),
+              },
+              questions,
+            );
+          }
+          const verification = verifications++;
+          const verdict = verification === 0 ? "not_satisfied" : "satisfied";
+          const evidence = verification === 0 ? "c1" : "cart";
+          return provider({
+            verdict: choice(
+              verdict,
+              ["satisfied", "not_satisfied"],
+              verification === 0 ? 0.73 : 0.9,
+            ),
+            evidence: choice(evidence, Object.keys(questions.evidence.criteria)),
+          });
+        },
+        now: () => nowMs,
+      },
+    );
+
+    expect(result).toMatchObject({ status: "complete", stopReason: "complete", providerCalls: 4 });
+    expect(writes).toEqual(["size-m", "e2"]);
+    expect(waits).toBe(5);
+    expect(nowMs).toBe(9_500);
+    expect(verifications).toBe(2);
+    expect(result.trace).toHaveLength(2);
+    expect(result.trace[0]).toMatchObject({ verification: "observed_state_transition" });
+    expect(result.verification).toMatchObject({ status: "satisfied", evidence: { id: "cart" } });
+  });
+
+  it("navigates to a product once before selecting a size and adding it", async () => {
+    const productUrl = "https://example.test/shop/alpha-jacket";
+    const category = {
+      ...observation,
+      identity: {
+        ...observation.identity,
+        fullUrl: "https://example.test/shop/jackets",
+        documentToken: "category",
+      },
+      candidates: [
+        { ref: "product", role: "link", name: "Alpha Jacket", type: "a", href: productUrl },
+      ],
+      chunks: [{ id: "category", text: "Jackets Alpha Jacket", refs: ["product"] }],
+    };
+    const product = {
+      ...observation,
+      identity: { ...observation.identity, fullUrl: productUrl, documentToken: "product" },
+      candidates: [
+        { ref: "self", role: "link", name: "Alpha Jacket", type: "a", href: productUrl },
+        {
+          ref: "size-m",
+          role: "radio",
+          name: "M",
+          type: "radio",
+          nearbyText: "Select size",
+          state: { checked: false },
+        },
+        {
+          ref: "add",
+          role: "button",
+          name: "Add to cart",
+          type: "button",
+          nearbyText: "Alpha Jacket M",
+        },
+      ],
+      chunks: [
+        {
+          id: "product",
+          text: "Alpha Jacket Select size Add to cart",
+          refs: ["self", "size-m", "add"],
+        },
+      ],
+    };
+    let current: Record<string, any> = category;
+    let nowMs = 0;
+    let cartWrite = false;
+    let actionIndex = 0;
+    let verificationIndex = 0;
+    const navigations: string[] = [];
+    const writes: string[] = [];
+    const requestedActions = ["nav:product", "click:size-m", "click:add"];
+    const result = await semantic.runBrowserSemantic(
+      {
+        command: "semantic.act",
+        goal: "open the Alpha Jacket, select M, and add it to the cart",
+        allowWrite: true,
+        allowRefs: [],
+        inputs: {},
+        thresholds: { find: 0.6, write: 0.85, verifyNegative: 0.8, verifyPositive: 0.7 },
+        maxSteps: 3,
+      },
+      {
+        request: async (tool: string, args: Record<string, any>) => {
+          if (tool === "page.read") {
+            return response({ semanticObservation: current });
+          }
+          if (tool === "navigate") {
+            navigations.push(args.url);
+            current = product;
+          }
+          if (tool === "click") {
+            writes.push(args.ref);
+            if (args.ref === "size-m") {
+              current = {
+                ...current,
+                candidates: current.candidates.map((candidate: Record<string, any>) =>
+                  candidate.ref === "size-m"
+                    ? { ...candidate, state: { checked: true } }
+                    : candidate,
+                ),
+              };
+            } else {
+              cartWrite = true;
+            }
+          }
+          if (tool === "wait") {
+            nowMs += args.duration * 1_000;
+            if (cartWrite && nowMs >= 9_500) {
+              current = {
+                ...current,
+                chunks: [{ id: "cart", text: "Shopping Bag 1 Alpha Jacket M", refs: ["add"] }],
+              };
+            }
+          }
+          return actionResponse("OK");
+        },
+        evaluate: async (_state: Record<string, any>, questions: Record<string, any>) => {
+          if (questions.action) {
+            const requested = requestedActions[actionIndex++];
+            expect(Object.keys(questions.action.criteria)).toContain(requested);
+            if (actionIndex === 2) {
+              expect(Object.keys(questions.action.criteria)).not.toContain("nav:self");
+            }
+            return provider(
+              { action: choice(requested, Object.keys(questions.action.criteria), 0.9) },
+              questions,
+            );
+          }
+          const verdict = verificationIndex++ < 2 ? "not_satisfied" : "satisfied";
+          return provider({
+            verdict: choice(verdict, ["satisfied", "not_satisfied"], 0.9),
+            evidence: choice(
+              verdict === "satisfied" ? "cart" : current.chunks[0].id,
+              Object.keys(questions.evidence.criteria),
+            ),
+          });
+        },
+        now: () => nowMs,
+      },
+    );
+
+    expect(result).toMatchObject({ status: "complete", stopReason: "complete", providerCalls: 6 });
+    expect(navigations).toEqual([productUrl]);
+    expect(writes).toEqual(["size-m", "add"]);
+    expect(result.trace.map((entry: Record<string, any>) => entry.kind)).toEqual([
+      "navigate",
+      "click",
+      "click",
+    ]);
+  });
+
+  it("bounds no-change settling, verifies once, and never replays the write", async () => {
+    let reads = 0;
+    let writes = 0;
+    let waits = 0;
+    let verifications = 0;
+    const result = await semantic.runBrowserSemantic(
+      {
+        command: "semantic.act",
+        goal: "cart changed",
+        allowWrite: true,
+        allowRefs: ["e2"],
+        inputs: {},
+        maxSteps: 3,
+      },
+      {
+        request: async (tool: string) => {
+          if (tool === "page.read") {
+            reads++;
+            return response({ semanticObservation: observation });
+          }
+          if (tool === "click") {
+            writes++;
+          }
+          if (tool === "wait") {
+            waits++;
+          }
+          return actionResponse("OK");
+        },
+        evaluate: async (_state: unknown, questions: Record<string, any>) => {
+          if (questions.action) {
+            const labels = Object.keys(questions.action.criteria);
+            return provider(
+              { action: choice(labels.includes("click:e2") ? "click:e2" : "stop", labels) },
+              questions,
+            );
+          }
+          verifications++;
+          return provider({
+            verdict: choice("satisfied", ["satisfied", "not_satisfied"], 0.5),
+            evidence: choice("c1", Object.keys(questions.evidence.criteria)),
+          });
+        },
+        now: () => 0,
+      },
+    );
+
+    expect(result).toMatchObject({ status: "stopped", stopReason: "uncertain" });
+    expect({ reads, writes, waits, verifications }).toEqual({
+      reads: 7,
+      writes: 1,
+      waits: 5,
+      verifications: 1,
+    });
+  });
+
+  it.each([
+    ["malformed read", () => actionResponse("not-json")],
+    [
+      "identity-mismatched read",
+      () =>
+        response({
+          semanticObservation: {
+            ...observation,
+            identity: { ...observation.identity, tabId: 99 },
+          },
+        }),
+    ],
+  ])(
+    "stops outcome_unknown on a post-write %s without verification or replay",
+    async (_name, postWriteResponse) => {
+      let reads = 0;
+      let writes = 0;
+      let verifications = 0;
+      const result = await semantic.runBrowserSemantic(
+        {
+          command: "semantic.act",
+          goal: "saved",
+          allowWrite: true,
+          allowRefs: ["e2"],
+          inputs: {},
+          maxSteps: 2,
+        },
+        {
+          request: async (tool: string) => {
+            if (tool === "page.read") {
+              return reads++ ? postWriteResponse() : response({ semanticObservation: observation });
+            }
+            if (tool === "click") {
+              writes++;
+            }
+            return actionResponse("OK");
+          },
+          evaluate: async (_state: unknown, questions: Record<string, any>) => {
+            if (!questions.action) {
+              verifications++;
+            }
+            return provider(
+              { action: choice("click:e2", Object.keys(questions.action.criteria)) },
+              questions,
+            );
+          },
+          now: () => 0,
+        },
+      );
+
+      expect(result).toMatchObject({ status: "stopped", stopReason: "outcome_unknown" });
+      expect({ reads, writes, verifications }).toEqual({ reads: 2, writes: 1, verifications: 0 });
+    },
+  );
+
   it("never reoffers or replays a write when verification is not satisfied", async () => {
     let mutations = 0;
     const request = async (tool: string) => {
@@ -411,9 +1169,12 @@ describe("semantic CLI", () => {
     const evaluate = async (_state: unknown, questions: Record<string, any>) => {
       if (questions.action) {
         const labels = Object.keys(questions.action.criteria);
-        return provider({
-          action: choice(labels.includes("click:e2") ? "click:e2" : "stop", labels),
-        });
+        return provider(
+          {
+            action: choice(labels.includes("click:e2") ? "click:e2" : "stop", labels),
+          },
+          questions,
+        );
       }
       const answers: Record<string, any> = {
         verdict: choice("not_satisfied", ["satisfied", "not_satisfied"]),
@@ -437,6 +1198,585 @@ describe("semantic CLI", () => {
     expect(result).toMatchObject({ status: "stopped", stopReason: "uncertain" });
     expect(mutations).toBe(1);
     expect(result.trace).toHaveLength(1);
+  });
+
+  it("retries one invalid pre-action decision and executes the intended action once", async () => {
+    let actionDecisions = 0;
+    let reads = 0;
+    let readsAtWrite = 0;
+    let writes = 0;
+    const result = await semantic.runBrowserSemantic(
+      {
+        command: "semantic.act",
+        goal: "delete account",
+        allowWrite: true,
+        allowRefs: ["e2"],
+        inputs: {},
+        maxSteps: 1,
+      },
+      {
+        request: async (tool: string) => {
+          if (tool === "page.read") {
+            reads++;
+            return response({ semanticObservation: observation });
+          }
+          if (tool === "click") {
+            readsAtWrite = reads;
+            writes++;
+          }
+          return actionResponse("OK");
+        },
+        evaluate: async (_state: unknown, questions: Record<string, any>) => {
+          if (questions.action) {
+            const labels = Object.keys(questions.action.criteria);
+            if (actionDecisions++ === 0) {
+              return invalidProviderChoice("action", labels);
+            }
+            return provider({ action: choice("click:e2", labels) }, questions);
+          }
+          return provider({
+            verdict: choice("satisfied", ["satisfied", "not_satisfied"]),
+            evidence: choice("c1", Object.keys(questions.evidence.criteria)),
+          });
+        },
+        now: () => 0,
+      },
+    );
+
+    expect(result).toMatchObject({ status: "complete", providerCalls: 3 });
+    expect({ actionDecisions, readsAtWrite, writes }).toEqual({
+      actionDecisions: 2,
+      readsAtWrite: 1,
+      writes: 1,
+    });
+  });
+
+  it("narrows a large action menu by relevant region after one invalid decision", async () => {
+    const candidates = Array.from({ length: 20 }, (_, index) => ({
+      ref: `e${index + 1}`,
+      role: "button",
+      name: index === 19 ? "Add to cart" : `Distractor ${index + 1}`,
+      type: "button",
+      nearbyText: index === 19 ? "Product options" : "Other controls",
+    }));
+    const current = {
+      ...observation,
+      candidates,
+      chunks: [
+        {
+          id: "other",
+          text: "Other controls",
+          refs: candidates.slice(0, 19).map((candidate) => candidate.ref),
+        },
+        { id: "product", text: "Product options and Add to cart", refs: ["e20"] },
+      ],
+    };
+    let actionDecisions = 0;
+    let filterCalls = 0;
+    let reads = 0;
+    const writes: string[] = [];
+    const result = await semantic.runBrowserSemantic(
+      {
+        command: "semantic.act",
+        goal: "add the product to the cart",
+        allowWrite: true,
+        inputs: {},
+        maxSteps: 1,
+      },
+      {
+        request: async (tool: string, args: Record<string, any>) => {
+          if (tool === "page.read") {
+            reads++;
+            return response({ semanticObservation: current });
+          }
+          if (tool === "click") {
+            writes.push(args.ref);
+          }
+          return actionResponse("OK");
+        },
+        evaluate: async (_state: unknown, questions: Record<string, any>) => {
+          if (questions.action) {
+            actionDecisions++;
+            const labels = Object.keys(questions.action.criteria);
+            if (actionDecisions === 1) {
+              return invalidProviderChoice("action", labels);
+            }
+            expect(labels).toContain("click:e20");
+            expect(labels).not.toContain("click:e1");
+            return actionProvider(questions, "click:e20");
+          }
+          if (questions.chunk_0) {
+            filterCalls++;
+            return provider({
+              chunk_0: choice("not_relevant", Object.keys(questions.chunk_0.criteria)),
+              chunk_1: choice("relevant", Object.keys(questions.chunk_1.criteria)),
+            });
+          }
+          return provider({
+            verdict: choice("satisfied", ["satisfied", "not_satisfied"]),
+            evidence: choice("product", Object.keys(questions.evidence.criteria)),
+          });
+        },
+        now: () => 0,
+      },
+    );
+
+    expect(result).toMatchObject({ status: "complete", providerCalls: 4 });
+    expect({ actionDecisions, filterCalls, reads, writes }).toEqual({
+      actionDecisions: 2,
+      filterCalls: 1,
+      reads: 7,
+      writes: ["e20"],
+    });
+  });
+
+  it("does not exceed the provider-call budget when call 17 returns an invalid action decision", async () => {
+    const candidates = Array.from({ length: 7 }, (_, index) => ({
+      ref: `write-${index + 1}`,
+      role: "button",
+      name: `Write ${index + 1}`,
+      type: "button",
+      nearbyText: `Distinct write ${index + 1}`,
+    }));
+    const current = { ...observation, candidates };
+    const actionAttempts = Array.from({ length: 7 }, () => 0);
+    const writes: string[] = [];
+    let actualEvaluateCalls = 0;
+    const result = await semantic.runBrowserSemantic(
+      {
+        command: "semantic.act",
+        goal: "perform bounded writes",
+        allowWrite: true,
+        inputs: {},
+        maxSteps: 7,
+      },
+      {
+        request: async (tool: string, args: Record<string, any>) => {
+          if (tool === "page.read") {
+            return response({ semanticObservation: current });
+          }
+          if (tool === "click") {
+            writes.push(args.ref);
+          }
+          return actionResponse("OK");
+        },
+        evaluate: async (_state: unknown, questions: Record<string, any>) => {
+          actualEvaluateCalls++;
+          if (questions.action) {
+            const writeIndex = writes.length;
+            const labels = Object.keys(questions.action.criteria);
+            const attempt = actionAttempts[writeIndex]++;
+            if ((writeIndex < 4 && attempt === 0) || writeIndex === 6) {
+              return invalidProviderChoice("action", labels);
+            }
+            return provider({ action: choice(`click:write-${writeIndex + 1}`, labels) }, questions);
+          }
+          return provider({
+            verdict: choice("not_satisfied", ["satisfied", "not_satisfied"]),
+            evidence: choice("c1", Object.keys(questions.evidence.criteria)),
+          });
+        },
+        now: () => 0,
+      },
+    );
+
+    expect(result).toMatchObject({
+      status: "stopped",
+      stopReason: "decision_failed",
+      errorCode: "provider_call_budget_exhausted",
+      providerCalls: 17,
+    });
+    expect(result.trace).toHaveLength(6);
+    expect(actualEvaluateCalls).toBe(17);
+    expect(writes).toEqual(candidates.slice(0, 6).map((candidate) => candidate.ref));
+  });
+
+  it("does not count a malformed-decision retry blocked by wall-time exhaustion", async () => {
+    let nowMs = 0;
+    let actualEvaluateCalls = 0;
+    let writes = 0;
+    const result = await semantic.runBrowserSemantic(
+      { command: "semantic.act", goal: "stop safely", allowWrite: true, inputs: {}, maxSteps: 1 },
+      {
+        request: async (tool: string) => {
+          if (tool === "click") {
+            writes++;
+          }
+          return response({ semanticObservation: observation });
+        },
+        evaluate: async (_state: unknown, questions: Record<string, any>) => {
+          actualEvaluateCalls++;
+          nowMs = 30_000;
+          return invalidProviderChoice("action", Object.keys(questions.action.criteria));
+        },
+        now: () => nowMs,
+      },
+    );
+
+    expect(result).toEqual({
+      status: "stopped",
+      stopReason: "decision_failed",
+      errorCode: "wall_time_budget_exhausted",
+      trace: [],
+      providerCalls: 1,
+    });
+    expect({ actualEvaluateCalls, writes }).toEqual({ actualEvaluateCalls: 1, writes: 0 });
+  });
+
+  it("does not execute a selected write after action selection exhausts wall time", async () => {
+    let nowMs = 0;
+    let writes = 0;
+    const result = await semantic.runBrowserSemantic(
+      {
+        command: "semantic.act",
+        goal: "delete the account",
+        allowWrite: true,
+        allowRefs: ["e2"],
+        inputs: {},
+        maxSteps: 1,
+      },
+      {
+        request: async (tool: string) => {
+          if (tool === "page.read") {
+            return response({ semanticObservation: observation });
+          }
+          if (tool === "click") {
+            writes++;
+          }
+          return actionResponse("OK");
+        },
+        evaluate: async (_state: unknown, questions: Record<string, any>) => {
+          nowMs = 30_000;
+          return actionProvider(questions, "click:e2");
+        },
+        now: () => nowMs,
+      },
+    );
+
+    expect(result).toEqual({
+      status: "stopped",
+      stopReason: "time_budget",
+      trace: [],
+      providerCalls: 1,
+    });
+    expect(writes).toBe(0);
+  });
+
+  it("retains trace and suppresses the same write after two invalid next-step decisions", async () => {
+    const original = { ...observation.candidates[1], ref: "add-old", name: "Add to cart" };
+    const rerendered = { ...original, ref: "add-new" };
+    let current = { ...observation, candidates: [original] };
+    let writes = 0;
+    let actionCalls = 0;
+    let offeredAfterWrite: string[] = [];
+    const result = await semantic.runBrowserSemantic(
+      { command: "semantic.act", goal: "add once", allowWrite: true, inputs: {}, maxSteps: 3 },
+      {
+        request: async (tool: string) => {
+          if (tool === "page.read") {
+            return response({ semanticObservation: current });
+          }
+          if (tool === "click") {
+            writes++;
+            current = { ...current, candidates: [rerendered] };
+          }
+          return actionResponse("OK");
+        },
+        evaluate: async (_state: unknown, questions: Record<string, any>) => {
+          if (questions.action) {
+            const labels = Object.keys(questions.action.criteria);
+            if (actionCalls++ === 0) {
+              return provider({ action: choice("click:add-old", labels) }, questions);
+            }
+            offeredAfterWrite = labels;
+            return invalidProviderChoice("action", labels);
+          }
+          return provider({
+            verdict: choice("not_satisfied", ["satisfied", "not_satisfied"]),
+            evidence: choice("c1", Object.keys(questions.evidence.criteria)),
+          });
+        },
+        now: () => 0,
+      },
+    );
+
+    expect(result).toMatchObject({
+      status: "stopped",
+      stopReason: "decision_failed",
+      errorCode: "provider_invalid_response",
+      providerCalls: 4,
+      trace: [expect.objectContaining({ ref: "add-old", result: "executed" })],
+    });
+    expect(offeredAfterWrite).not.toContain("click:add-new");
+    expect(writes).toBe(1);
+  });
+
+  it("retries an invalid next-step decision without reoffering the spent write", async () => {
+    const alpha = {
+      ...observation.candidates[1],
+      ref: "alpha",
+      name: "Add to cart",
+      nearbyText: "Alpha product",
+    };
+    const beta = { ...alpha, ref: "beta", nearbyText: "Beta product" };
+    const current = { ...observation, candidates: [alpha, beta] };
+    let actionDecisions = 0;
+    let verifications = 0;
+    const retryMenus: string[][] = [];
+    const writes: string[] = [];
+    const result = await semantic.runBrowserSemantic(
+      {
+        command: "semantic.act",
+        goal: "add Alpha then Beta",
+        allowWrite: true,
+        inputs: {},
+        maxSteps: 2,
+      },
+      {
+        request: async (tool: string, args: Record<string, any>) => {
+          if (tool === "page.read") {
+            return response({ semanticObservation: current });
+          }
+          if (tool === "click") {
+            writes.push(args.ref);
+          }
+          return actionResponse("OK");
+        },
+        evaluate: async (_state: unknown, questions: Record<string, any>) => {
+          if (questions.action) {
+            const labels = Object.keys(questions.action.criteria);
+            if (actionDecisions++ === 0) {
+              return provider({ action: choice("click:alpha", labels) }, questions);
+            }
+            retryMenus.push(labels);
+            if (actionDecisions === 2) {
+              return invalidProviderChoice("action", labels);
+            }
+            return provider({ action: choice("click:beta", labels) }, questions);
+          }
+          const verdict = verifications++ === 0 ? "not_satisfied" : "satisfied";
+          return provider({
+            verdict: choice(verdict, ["satisfied", "not_satisfied"]),
+            evidence: choice("c1", Object.keys(questions.evidence.criteria)),
+          });
+        },
+        now: () => 0,
+      },
+    );
+
+    expect(result).toMatchObject({ status: "complete", providerCalls: 5 });
+    expect(retryMenus).toHaveLength(2);
+    expect(retryMenus[0]).toEqual(retryMenus[1]);
+    expect(retryMenus[0]).not.toContain("click:alpha");
+    expect(retryMenus[0]).toContain("click:beta");
+    expect(writes).toEqual(["alpha", "beta"]);
+  });
+
+  it("keeps a distinct same-name control eligible when spent context remains unambiguous", async () => {
+    const alpha = {
+      ...observation.candidates[1],
+      ref: "alpha",
+      name: "Add to cart",
+      nearbyText: "Alpha product",
+    };
+    const beta = { ...alpha, ref: "beta", nearbyText: "Beta product" };
+    const current = { ...observation, candidates: [alpha, beta] };
+    let actionCalls = 0;
+    let writes = 0;
+    let secondMenu: string[] = [];
+    const result = await semantic.runBrowserSemantic(
+      {
+        command: "semantic.act",
+        goal: "add Alpha then Beta",
+        allowWrite: true,
+        inputs: {},
+        maxSteps: 2,
+      },
+      {
+        request: async (tool: string) => {
+          if (tool === "page.read") {
+            return response({ semanticObservation: current });
+          }
+          if (tool === "click") {
+            writes++;
+          }
+          return actionResponse("OK");
+        },
+        evaluate: async (_state: unknown, questions: Record<string, any>) => {
+          if (questions.action) {
+            const labels = Object.keys(questions.action.criteria);
+            if (actionCalls++ === 0) {
+              return provider({ action: choice("click:alpha", labels) }, questions);
+            }
+            secondMenu = labels;
+            return provider({ action: choice("stop", labels) }, questions);
+          }
+          return provider({
+            verdict: choice("not_satisfied", ["satisfied", "not_satisfied"]),
+            evidence: choice("c1", Object.keys(questions.evidence.criteria)),
+          });
+        },
+        now: () => 0,
+      },
+    );
+    expect(result).toMatchObject({ status: "stopped", stopReason: "uncertain" });
+    expect(secondMenu).not.toContain("click:alpha");
+    expect(secondMenu).toContain("click:beta");
+    expect(writes).toBe(1);
+  });
+
+  it.each(["disappeared", "changed"])(
+    "suppresses an ambiguous same-name group when spent context has %s",
+    async (mode) => {
+      const alpha = {
+        ...observation.candidates[1],
+        ref: "alpha",
+        name: "Add to cart",
+        nearbyText: "Alpha product",
+      };
+      const beta = { ...alpha, ref: "beta", nearbyText: "Beta product" };
+      let current = { ...observation, candidates: [alpha, beta] };
+      let actionCalls = 0;
+      let writes = 0;
+      let secondMenu: string[] = [];
+      const result = await semantic.runBrowserSemantic(
+        { command: "semantic.act", goal: "add safely", allowWrite: true, inputs: {}, maxSteps: 2 },
+        {
+          request: async (tool: string) => {
+            if (tool === "page.read") {
+              return response({ semanticObservation: current });
+            }
+            if (tool === "click") {
+              writes++;
+              current = {
+                ...current,
+                candidates:
+                  mode === "disappeared"
+                    ? [beta]
+                    : [{ ...alpha, ref: "alpha-new", nearbyText: "Changed product" }, beta],
+              };
+            }
+            return actionResponse("OK");
+          },
+          evaluate: async (_state: unknown, questions: Record<string, any>) => {
+            if (questions.action) {
+              const labels = Object.keys(questions.action.criteria);
+              if (actionCalls++ === 0) {
+                return provider({ action: choice("click:alpha", labels) }, questions);
+              }
+              secondMenu = labels;
+              return provider({ action: choice("stop", labels) }, questions);
+            }
+            return provider({
+              verdict: choice("not_satisfied", ["satisfied", "not_satisfied"]),
+              evidence: choice("c1", Object.keys(questions.evidence.criteria)),
+            });
+          },
+          now: () => 0,
+        },
+      );
+      expect(result).toMatchObject({ status: "stopped", stopReason: "uncertain" });
+      expect(secondMenu.filter((label) => label.startsWith("click:"))).toEqual([]);
+      expect(writes).toBe(1);
+    },
+  );
+
+  it("returns a structured decision failure after two invalid decisions before any action", async () => {
+    let writes = 0;
+    const result = await semantic.runBrowserSemantic(
+      { command: "semantic.act", goal: "stop safely", allowWrite: true, inputs: {}, maxSteps: 1 },
+      {
+        request: async (tool: string) => {
+          if (tool === "click") {
+            writes++;
+          }
+          return response({ semanticObservation: observation });
+        },
+        evaluate: async (_state: unknown, questions: Record<string, any>) =>
+          invalidProviderChoice("action", Object.keys(questions.action.criteria)),
+        now: () => 0,
+      },
+    );
+    expect(result).toEqual({
+      status: "stopped",
+      stopReason: "decision_failed",
+      errorCode: "provider_invalid_response",
+      trace: [],
+      providerCalls: 2,
+    });
+    expect(writes).toBe(0);
+  });
+
+  it("does not retry other action-selection failures", async () => {
+    let decisions = 0;
+    const result = await semantic.runBrowserSemantic(
+      { command: "semantic.act", goal: "stop safely", allowWrite: false, inputs: {}, maxSteps: 1 },
+      {
+        request: async () => response({ semanticObservation: observation }),
+        evaluate: async () => {
+          decisions++;
+          throw Object.assign(new Error("provider unavailable"), { code: "provider_unavailable" });
+        },
+        now: () => 0,
+      },
+    );
+    expect(result).toEqual({
+      status: "stopped",
+      stopReason: "decision_failed",
+      errorCode: "provider_unavailable",
+      trace: [],
+      providerCalls: 1,
+    });
+    expect(decisions).toBe(1);
+  });
+
+  it("allows a same-ref write when its stable name is genuinely different", async () => {
+    const add = { ...observation.candidates[1], name: "Add to cart" };
+    const remove = { ...add, name: "Remove from cart" };
+    let current = { ...observation, candidates: [add] };
+    let writes = 0;
+    let actionCalls = 0;
+    let verifications = 0;
+    let secondMenu: string[] = [];
+    const result = await semantic.runBrowserSemantic(
+      {
+        command: "semantic.act",
+        goal: "change cart twice",
+        allowWrite: true,
+        inputs: {},
+        maxSteps: 2,
+      },
+      {
+        request: async (tool: string) => {
+          if (tool === "page.read") {
+            return response({ semanticObservation: current });
+          }
+          if (tool === "click") {
+            writes++;
+            current = { ...current, candidates: [remove] };
+          }
+          return actionResponse("OK");
+        },
+        evaluate: async (_state: unknown, questions: Record<string, any>) => {
+          if (questions.action) {
+            const labels = Object.keys(questions.action.criteria);
+            if (actionCalls++ > 0) {
+              secondMenu = labels;
+            }
+            return provider({ action: choice("click:e2", labels) }, questions);
+          }
+          const verdict = verifications++ ? "satisfied" : "not_satisfied";
+          return provider({
+            verdict: choice(verdict, ["satisfied", "not_satisfied"]),
+            evidence: choice("c1", Object.keys(questions.evidence.criteria)),
+          });
+        },
+        now: () => 0,
+      },
+    );
+    expect(result.status).toBe("complete");
+    expect(secondMenu).toContain("click:e2");
+    expect(writes).toBe(2);
   });
 
   it("completes a login-like goal with three distinct writes", async () => {
@@ -466,14 +1806,19 @@ describe("semantic CLI", () => {
           if (tool === "page.read") {
             return response({ semanticObservation: loginObservation });
           }
-          mutations.push(tool === "form.fill" ? `fill:${args.data[0].ref}` : `click:${args.ref}`);
+          if (tool === "form.fill") {
+            mutations.push(`fill:${args.data[0].ref}`);
+          }
+          if (tool === "click") {
+            mutations.push(`click:${args.ref}`);
+          }
           return actionResponse("OK");
         },
         evaluate: async (_state: unknown, questions: Record<string, any>) => {
           if (questions.action) {
             const labels = Object.keys(questions.action.criteria);
             offered.push(labels);
-            return provider({ action: choice(requestedActions[actionIndex++], labels) });
+            return provider({ action: choice(requestedActions[actionIndex++], labels) }, questions);
           }
           const verdict = verificationIndex++ === 2 ? "satisfied" : "not_satisfied";
           return provider({
@@ -494,8 +1839,8 @@ describe("semantic CLI", () => {
       ]),
     );
     expect(offered[1]).not.toContain("fill:user:username");
-    expect(offered[1]).not.toContain("fill:user:password");
-    expect(offered[2]).not.toContain("fill:pass:username");
+    expect(offered[1]).toContain("fill:user:password");
+    expect(offered[2]).toContain("fill:pass:username");
     expect(offered[2]).not.toContain("fill:pass:password");
   });
 
@@ -518,13 +1863,15 @@ describe("semantic CLI", () => {
           if (tool === "page.read") {
             return response({ semanticObservation: reads++ ? second : first });
           }
-          writes++;
+          if (tool === "click") {
+            writes++;
+          }
           return actionResponse("OK");
         },
         evaluate: async (_state: unknown, questions: Record<string, any>) => {
           if (questions.action) {
             const labels = Object.keys(questions.action.criteria);
-            return provider({ action: choice("click:e2", labels) });
+            return provider({ action: choice("click:e2", labels) }, questions);
           }
           const verdict = verifications++ ? "satisfied" : "not_satisfied";
           return provider({
@@ -548,19 +1895,28 @@ describe("semantic CLI", () => {
           if (tool === "page.read") {
             return response({ semanticObservation: observation });
           }
-          writes++;
+          if (tool === "click") {
+            writes++;
+          }
           return actionResponse("OK");
         },
         evaluate: async (_state: unknown, questions: Record<string, any>) => {
           if (!questions.action) {
             throw new Error("provider disconnected");
           }
-          return provider({ action: choice("click:e2", Object.keys(questions.action.criteria)) });
+          return provider(
+            { action: choice("click:e2", Object.keys(questions.action.criteria)) },
+            questions,
+          );
         },
         now: () => 0,
       },
     );
-    expect(result).toMatchObject({ status: "stopped", stopReason: "verification_failed" });
+    expect(result).toMatchObject({
+      status: "stopped",
+      stopReason: "verification_failed",
+      providerCalls: 2,
+    });
     expect(writes).toBe(1);
   });
 
@@ -585,7 +1941,10 @@ describe("semantic CLI", () => {
           );
         },
         evaluate: async (_state: unknown, questions: Record<string, any>) =>
-          provider({ action: choice("click:e2", Object.keys(questions.action.criteria)) }),
+          provider(
+            { action: choice("click:e2", Object.keys(questions.action.criteria)) },
+            questions,
+          ),
         now: () => 0,
       },
     );
@@ -614,7 +1973,10 @@ describe("semantic CLI", () => {
           if (!questions.action) {
             verificationCalls++;
           }
-          return provider({ action: choice("click:e2", Object.keys(questions.action.criteria)) });
+          return provider(
+            { action: choice("click:e2", Object.keys(questions.action.criteria)) },
+            questions,
+          );
         },
         now: () => 0,
       },
@@ -661,7 +2023,10 @@ describe("semantic CLI", () => {
         },
         evaluate: async (_state: unknown, questions: Record<string, any>) => {
           const labels = Object.keys(questions.action.criteria);
-          return provider({ action: choice(selections++ ? "stop" : "fill:e1:email", labels) });
+          return provider(
+            { action: choice(selections++ ? "stop" : "fill:e1:email", labels) },
+            questions,
+          );
         },
         now: () => 0,
       },
@@ -824,9 +2189,12 @@ describe("semantic CLI", () => {
         },
         evaluate: async (_state: unknown, questions: Record<string, any>) => {
           if (questions.action) {
-            return provider({
-              action: choice("click:e63", Object.keys(questions.action.criteria), 0.65),
-            });
+            return provider(
+              {
+                action: choice("click:e63", Object.keys(questions.action.criteria), 0.65),
+              },
+              questions,
+            );
           }
           return provider({
             verdict: choice("satisfied", ["satisfied", "not_satisfied"]),
@@ -840,7 +2208,7 @@ describe("semantic CLI", () => {
       status: "complete",
       trace: [expect.objectContaining({ ref: "e63", appliedThreshold: 0.65 })],
     });
-    expect(reads).toBe(2);
+    expect(reads).toBe(7);
   });
 
   it("fails explicitly before provider selection when mandatory authorized actions exceed the hard bound", async () => {
@@ -852,25 +2220,27 @@ describe("semantic CLI", () => {
       nearbyText: "Actions",
     }));
     const evaluate = vi.fn();
-    await expect(
-      semantic.runBrowserSemantic(
-        {
-          command: "semantic.act",
-          goal: "choose an action",
-          allowWrite: true,
-          allowRefs: candidates.map((candidate) => candidate.ref),
-          inputs: {},
-          maxSteps: 1,
-        },
-        {
-          request: async () => response({ semanticObservation: { ...observation, candidates } }),
-          evaluate,
-          now: () => 0,
-        },
-      ),
-    ).rejects.toMatchObject({
-      code: "semantic_invalid_request",
-      message: `explicitly authorized actions exceed the limit of ${SEMANTIC_POLICY.limits.actionChoices}`,
+    const result = await semantic.runBrowserSemantic(
+      {
+        command: "semantic.act",
+        goal: "choose an action",
+        allowWrite: true,
+        allowRefs: candidates.map((candidate) => candidate.ref),
+        inputs: {},
+        maxSteps: 1,
+      },
+      {
+        request: async () => response({ semanticObservation: { ...observation, candidates } }),
+        evaluate,
+        now: () => 0,
+      },
+    );
+    expect(result).toMatchObject({
+      status: "stopped",
+      stopReason: "decision_failed",
+      errorCode: "semantic_invalid_request",
+      trace: [],
+      providerCalls: 0,
     });
     expect(evaluate).not.toHaveBeenCalled();
   });

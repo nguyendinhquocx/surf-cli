@@ -13,6 +13,10 @@ const {
 const { parseListenEndpoint } = require("../native/listener.cjs");
 const { normalizeSocketConfig } = require("../native/socket-permissions.cjs");
 const { getStateDir, loadHostIdentity, loadRegistry } = require("../native/remote-auth.cjs");
+const {
+  renderWslWrapper,
+  probeWindowsWrapper,
+} = require("../native/native-host-launch-probe.cjs");
 
 const HOST_NAME = "surf.browser.host";
 
@@ -151,17 +155,16 @@ function wslPathToWindowsPath(wslPath) {
   return convertWslPath(wslPath);
 }
 
-function createWrapper(wrapperDir, nodePath, hostPath, target = process.platform, listen, socketMode, socketGroup) {
+function createWrapper(wrapperDir, nodePath, hostPath, target = process.platform, listen, socketMode, socketGroup, distro = process.env.WSL_DISTRO_NAME, convertPath = wslPathToWindowsPath) {
   const socketConfig = normalizeSocketConfig(socketMode, socketGroup);
   assertSocketAccessTargetSupported(socketConfig.mode, socketConfig.group, target);
   fs.mkdirSync(wrapperDir, { recursive: true });
 
   if (target === "wsl-windows") {
     const cmdPath = path.join(wrapperDir, "host-wrapper-wsl.cmd");
-    const distroArg = process.env.WSL_DISTRO_NAME ? ` -d "${process.env.WSL_DISTRO_NAME}"` : "";
-    const content = `@echo off\r\nwsl.exe${distroArg} --cd "${path.dirname(hostPath)}" --exec "${nodePath}" "${hostPath}" %*\r\n`;
-    fs.writeFileSync(cmdPath, content);
-    return wslPathToWindowsPath(cmdPath);
+    const windowsPath = convertPath(cmdPath);
+    fs.writeFileSync(cmdPath, renderWslWrapper(nodePath, hostPath, distro));
+    return windowsPath;
   }
 
   if (process.platform === "win32") {
@@ -184,6 +187,32 @@ ${listen ? `: "\${SURF_LISTEN:=${listen}}"\nexport SURF_LISTEN\n` : ""}${socketE
   fs.writeFileSync(shPath, content);
   fs.chmodSync(shPath, "755");
   return shPath;
+}
+
+function installWithValidatedWrapper(wrapperPath, target, install, deps = {}) {
+  if (target === "wsl-windows") {
+    if (!deps.distro) throw new Error("WSL_DISTRO_NAME is required for Windows browser installation");
+    try {
+      probeWindowsWrapper(wrapperPath, deps);
+    } catch (error) {
+      if (!error.message.includes("WSL_E_DISTRO_NOT_FOUND")) {
+        throw new Error(`WSL wrapper validation failed before registration: ${error.message}`);
+      }
+      const explicitFailure = error;
+      const original = fs.readFileSync(deps.wrapperFsPath, "utf8");
+      fs.writeFileSync(deps.wrapperFsPath, renderWslWrapper(deps.nodePath, deps.hostPath, null));
+      try {
+        const defaultDistro = probeWindowsWrapper(wrapperPath, { ...deps, verifyDistro: true });
+        if (defaultDistro !== deps.distro) {
+          throw new Error("Windows default WSL distro does not match the installing distro");
+        }
+      } catch (fallbackError) {
+        fs.writeFileSync(deps.wrapperFsPath, original);
+        throw new Error(`WSL wrapper validation failed before registration (explicit distro: ${explicitFailure.message}; default distro: ${fallbackError.message})`);
+      }
+    }
+  }
+  return install();
 }
 
 function assertListenTargetSupported(listen, target) {
@@ -435,6 +464,9 @@ function main() {
   console.log(`Wrapper dir: ${wrapperDir}`);
   console.log("");
 
+  const wrapperFsPath = path.join(wrapperDir, "host-wrapper-wsl.cmd");
+  const previousWrapper = effectiveTarget === "wsl-windows" && fs.existsSync(wrapperFsPath)
+    ? fs.readFileSync(wrapperFsPath, "utf8") : null;
   const wrapperPath = createWrapper(
     wrapperDir,
     nodePath,
@@ -450,24 +482,34 @@ function main() {
   const installed = [];
   const skipped = [];
 
-  for (const browser of browsers) {
-    if (!BROWSERS[browser]) {
-      console.error(`Unknown browser: ${browser}`);
-      continue;
-    }
+  try {
+    installWithValidatedWrapper(wrapperPath, effectiveTarget, () => {
+      for (const browser of browsers) {
+        if (!BROWSERS[browser]) {
+          console.error(`Unknown browser: ${browser}`);
+          continue;
+        }
 
-    let result;
-    try {
-      result = installManifest(browser, extensionId, wrapperPath, effectiveTarget);
-    } catch (error) {
-      console.error(`Error: Failed to install ${BROWSERS[browser].name}: ${error.message}`);
-      process.exit(1);
+        let result;
+        try {
+          result = installManifest(browser, extensionId, wrapperPath, effectiveTarget);
+        } catch (error) {
+          throw new Error(`Failed to install ${BROWSERS[browser].name}: ${error.message}`);
+        }
+        if (result) {
+          installed.push({ browser: BROWSERS[browser].name, path: result });
+        } else {
+          skipped.push(BROWSERS[browser].name);
+        }
+      }
+    }, { wrapperFsPath, nodePath, hostPath, distro: process.env.WSL_DISTRO_NAME });
+  } catch (error) {
+    if (effectiveTarget === "wsl-windows" && installed.length === 0) {
+      if (previousWrapper === null) fs.rmSync(wrapperFsPath, { force: true });
+      else fs.writeFileSync(wrapperFsPath, previousWrapper);
     }
-    if (result) {
-      installed.push({ browser: BROWSERS[browser].name, path: result });
-    } else {
-      skipped.push(BROWSERS[browser].name);
-    }
+    console.error(`Error: ${error.message}`);
+    process.exit(1);
   }
 
   if (installed.length > 0) {
@@ -490,6 +532,10 @@ if (require.main === module) {
 
 module.exports = {
   createWrapper,
+  findNode,
+  getHostPath,
+  probeWindowsWrapper,
+  installWithValidatedWrapper,
   writeManifest,
   assertListenTargetSupported,
   assertSocketAccessTargetSupported,

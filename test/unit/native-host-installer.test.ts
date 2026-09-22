@@ -13,7 +13,9 @@ const path = require("node:path");
 const { spawnSync } = require("node:child_process");
 const {
   createWrapper,
+  installWithValidatedWrapper,
   installManifest,
+  probeWindowsWrapper,
   writeManifest,
   assertListenTargetSupported,
   assertSocketAccessTargetSupported,
@@ -409,11 +411,253 @@ describe("native host installer", () => {
       });
     }
 
-    const cmdPath = createWrapper(tempDir, nodePath, hostPath, "wsl-windows");
-    expect(fs.readFileSync(path.join(tempDir, "host-wrapper-wsl.cmd"), "utf8")).toContain(
-      `"${hostPath}" %*`,
+    const cmdPath = createWrapper(
+      tempDir,
+      nodePath,
+      hostPath,
+      "wsl-windows",
+      undefined,
+      undefined,
+      undefined,
+      "Ubuntu-24.04",
+      () => "C:\\Users\\Test\\surf-cli\\host-wrapper-wsl.cmd",
     );
-    expect(cmdPath).toBeTruthy();
+    expect(fs.readFileSync(path.join(tempDir, "host-wrapper-wsl.cmd"), "utf8")).toBe(
+      `@echo off\r\nrem SURF_NATIVE_HOST_LAUNCH_PROBE_V1\r\nwsl.exe -d "Ubuntu-24.04" --cd "${path.dirname(hostPath)}" --exec "${nodePath}" "${hostPath}" %*\r\n`,
+    );
+    expect(cmdPath).toBe("C:\\Users\\Test\\surf-cli\\host-wrapper-wsl.cmd");
+  });
+
+  it("probes a generated WSL Windows wrapper through bounded cmd interop", () => {
+    const calls: any[] = [];
+    probeWindowsWrapper("C:\\Users\\Test User\\surf-cli\\host-wrapper-wsl.cmd", {
+      execFileSync: (file: string, args: string[], options: any) => {
+        calls.push([file, args, options]);
+        return "SURF_NATIVE_HOST_LAUNCH_PROBE_OK\r\n";
+      },
+    });
+
+    expect(calls).toEqual([
+      [
+        "cmd.exe",
+        [
+          "/d",
+          "/s",
+          "/c",
+          '""C:\\Users\\Test User\\surf-cli\\host-wrapper-wsl.cmd" --surf-native-host-launch-probe"',
+        ],
+        expect.objectContaining({ encoding: "utf8", timeout: 5000 }),
+      ],
+    ]);
+  });
+
+  it("preserves an installed wrapper when its Windows path cannot be resolved", () => {
+    const wrapperDir = makeTempDir();
+    const wrapperFsPath = path.join(wrapperDir, "host-wrapper-wsl.cmd");
+    fs.writeFileSync(wrapperFsPath, "existing working wrapper");
+    expect(() =>
+      createWrapper(
+        wrapperDir,
+        "/usr/bin/node",
+        "/home/surf/native/host.cjs",
+        "wsl-windows",
+        undefined,
+        undefined,
+        undefined,
+        "Ubuntu",
+        () => {
+          throw new Error("wslpath conversion failed");
+        },
+      ),
+    ).toThrow("wslpath conversion failed");
+    expect(fs.readFileSync(wrapperFsPath, "utf8")).toBe("existing working wrapper");
+  });
+
+  it("reports failed, timed out, and malformed WSL wrapper probes", () => {
+    expect(() =>
+      probeWindowsWrapper("C:\\surf\\host-wrapper-wsl.cmd", {
+        execFileSync: () => {
+          throw Object.assign(new Error("wrapper exited with status 1"), {
+            stderr: "wsl.exe could not start the distro",
+          });
+        },
+      }),
+    ).toThrow(/launch probe failed.*wsl\.exe could not start the distro/);
+
+    expect(() =>
+      probeWindowsWrapper("C:\\surf\\host-wrapper-wsl.cmd", {
+        execFileSync: () => "not the probe marker\n",
+      }),
+    ).toThrow(/launch probe failed.*unexpected output/);
+
+    expect(() =>
+      probeWindowsWrapper("C:\\surf\\host-wrapper-wsl.cmd", {
+        timeoutMs: 25,
+        execFileSync: (_file: string, _args: string[], options: any) => {
+          expect(options.timeout).toBe(25);
+          throw Object.assign(new Error("spawnSync cmd.exe ETIMEDOUT"), { code: "ETIMEDOUT" });
+        },
+      }),
+    ).toThrow(/launch probe failed.*ETIMEDOUT/);
+  });
+
+  it("does not register a WSL wrapper when its launch probe fails", () => {
+    const tempDir = makeTempDir();
+    const wrapperFsPath = path.join(tempDir, "host-wrapper-wsl.cmd");
+    fs.writeFileSync(wrapperFsPath, "original wrapper");
+    let registered = false;
+    expect(() =>
+      installWithValidatedWrapper(
+        "C:\\surf\\host-wrapper-wsl.cmd",
+        "wsl-windows",
+        () => {
+          registered = true;
+        },
+        {
+          wrapperFsPath,
+          nodePath: "/usr/bin/node",
+          hostPath: "/home/surf/native/host.cjs",
+          distro: "Ubuntu",
+          execFileSync: () => "wrong output\n",
+        },
+      ),
+    ).toThrow(/before registration/);
+    expect(registered).toBe(false);
+    expect(fs.readFileSync(wrapperFsPath, "utf8")).toBe("original wrapper");
+  });
+
+  it("uses the Windows default distro only after the launch probe confirms its identity", () => {
+    const tempDir = makeTempDir();
+    const wrapperFsPath = path.join(tempDir, "host-wrapper-wsl.cmd");
+    const nodePath = "/usr/bin/node";
+    const hostPath = "/home/surf/native/host.cjs";
+    const explicit = `@echo off\r\nrem SURF_NATIVE_HOST_LAUNCH_PROBE_V1\r\nwsl.exe -d "Ubuntu" --cd "/home/surf/native" --exec "${nodePath}" "${hostPath}" %*\r\n`;
+    const fallback = `@echo off\r\nrem SURF_NATIVE_HOST_LAUNCH_PROBE_V1\r\nwsl.exe --cd "/home/surf/native" --exec "${nodePath}" "${hostPath}" %*\r\n`;
+    fs.writeFileSync(wrapperFsPath, explicit);
+    let attempts = 0;
+    const result = installWithValidatedWrapper(
+      "C:\\surf\\host-wrapper-wsl.cmd",
+      "wsl-windows",
+      () => "registered",
+      {
+        wrapperFsPath,
+        nodePath,
+        hostPath,
+        distro: "Ubuntu",
+        execFileSync: (_file: string, args: string[]) => {
+          attempts++;
+          if (attempts === 1) {
+            expect(fs.readFileSync(wrapperFsPath, "utf8")).toBe(explicit);
+            throw new Error("WSL_E_DISTRO_NOT_FOUND");
+          }
+          expect(fs.readFileSync(wrapperFsPath, "utf8")).toBe(fallback);
+          expect(args[3]).toContain("--surf-native-host-launch-probe-distro");
+          return 'SURF_NATIVE_HOST_LAUNCH_PROBE_OK:"Ubuntu"\n';
+        },
+      },
+    );
+    expect(result).toBe("registered");
+    expect(attempts).toBe(2);
+    expect(fs.readFileSync(wrapperFsPath, "utf8")).toBe(fallback);
+  });
+
+  it("keeps explicit distro selection when its wrapper launches successfully", () => {
+    const tempDir = makeTempDir();
+    const wrapperFsPath = path.join(tempDir, "host-wrapper-wsl.cmd");
+    fs.writeFileSync(wrapperFsPath, "explicit wrapper");
+    const installed = installWithValidatedWrapper(
+      "C:\\surf\\host-wrapper-wsl.cmd",
+      "wsl-windows",
+      () => "registered",
+      {
+        wrapperFsPath,
+        distro: "Ubuntu",
+        execFileSync: () => "SURF_NATIVE_HOST_LAUNCH_PROBE_OK\n",
+      },
+    );
+    expect(installed).toBe("registered");
+    expect(fs.readFileSync(wrapperFsPath, "utf8")).toBe("explicit wrapper");
+  });
+
+  it.each([null, "Other", "broken"])("rejects an unverified default distro %s", (identity) => {
+    const tempDir = makeTempDir();
+    const wrapperFsPath = path.join(tempDir, "host-wrapper-wsl.cmd");
+    fs.writeFileSync(wrapperFsPath, "explicit wrapper");
+    let registered = false;
+    let attempts = 0;
+    expect(() =>
+      installWithValidatedWrapper(
+        "C:\\surf\\host-wrapper-wsl.cmd",
+        "wsl-windows",
+        () => {
+          registered = true;
+        },
+        {
+          wrapperFsPath,
+          nodePath: "/usr/bin/node",
+          hostPath: "/home/surf/native/host.cjs",
+          distro: "Ubuntu",
+          execFileSync: () => {
+            attempts++;
+            if (attempts === 1) {
+              throw new Error("WSL_E_DISTRO_NOT_FOUND");
+            }
+            return identity === "broken"
+              ? "unexpected output"
+              : `SURF_NATIVE_HOST_LAUNCH_PROBE_OK:${JSON.stringify(identity)}\n`;
+          },
+        },
+      ),
+    ).toThrow(/before registration/);
+    expect(registered).toBe(false);
+    expect(fs.readFileSync(wrapperFsPath, "utf8")).toBe("explicit wrapper");
+  });
+
+  it("does not probe ordinary native-host wrappers", () => {
+    const result = installWithValidatedWrapper("/tmp/host-wrapper.sh", "linux", () => "installed", {
+      execFileSync: () => {
+        throw new Error("probe should not run");
+      },
+    });
+
+    expect(result).toBe("installed");
+  });
+
+  it("launch probe exits without creating a Surf socket", () => {
+    const tempDir = makeTempDir();
+    const socketPath = path.join(tempDir, "surf.sock");
+    const result = spawnSync(
+      process.execPath,
+      ["native/host.cjs", "--surf-native-host-launch-probe"],
+      {
+        encoding: "utf8",
+        env: { ...process.env, SURF_SOCKET: socketPath },
+        timeout: 5000,
+      },
+    );
+
+    expect(result.status).toBe(0);
+    expect(result.signal).toBeNull();
+    expect(result.stdout).toBe("SURF_NATIVE_HOST_LAUNCH_PROBE_OK\n");
+    expect(result.stderr).toBe("");
+    expect(fs.existsSync(socketPath)).toBe(false);
+  });
+
+  it("launch probe reports only the WSL distro identity without opening a socket", () => {
+    const socketPath = path.join(makeTempDir(), "surf.sock");
+    const result = spawnSync(
+      process.execPath,
+      ["native/host.cjs", "--surf-native-host-launch-probe-distro"],
+      {
+        encoding: "utf8",
+        env: { ...process.env, SURF_SOCKET: socketPath, WSL_DISTRO_NAME: "Ubuntu" },
+        timeout: 5000,
+      },
+    );
+    expect(result.status).toBe(0);
+    expect(result.stdout).toBe('SURF_NATIVE_HOST_LAUNCH_PROBE_OK:"Ubuntu"\n');
+    expect(result.stderr).toBe("");
+    expect(fs.existsSync(socketPath)).toBe(false);
   });
 
   it("validates Tailnet-only listener endpoints and persists the wrapper setting", () => {
