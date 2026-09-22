@@ -325,6 +325,50 @@ describe("accessibility tree", () => {
     ).toBeLessThanOrEqual(24 * 1024);
   });
 
+  it("associates value-free checked and selected state with semantic refs and evidence", () => {
+    const size = new FakeInputElement("input");
+    size.setAttribute("type", "radio");
+    size.setAttribute("aria-label", 'M \\ "Tall"');
+    size.value = "private-size-value";
+    size.checked = true;
+    const color = element("button", {
+      role: "option",
+      "aria-label": "Black",
+      "aria-selected": "false",
+    });
+    color.value = "private-color-value";
+    (document.body as unknown as FakeElement).append(size, color);
+    window.__piElementMap = {
+      size: { element: new WeakRef(size as unknown as Element), role: "radio", name: "M" },
+      color: { element: new WeakRef(color as unknown as Element), role: "option", name: "Black" },
+    };
+
+    let observation: any;
+    messageHandler?.(
+      { type: "GENERATE_ACCESSIBILITY_TREE", options: { semanticObservation: true } },
+      {},
+      (result) => {
+        observation = result.semanticObservation;
+      },
+    );
+
+    expect(observation.candidates).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ ref: "size", state: { checked: true } }),
+        expect.objectContaining({ ref: "color", state: { selected: false } }),
+      ]),
+    );
+    expect(observation.chunks).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ text: 'radio "M \\\\ \\"Tall\\"" [checked]', refs: ["size"] }),
+        expect.objectContaining({ text: 'option "Black" [not-selected]', refs: ["color"] }),
+      ]),
+    );
+    expect(JSON.stringify(observation)).not.toContain("private-size-value");
+    expect(JSON.stringify(observation)).not.toContain("private-color-value");
+    expect(observation.candidates).toHaveLength(2);
+  });
+
   it("emits one semantic candidate when repeated reads assigned multiple refs to one element", () => {
     const quantity = new FakeInputElement("input");
     quantity.setAttribute("type", "number");

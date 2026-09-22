@@ -12,15 +12,32 @@ const {
 
 const FIELD_ROLES = new Set(["textbox", "searchbox", "combobox", "spinbutton"]);
 const CLICK_ROLES = new Set(["button", "link", "checkbox", "radio"]);
+const POST_WRITE_SETTLE_WAITS_MS = Object.freeze([500, 1_000, 2_000, 4_000, 2_000]);
+const THRESHOLD_KEYS = Object.freeze({
+  find: "find",
+  filter: "filter",
+  "verify-positive": "verifyPositive",
+  "verify-negative": "verifyNegative",
+  "prerequisite-supported": "prerequisiteSupported",
+  "prerequisite-blocked": "prerequisiteBlocked",
+  write: "write",
+  "exact-ref-write": "exactRefWrite",
+});
+const COMMAND_THRESHOLD_KEYS = Object.freeze({
+  "semantic.find": new Set(["find"]),
+  "semantic.filter": new Set(["filter"]),
+  "semantic.verify": new Set(["verify-positive", "verify-negative"]),
+  "semantic.act": new Set(["find", "write", "exact-ref-write", "verify-positive", "verify-negative", "prerequisite-supported", "prerequisite-blocked"]),
+});
 
 const SEMANTIC_HELP = `Usage:
-  surf semantic.find <goal> [--session <name> | --tab-id <id>] [--json]
-  surf semantic.verify <outcome> [--session <name> | --tab-id <id>] [--json]
-  surf semantic.filter <goal> [--top <1-12>] [--session <name> | --tab-id <id>] [--json]
-  surf semantic.act <goal> [--max-steps <1-8>] [--allow-write] [--allow-ref <ref>...] [--input <name=value>...] [--session <name> | --tab-id <id>] [--json]
+  surf semantic.find <goal> [--threshold find=<0-1>] [--session <name> | --tab-id <id>] [--json]
+  surf semantic.verify <outcome> [--threshold verify-positive=<0-1>] [--threshold verify-negative=<0-1>] [--session <name> | --tab-id <id>] [--json]
+  surf semantic.filter <goal> [--top <1-12>] [--threshold filter=<0-1>] [--session <name> | --tab-id <id>] [--json]
+  surf semantic.act <goal> [--max-steps <1-8>] [--allow-write] [--allow-ref <ref>...] [--input <name=value>...] [--threshold <name=value>...] [--session <name> | --tab-id <id>] [--json]
   surf semantic auth set|status|clear
 
-Semantic commands send a bounded, value-free page observation to TypeSafe. semantic.act allows only same-origin navigation, fixed scroll/wait actions, and (with --allow-write) clicks/fills. --allow-write authorizes mutation-capable clicks, including submit/purchase/delete/send/publish; repeatable --allow-ref narrows this authority.`;
+Semantic commands send a bounded, value-free page observation to TypeSafe. semantic.act allows only same-origin navigation, fixed scroll/wait actions, and (with --allow-write) clicks/fills. --allow-write authorizes mutation-capable clicks, including submit/purchase/delete/send/publish; repeatable --allow-ref narrows this authority. Repeatable --threshold overrides applicable confidence thresholds for this run only; defaults remain safer and write authority is unchanged. Names: find, filter, verify-positive, verify-negative, prerequisite-supported, prerequisite-blocked, write, exact-ref-write.`;
 
 function normalizeSemanticArgs(argv) {
   if (argv[0] !== "semantic") return argv;
@@ -39,14 +56,14 @@ function parseSemanticArgs(argv) {
     return { command, json: args.includes("--json") };
   }
   if (!["semantic.find", "semantic.verify", "semantic.filter", "semantic.act"].includes(command)) throw new Error(`unknown semantic command: ${command}`);
-  const result = { command, json: false, allowWrite: false, allowRefs: [], inputs: {}, maxSteps: SEMANTIC_POLICY.limits.defaultSteps };
+  const result = { command, json: false, allowWrite: false, allowRefs: [], inputs: {}, thresholds: {}, maxSteps: SEMANTIC_POLICY.limits.defaultSteps };
   const positionals = [];
   for (let i = 1; i < args.length; i++) {
     const arg = args[i];
     if (arg === "--json") result.json = true;
     else if (arg === "--no-wait") result.noWait = true;
     else if (arg === "--allow-write") result.allowWrite = true;
-    else if (["--session", "--tab-id", "--top", "--max-steps", "--allow-ref", "--input"].includes(arg)) {
+    else if (["--session", "--tab-id", "--top", "--max-steps", "--allow-ref", "--input", "--threshold"].includes(arg)) {
       const value = args[++i];
       if (!value || value.startsWith("--")) throw new Error(`${arg} requires a value`);
       if (arg === "--session") result.session = value;
@@ -54,6 +71,16 @@ function parseSemanticArgs(argv) {
       if (arg === "--top") result.top = positiveInteger(value, arg);
       if (arg === "--max-steps") result.maxSteps = positiveInteger(value, arg);
       if (arg === "--allow-ref") result.allowRefs.push(value);
+      if (arg === "--threshold") {
+        const separator = value.indexOf("=");
+        const name = separator > 0 ? value.slice(0, separator) : "";
+        const thresholdValue = separator > 0 ? value.slice(separator + 1) : "";
+        const key = THRESHOLD_KEYS[name];
+        if (!key) throw new Error(`unknown semantic threshold: ${name || value}`);
+        if (!/^(?:0(?:\.\d+)?|1(?:\.0+)?)$/.test(thresholdValue)) throw new Error(`--threshold ${name} must be a decimal between 0 and 1`);
+        if (Object.hasOwn(result.thresholds, key)) throw new Error(`duplicate --threshold: ${name}`);
+        result.thresholds[key] = Number(thresholdValue);
+      }
       if (arg === "--input") {
         const separator = value.indexOf("=");
         const name = separator > 0 ? value.slice(0, separator) : "";
@@ -71,6 +98,11 @@ function parseSemanticArgs(argv) {
   if (result.maxSteps > SEMANTIC_POLICY.limits.maxSteps) throw new Error(`--max-steps must not exceed ${SEMANTIC_POLICY.limits.maxSteps}`);
   if (Object.keys(result.inputs).length > SEMANTIC_POLICY.limits.inputSlots) throw new Error(`--input supports at most ${SEMANTIC_POLICY.limits.inputSlots} slots`);
   if (result.allowRefs.length && !result.allowWrite) throw new Error("--allow-ref requires --allow-write");
+  for (const name of Object.keys(THRESHOLD_KEYS)) {
+    if (Object.hasOwn(result.thresholds, THRESHOLD_KEYS[name]) && !COMMAND_THRESHOLD_KEYS[command].has(name)) {
+      throw new Error(`--threshold ${name} does not apply to ${command}`);
+    }
+  }
   result.goal = positionals[0].trim();
   return result;
 }
@@ -81,6 +113,13 @@ function positiveInteger(value, flag) {
   return parsed;
 }
 
+function interactiveCandidateState(state) {
+  const projected = {};
+  if (state?.checked === true || state?.checked === false || state?.checked === "mixed") projected.checked = state.checked;
+  if (state?.selected === true || state?.selected === false) projected.selected = state.selected;
+  return Object.keys(projected).length ? projected : undefined;
+}
+
 function providerState(observation) {
   let origin;
   try { origin = new URL(observation.identity.fullUrl).origin; } catch { throw new Error("semantic observation has an invalid page URL"); }
@@ -89,9 +128,27 @@ function providerState(observation) {
     title: observation.page.title,
     readyState: observation.page.readyState,
     modals: observation.page.modals,
-    candidates: observation.candidates.map(({ ref, role, name, type, nearbyText }) => ({ id: ref, role, name, type, text: nearbyText })),
+    candidates: observation.candidates.map(({ ref, role, name, type, nearbyText, state }) => {
+      const interactiveState = interactiveCandidateState(state);
+      return { id: ref, role, name, type, text: nearbyText, ...(interactiveState ? { state: interactiveState } : {}) };
+    }),
     chunks: observation.chunks.map(({ id, text, refs = [] }) => ({ id, text, refs })),
   };
+}
+
+function semanticProjectionHash(state) {
+  return crypto.createHash("sha256").update(JSON.stringify(state)).digest("hex");
+}
+
+function observedCandidateStateTransition(observation, before) {
+  if (!before) return false;
+  if (observation.identity.fullUrl !== before.fullUrl || observation.identity.documentToken !== before.documentToken) return false;
+  const candidate = observation.candidates.find((item) =>
+    item.ref === before.ref && item.role === before.role && item.name === before.name && item.type === before.type);
+  const after = interactiveCandidateState(candidate?.state);
+  if (!after) return false;
+  return (before.state.checked !== undefined && after.checked !== undefined && before.state.checked !== after.checked) ||
+    (before.state.selected !== undefined && after.selected !== undefined && before.state.selected !== after.selected);
 }
 
 function canonicalSameOriginDestination(candidate, fullUrl) {
@@ -203,6 +260,33 @@ function confirmedActionResponse(response) {
   throw error;
 }
 
+function semanticStatesFromPageContent(pageContent) {
+  const states = new Map();
+  if (typeof pageContent !== "string") return states;
+  for (const line of pageContent.split("\n")) {
+    const ref = line.match(/\[(e\d+)\]/)?.[1];
+    if (!ref) continue;
+    const state = {};
+    if (line.includes("[checked=mixed]")) state.checked = "mixed";
+    else if (line.includes("[checked]")) state.checked = true;
+    else if (line.includes("[unchecked]")) state.checked = false;
+    if (line.includes("[not-selected]")) state.selected = false;
+    else if (line.includes("[selected]")) state.selected = true;
+    if (Object.keys(state).length) states.set(ref, state);
+  }
+  return states;
+}
+
+function semanticStateEvidence(candidate) {
+  const markers = [];
+  if (candidate.state?.checked !== undefined) {
+    markers.push(candidate.state.checked === "mixed" ? "[checked=mixed]" : candidate.state.checked ? "[checked]" : "[unchecked]");
+  }
+  if (candidate.state?.selected !== undefined) markers.push(candidate.state.selected ? "[selected]" : "[not-selected]");
+  const name = candidate.name ? ` "${candidate.name.replaceAll('"', '\\"')}"` : "";
+  return `${candidate.role || "control"}${name} ${markers.join(" ")}`.slice(0, 240);
+}
+
 function semanticObservationFrom(response) {
   const text = unwrapResponse(response);
   let envelope;
@@ -220,17 +304,70 @@ function semanticObservationFrom(response) {
   ) {
     throw new Error("browser returned an invalid semantic observation");
   }
-  return observation;
+  const pageStates = semanticStatesFromPageContent(envelope.pageContent);
+  const addedState = [];
+  const candidates = observation.candidates.map((candidate) => {
+    const fallback = pageStates.get(candidate.ref);
+    if (!fallback) return candidate;
+    const state = { ...fallback, ...candidate.state };
+    if (JSON.stringify(state) === JSON.stringify(candidate.state)) return candidate;
+    const enriched = { ...candidate, state };
+    addedState.push(enriched);
+    return enriched;
+  });
+  if (!addedState.length) return observation;
+  const addedByRef = new Map(addedState.map((candidate) => [candidate.ref, candidate]));
+  const chunks = observation.chunks.map((chunk) => {
+    const evidence = (chunk.refs || []).flatMap((ref) => {
+      const candidate = addedByRef.get(ref);
+      return candidate ? [semanticStateEvidence(candidate)] : [];
+    });
+    if (!evidence.length) return chunk;
+    return { ...chunk, text: `${chunk.text}\n${evidence.join(" ")}`.slice(0, 1_024) };
+  });
+  return { ...observation, candidates, chunks };
 }
 
 function logicalWriteIdentity(observation, action, candidate) {
-  return JSON.stringify([
-    action.kind,
-    observation.identity.fullUrl,
-    candidate.ref,
-    candidate.role,
-    candidate.name,
-  ]);
+  return {
+    base: JSON.stringify([
+      action.kind,
+      observation.identity.fullUrl,
+      candidate.role,
+      candidate.type,
+      candidate.name,
+      action.url || canonicalSameOriginDestination(candidate, observation.identity.fullUrl),
+      action.kind === "fill" ? action.slot : null,
+    ]),
+    context: normalizedSemanticPart(candidate.nearbyText).slice(0, 240),
+  };
+}
+
+function writeWasSpent(observation, action, candidate, spentWrites) {
+  const identity = logicalWriteIdentity(observation, action, candidate);
+  const spent = spentWrites.filter((item) => item.base === identity.base);
+  if (!spent.length) return false;
+  if (spent.some((item) => item.context === identity.context)) return true;
+  const currentContexts = observation.candidates
+    .filter((item) => {
+      if (action.kind === "click" && !CLICK_ROLES.has(item.role)) return false;
+      if (action.kind === "fill" && !isEditable(item)) return false;
+      return logicalWriteIdentity(observation, { ...action, ref: item.ref }, item).base === identity.base;
+    })
+    .map((item) => normalizedSemanticPart(item.nearbyText).slice(0, 240));
+  return spent.some((item) => currentContexts.filter((context) => context === item.context).length !== 1);
+}
+
+function spendWrite(spentWrites, identity) {
+  if (!spentWrites.some((item) => item.base === identity.base && item.context === identity.context)) {
+    spentWrites.push(identity);
+  }
+}
+
+function semanticErrorCode(error, fallback) {
+  return typeof error?.code === "string" && /^[A-Za-z0-9_]{1,64}$/.test(error.code)
+    ? error.code
+    : fallback;
 }
 
 function isEditable(candidate) {
@@ -252,7 +389,7 @@ function takeActionVariants(groups, capacity) {
   return selected;
 }
 
-function buildActions(observation, inputs, allowWrite, allowRefs = [], spentWrites = new Set()) {
+function buildActions(observation, inputs, allowWrite, allowRefs = [], spentWrites = []) {
   const fixedActions = [
     ...SEMANTIC_POLICY.scrolls.map((direction) => ({ id: `scroll:${direction}`, kind: "scroll", direction })),
     ...SEMANTIC_POLICY.waitsMs.map((durationMs) => ({ id: `wait:${durationMs}`, kind: "wait", durationMs })),
@@ -264,7 +401,7 @@ function buildActions(observation, inputs, allowWrite, allowRefs = [], spentWrit
   const navigationGroups = new Map();
   for (const [index, candidate] of observation.candidates.entries()) {
     const url = canonicalSameOriginDestination(candidate, observation.identity.fullUrl);
-    if (!url) continue;
+    if (!url || url === observation.identity.fullUrl) continue;
     const current = navigationGroups.get(url);
     const ranked = { ...candidate, index };
     if (!current || concreteCandidateOrder(ranked, current) < 0) navigationGroups.set(url, ranked);
@@ -282,12 +419,12 @@ function buildActions(observation, inputs, allowWrite, allowRefs = [], spentWrit
     for (const candidate of writeCandidates) {
       if (CLICK_ROLES.has(candidate.role)) {
         const action = { id: `click:${candidate.ref}`, kind: "click", ref: candidate.ref };
-        if (!spentWrites.has(logicalWriteIdentity(observation, action, candidate))) mandatoryWrites.push(action);
+        if (!writeWasSpent(observation, action, candidate, spentWrites)) mandatoryWrites.push(action);
       } else if (isEditable(candidate)) {
         const slot = Object.keys(inputs)[0];
         if (slot) {
           const action = { id: `fill:${candidate.ref}:${slot}`, kind: "fill", ref: candidate.ref, slot };
-          if (!spentWrites.has(logicalWriteIdentity(observation, action, candidate))) mandatoryWrites.push(action);
+          if (!writeWasSpent(observation, action, candidate, spentWrites)) mandatoryWrites.push(action);
         }
       }
     }
@@ -302,7 +439,7 @@ function buildActions(observation, inputs, allowWrite, allowRefs = [], spentWrit
       for (const candidate of fillCandidates) {
         if (mandatoryWrites.some((action) => action.kind === "fill" && action.ref === candidate.ref && action.slot === slot)) continue;
         const action = { id: `fill:${candidate.ref}:${slot}`, kind: "fill", ref: candidate.ref, slot };
-        if (!spentWrites.has(logicalWriteIdentity(observation, action, candidate))) additionalFills.push(action);
+        if (!writeWasSpent(observation, action, candidate, spentWrites)) additionalFills.push(action);
       }
     }
     const required = [...fixedActions, ...mandatoryWrites];
@@ -321,7 +458,7 @@ function buildActions(observation, inputs, allowWrite, allowRefs = [], spentWrit
     if (allowWrite) {
       if (CLICK_ROLES.has(candidate.role)) {
         const action = { id: `click:${candidate.ref}`, kind: "click", ref: candidate.ref };
-        if (!spentWrites.has(logicalWriteIdentity(observation, action, candidate))) {
+        if (!writeWasSpent(observation, action, candidate, spentWrites)) {
           const group = canonicalSameOriginDestination(candidate, observation.identity.fullUrl)
             ? navigationClickActions
             : controlClickActions;
@@ -331,7 +468,7 @@ function buildActions(observation, inputs, allowWrite, allowRefs = [], spentWrit
       if (isEditable(candidate)) {
         for (const slot of Object.keys(inputs)) {
           const action = { id: `fill:${candidate.ref}:${slot}`, kind: "fill", ref: candidate.ref, slot };
-          if (!spentWrites.has(logicalWriteIdentity(observation, action, candidate))) fillActions.push(action);
+          if (!writeWasSpent(observation, action, candidate, spentWrites)) fillActions.push(action);
         }
       }
     }
@@ -367,11 +504,14 @@ async function runBrowserSemantic(options, { request, evaluate, now = () => perf
   const remaining = () => Math.max(0, Math.floor(deadline - now()));
   let providerCalls = 0;
   const evaluator = async (state, questions, providerOptions = {}) => {
-    if (++providerCalls > SEMANTIC_POLICY.limits.providerCalls) throw new Error("semantic provider-call budget exhausted");
-    if (remaining() < 1) throw new Error("semantic wall-clock budget exhausted");
+    if (providerCalls >= SEMANTIC_POLICY.limits.providerCalls) throw new SemanticError("provider_call_budget_exhausted", "semantic provider-call budget exhausted");
+    if (remaining() < 1) throw new SemanticError("wall_time_budget_exhausted", "semantic wall-clock budget exhausted");
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), Math.min(SEMANTIC_POLICY.timeoutMs, remaining()));
-    try { return await evaluate(state, questions, { ...providerOptions, signal: controller.signal }); }
+    try {
+      providerCalls++;
+      return await evaluate(state, questions, { ...providerOptions, signal: controller.signal });
+    }
     finally { clearTimeout(timer); }
   };
   let designatedIdentity;
@@ -390,6 +530,27 @@ async function runBrowserSemantic(options, { request, evaluate, now = () => perf
     }
     return observation;
   };
+  const settleAfterWrite = async (stateTransition) => {
+    let settledObservation = await observe();
+    let settledState = providerState(settledObservation);
+    if (observedCandidateStateTransition(settledObservation, stateTransition)) {
+      return { observation: settledObservation, state: settledState, stateTransitionObserved: true };
+    }
+    let stateTransitionObserved = false;
+    for (const waitMs of POST_WRITE_SETTLE_WAITS_MS) {
+      const timeoutMs = remaining();
+      if (timeoutMs < 1) break;
+      await request("wait", { duration: Math.min(waitMs, timeoutMs) / 1_000 }, timeoutMs, designatedIdentity);
+      if (remaining() < 1) break;
+      settledObservation = await observe();
+      settledState = providerState(settledObservation);
+      if (observedCandidateStateTransition(settledObservation, stateTransition)) {
+        stateTransitionObserved = true;
+        break;
+      }
+    }
+    return { observation: settledObservation, state: settledState, stateTransitionObserved };
+  };
   let observation = await observe();
   let state = providerState(observation);
   if (options.command === "semantic.find") {
@@ -398,7 +559,7 @@ async function runBrowserSemantic(options, { request, evaluate, now = () => perf
       ...state,
       candidates: logicalCandidates.map(({ id, role, name, type, text }) => ({ id, role, name, type, text })),
     };
-    const result = await find({ state: logicalState, goal: options.goal, candidates: logicalCandidates, evaluate: evaluator });
+    const result = await find({ state: logicalState, goal: options.goal, candidates: logicalCandidates, thresholds: options.thresholds, evaluate: evaluator });
     const logicalCandidate = result.candidate;
     const concrete = logicalCandidate?.concreteCandidates?.[0] || null;
     return {
@@ -417,27 +578,86 @@ async function runBrowserSemantic(options, { request, evaluate, now = () => perf
       } : null,
     };
   }
-  if (options.command === "semantic.verify") return verify({ state, outcome: options.goal, evidence: state.chunks, evaluate: evaluator });
+  if (options.command === "semantic.verify") return verify({ state, outcome: options.goal, evidence: state.chunks, thresholds: options.thresholds, evaluate: evaluator });
   if (options.command === "semantic.filter") {
-    const result = await filter({ state, goal: options.goal, chunks: state.chunks, top: options.top, evaluate: evaluator });
+    const result = await filter({ state, goal: options.goal, chunks: state.chunks, top: options.top, thresholds: options.thresholds, evaluate: evaluator });
     const relevantRefs = new Set(result.chunks.flatMap((chunk) => chunk.refs || []));
     return { ...result, page: { origin: state.origin, title: state.title, readyState: state.readyState, modals: state.modals }, candidates: state.candidates.filter((candidate) => relevantRefs.has(candidate.id)), omitted: observation.omitted };
   }
 
   const trace = [];
   let staleRefreshes = 0;
-  const spentWrites = new Set();
+  const spentWrites = [];
   let identical = 0;
-  let previousHash = crypto.createHash("sha256").update(JSON.stringify(state)).digest("hex");
+  let previousHash = semanticProjectionHash(state);
   for (let step = 1; step <= options.maxSteps; step++) {
     if (remaining() < 1) return { status: "stopped", stopReason: "time_budget", trace, providerCalls };
-    const actions = buildActions(observation, options.inputs, options.allowWrite, options.allowRefs, spentWrites);
-    const choice = await chooseAction({ state, goal: options.goal, actions, origin: state.origin, allowWrite: options.allowWrite, allowRefs: options.allowRefs, inputSlots: Object.keys(options.inputs), evaluate: evaluator });
-    if (choice.status !== "selected") return { status: "stopped", stopReason: "uncertain", trace, providerCalls, appliedThreshold: choice.appliedThreshold, decision: choice.decision, logicalDecision: choice.logicalDecision, concreteDecision: choice.concreteDecision, model: choice.model, usage: choice.usage };
+    let choice;
+    try {
+      let actions = buildActions(observation, options.inputs, options.allowWrite, options.allowRefs, spentWrites);
+      for (let retries = 0; ; retries++) {
+        try {
+          choice = await chooseAction({ state, goal: options.goal, actions, origin: state.origin, allowWrite: options.allowWrite, allowRefs: options.allowRefs, inputSlots: Object.keys(options.inputs), thresholds: options.thresholds, evaluate: evaluator });
+          break;
+        } catch (error) {
+          if (error?.code !== "provider_invalid_response" || retries >= SEMANTIC_POLICY.limits.invalidActionDecisionRetries) throw error;
+          if (actions.length > SEMANTIC_POLICY.limits.directActionRetryChoices) {
+            const relevant = await filter({
+              state,
+              goal: `Find page regions containing controls for the next action toward: ${options.goal}`,
+              chunks: state.chunks,
+              top: SEMANTIC_POLICY.limits.invalidActionDecisionRegionTop,
+              thresholds: options.thresholds,
+              evaluate: evaluator,
+            });
+            if (relevant.status === "filtered") {
+              const refs = new Set(relevant.chunks.flatMap((chunk) => chunk.refs || []));
+              actions = actions.filter((action) => {
+                const ref = action.ref || action.concreteRef;
+                return !ref || refs.has(ref);
+              });
+            }
+          }
+        }
+      }
+    } catch (error) {
+      return { status: "stopped", stopReason: "decision_failed", errorCode: semanticErrorCode(error, "decision_failed"), trace, providerCalls };
+    }
+    if (choice.status !== "selected") return {
+      status: "stopped",
+      stopReason: choice.status === "blocked" ? "prerequisite_blocked" : "uncertain",
+      trace,
+      providerCalls,
+      appliedThreshold: choice.appliedThreshold,
+      decision: choice.decision,
+      logicalDecision: choice.logicalDecision,
+      concreteDecision: choice.concreteDecision,
+      prerequisiteStatus: choice.prerequisiteStatus,
+      prerequisiteThresholds: choice.prerequisiteThresholds,
+      prerequisiteDecision: choice.prerequisiteDecision,
+      prerequisiteEvidence: choice.prerequisiteEvidence,
+      prerequisiteEvidenceThreshold: choice.prerequisiteEvidenceThreshold,
+      prerequisiteEvidenceDecision: choice.prerequisiteEvidenceDecision,
+      model: choice.model,
+      usage: choice.usage,
+    };
+    if (remaining() < 1) return { status: "stopped", stopReason: "time_budget", trace, providerCalls };
     const action = choice.action;
     const actionCandidate = observation.candidates.find((item) => item.ref === action.ref);
     const writeIdentity = action.kind === "click" || action.kind === "fill"
       ? logicalWriteIdentity(observation, action, actionCandidate)
+      : null;
+    const preWriteState = action.kind === "click" ? interactiveCandidateState(actionCandidate?.state) : undefined;
+    const stateTransition = preWriteState
+      ? {
+          fullUrl: observation.identity.fullUrl,
+          documentToken: observation.identity.documentToken,
+          ref: actionCandidate.ref,
+          role: actionCandidate.role,
+          name: actionCandidate.name,
+          type: actionCandidate.type,
+          state: preWriteState,
+        }
       : null;
     const traceAction = { step, kind: action.kind, appliedThreshold: choice.appliedThreshold, logicalProbability: choice.decision.probability, ...(action.logicalIdentity ? { logicalIdentity: action.logicalIdentity } : {}), ...(action.ref ? { ref: action.ref } : {}), ...(action.concreteRef ? { concreteRef: action.concreteRef, concreteProbability: choice.decision.probability } : {}), ...(action.slot ? { slot: action.slot } : {}), ...(action.direction ? { direction: action.direction } : {}), ...(action.durationMs ? { durationMs: action.durationMs } : {}) };
     try { confirmedActionResponse(await executeAction(request, observation, action, options.inputs, remaining(), designatedIdentity)); }
@@ -452,27 +672,34 @@ async function runBrowserSemantic(options, { request, evaluate, now = () => perf
       return { status: "stopped", stopReason, trace, providerCalls };
     }
     trace.push({ ...traceAction, result: "executed" });
+    let stateTransitionObserved = false;
     try {
-      observation = await observe();
-      state = providerState(observation);
+      if (writeIdentity) {
+        ({ observation, state, stateTransitionObserved } = await settleAfterWrite(stateTransition));
+      } else {
+        observation = await observe();
+        state = providerState(observation);
+      }
     } catch {
       return { status: "stopped", stopReason: "outcome_unknown", trace, providerCalls };
     }
     let outcome;
     try {
-      outcome = await verify({ state, outcome: options.goal, evidence: state.chunks, evaluate: evaluator });
-    } catch {
-      return { status: "stopped", stopReason: "verification_failed", trace, providerCalls };
+      outcome = await verify({ state, outcome: options.goal, evidence: state.chunks, thresholds: options.thresholds, evaluate: evaluator });
+    } catch (error) {
+      return { status: "stopped", stopReason: "verification_failed", errorCode: semanticErrorCode(error, "verification_failed"), trace, providerCalls };
     }
     if (outcome.status === "satisfied") return { status: "complete", stopReason: "complete", trace, verification: outcome, providerCalls };
     if (action.kind === "click" || action.kind === "fill") {
-      if (outcome.status !== "not_satisfied") {
+      const verifiedIntermediate = stateTransitionObserved && outcome.decision.label === "not_satisfied";
+      if (outcome.status !== "not_satisfied" && !verifiedIntermediate) {
         return { status: "stopped", stopReason: "uncertain", trace, verification: outcome, providerCalls };
       }
-      spentWrites.add(writeIdentity);
+      if (verifiedIntermediate) trace[trace.length - 1].verification = "observed_state_transition";
+      spendWrite(spentWrites, writeIdentity);
       continue;
     }
-    const hash = crypto.createHash("sha256").update(JSON.stringify(state)).digest("hex");
+    const hash = semanticProjectionHash(state);
     identical = hash === previousHash ? identical + 1 : 0;
     previousHash = hash;
     if (identical >= SEMANTIC_POLICY.limits.identicalObservationHashes) return { status: "stopped", stopReason: "no_progress", trace, providerCalls };
