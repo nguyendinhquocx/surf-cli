@@ -1,4 +1,16 @@
 #!/usr/bin/env node
+const LAUNCH_PROBE_ARGUMENT = "--surf-native-host-launch-probe";
+const LAUNCH_PROBE_MARKER = "SURF_NATIVE_HOST_LAUNCH_PROBE_OK";
+
+if (process.argv.length === 3 && process.argv[2] === LAUNCH_PROBE_ARGUMENT) {
+  process.stdout.write(`${LAUNCH_PROBE_MARKER}\n`);
+  process.exit(0);
+}
+if (process.argv.length === 3 && process.argv[2] === `${LAUNCH_PROBE_ARGUMENT}-distro`) {
+  process.stdout.write(`${LAUNCH_PROBE_MARKER}:${JSON.stringify(process.env.WSL_DISTRO_NAME || null)}\n`);
+  process.exit(0);
+}
+
 const net = require("net");
 const fs = require("fs");
 const path = require("path");
