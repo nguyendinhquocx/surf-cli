@@ -2,20 +2,30 @@
 
 ## [Unreleased]
 
+## [2.20.0] - 2026-09-23
+
+### Highlights
+- Find and act on page elements with optional semantic browser commands, with explicit permission required for changes.
+- Run short, repeatable browser workflows from a file, including form entry and checks.
+- Set confidence thresholds per semantic command while keeping the safer defaults.
+- Install Surf's Windows Chrome connection from WSL more reliably, with better diagnosis when it fails.
+
 ### Added
-- **Per-run semantic confidence thresholds** - Semantic commands accept repeatable, command-specific `--threshold name=value` overrides while preserving safer defaults and existing write authorization. Applied thresholds are included in structured results, including the `semantic.act` prerequisite support and block gates.
-- **Bounded semantic workflow steps** - Semantic v1 workflow files can use closed `find`, same-origin `open`, `ensureChecked`, `fill`, one-shot `click`, and `assert` steps. Execution requires `--allow-semantic`, mutations additionally require `--allow-write`, and bounded private fill inputs can be read with `--inputs-stdin`. Validation and dry-run remain offline; model-derived writes retain the 0.95 gate, guarded identity, private attempt records, and no-replay-on-unknown behavior.
-- **Optional Jev semantic browser actions** - `semantic.find`, `semantic.verify`, and `semantic.filter` expose individual semantic decisions, while the bounded, goal-driven `semantic.act` loop repeatedly observes, chooses, safely acts, and verifies until complete or uncertain. These commands use compact value-free observations and confidence-gated TypeSafe decisions. Writes require explicit `--allow-write`, can be narrowed with repeatable `--allow-ref`, and are guarded against stale DOM identity. Broad writes retain the `0.95` threshold; an exact single-ref, single-action write uses the recorded `0.65` threshold. TypeSafe credentials use its shared user store with an environment override; existing commands remain provider-free.
+- **Semantic browser commands** - Use `semantic.find`, `semantic.verify`, and `semantic.filter` to locate and check elements, or `semantic.act` to work toward a goal. These optional commands use TypeSafe AI credentials; existing Surf commands do not need a provider. Changes to a page require `--allow-write` and can be limited with `--allow-ref`. Surf checks that the target has not changed before acting.
+- **Browser workflows** - Run short workflows with `find`, same-origin `open`, `ensureChecked`, `fill`, `click`, and `assert` steps. Workflows require `--allow-semantic`; changes also require `--allow-write`. Use `--inputs-stdin` for private form values. Validation and dry runs work offline.
+- **Adjustable confidence** - Set command-specific semantic confidence thresholds with repeatable `--threshold name=value` options. Defaults and write permissions remain in place, and structured output shows the thresholds used.
+
+### Changed
+- **Development dependencies** - Updated Biome, Chrome and Node.js types, Pi Subagents, Puppeteer, TypeBox, Vitest, Vite, and Zod.
 
 ### Fixed
-- **Dynamic semantic writes** - Successful dynamic writes now observe an adaptive, bounded hydration window before one verification, suppress replay across rerendered refs, and retain prior action trace when a later decision fails. Exact computed checked or selected transitions establish intermediate progress without relaxing verification for ordinary buttons or fills. One malformed action decision gets a bounded retry, narrowing large menus to relevant page regions first. Action decisions include bounded control descriptions and an independent prerequisite verdict so unavailable product variants stop before mutation. See [#316](https://github.com/nicobailon/surf-cli/issues/316).
-- **Semantic candidate confidence** - Equivalent navigation controls now share one logical choice without merging controls from different contexts. Direct navigation and explicitly authorized clicks remain distinct, bounded actions.
-- **Native connection troubleshooting** - Failed local `surf doctor` socket and native-host checks now explain how to enable extension Debug Mode and inspect the service-worker console.
+- **Dynamic pages** - Semantic actions wait briefly for a page to update before checking the result, without repeating a change when its outcome is uncertain. They keep the action history when a later step fails and stop before changes when a requested option is unavailable. See [#316](https://github.com/nicobailon/surf-cli/issues/316).
+- **Semantic navigation** - Equivalent navigation controls no longer appear as competing choices, while controls in different contexts remain separate.
+- **Connection troubleshooting** - When socket or native-host checks fail, `surf doctor` explains how to enable extension Debug Mode and inspect the service-worker console.
 - **`frame.diagnose` help** - Command-specific help now describes the diagnostic options and related frame commands without contacting Chrome. Thanks to [@gimbo](https://github.com/gimbo) for [#280](https://github.com/nicobailon/surf-cli/issues/280).
-- **`network.body` output** - `surf network.body <id>` now prints the captured CDP response body exactly, including empty and JSON-shaped text, while `--json` remains structured. Thanks to [@Ananasiy](https://github.com/Ananasiy) for [#291](https://github.com/nicobailon/surf-cli/pull/291).
-- **Published extension freshness** - npm packages now rebuild the extension before packing and CI verifies the packed runtime matches that build. Thanks to [@gimbo](https://github.com/gimbo) for [#279](https://github.com/nicobailon/surf-cli/issues/279) and [@hongyuatcufe](https://github.com/hongyuatcufe) for confirming the published artifact evidence.
-- **WSL Windows native host discovery** - Windows-browser installs from WSL now register and remove each browser's per-user native messaging host entry, while `surf doctor` validates the effective registry path. Windows tool lookup also handles WSL environments where interoperability executables are absent from `PATH`. Thanks to [@airtonix](https://github.com/airtonix) for [#290](https://github.com/nicobailon/surf-cli/issues/290).
-- **WSL native host launch validation** - Windows-browser installs from WSL now probe the generated wrapper before registration. If explicit distro selection fails, installation uses the Windows default only after confirming it is the installing distro. `surf doctor` probes only an exact, current Surf wrapper and skips modified or legacy scripts. Thanks to [@airtonix](https://github.com/airtonix) for the launch diagnosis in [#290](https://github.com/nicobailon/surf-cli/issues/290).
+- **`network.body` output** - `surf network.body <id>` prints the captured response exactly, including empty or JSON-shaped text; `--json` remains structured. Thanks to [@Ananasiy](https://github.com/Ananasiy) for [#291](https://github.com/nicobailon/surf-cli/pull/291).
+- **npm extension files** - Publishing rebuilds the extension so packages include current browser code. Thanks to [@gimbo](https://github.com/gimbo) for [#279](https://github.com/nicobailon/surf-cli/issues/279) and [@hongyuatcufe](https://github.com/hongyuatcufe) for confirming the issue.
+- **Windows Chrome from WSL** - Installation now registers the native host for each Windows browser, even when Windows programs are absent from the WSL `PATH`. It tests the generated launcher before registration and checks that a fallback starts the intended distro. `surf doctor` checks the registration and tests only unmodified Surf launchers. Thanks to [@airtonix](https://github.com/airtonix) for [#290](https://github.com/nicobailon/surf-cli/issues/290).
 
 ## [2.19.0] - 2026-09-10
 
