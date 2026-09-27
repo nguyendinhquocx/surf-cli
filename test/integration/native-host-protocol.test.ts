@@ -674,6 +674,90 @@ describe("native host protocol integration", () => {
     expect(host.stderr()).toBe("");
   });
 
+  it("routes page text, page state, and JavaScript through the selected frame until frame.main", async () => {
+    const host = await startHostHarness();
+    const invoke = async (
+      tool: string,
+      args: Record<string, unknown>,
+      type: string,
+      response: NativeMessage = { success: true },
+      expectError = false,
+    ) => {
+      // A new connection per command, like separate CLI runs, so frame state must outlive it.
+      const transport = await openClientTransport({
+        kind: "local",
+        connectionOptions: host.socketPath,
+      });
+      const clientResponse = transport.request({
+        type: "tool_request",
+        method: "execute_tool",
+        params: { tool, args },
+        id: tool,
+      });
+      const extensionRequest = await host.waitForMessage(
+        (message) => message.type === type,
+        `${type} for ${tool}`,
+      );
+      host.send({ id: extensionRequest.id, ...response });
+      expect((await clientResponse).error !== undefined).toBe(expectError);
+      await transport.close();
+      return extensionRequest;
+    };
+
+    const switched = await invoke("frame.switch", { index: 0 }, "FRAME_SWITCH", {
+      frameId: 7,
+      url: "https://example.test/frame",
+    });
+    expect(switched.frameId).toBeUndefined();
+
+    const selectedFrameRequests = [
+      await invoke("page.text", {}, "GET_PAGE_TEXT", { text: "frame text" }),
+      await invoke("page.state", {}, "PAGE_STATE"),
+      await invoke("js", { code: "return 7" }, "EXECUTE_JAVASCRIPT", { success: true, result: 7 }),
+    ];
+    for (const request of selectedFrameRequests) {
+      expect(request.frameId).toBe(7);
+    }
+    const explicitFrameRequest = await invoke(
+      "js",
+      { code: "return 11", semanticFrameId: 11 },
+      "EXECUTE_JAVASCRIPT",
+      { success: true, result: 11 },
+    );
+    expect(explicitFrameRequest.frameId).toBe(11);
+
+    await invoke(
+      "page.text",
+      {},
+      "GET_PAGE_TEXT",
+      {
+        error: "Selected frame is gone",
+        errorCode: "frame_context_reset",
+        errorDetails: { reason: "missing-frame" },
+      },
+      true,
+    );
+    const requestAfterReset = await invoke("page.state", {}, "PAGE_STATE");
+    expect(requestAfterReset.frameId).toBeUndefined();
+
+    await invoke("frame.switch", { index: 0 }, "FRAME_SWITCH", {
+      frameId: 7,
+      url: "https://example.test/frame",
+    });
+
+    await invoke("frame.main", {}, "FRAME_MAIN");
+
+    const mainFrameRequests = [
+      await invoke("page.text", {}, "GET_PAGE_TEXT", { text: "main text" }),
+      await invoke("page.state", {}, "PAGE_STATE"),
+      await invoke("js", { code: "return 0" }, "EXECUTE_JAVASCRIPT", { success: true, result: 0 }),
+    ];
+    for (const request of mainFrameRequests) {
+      expect(request.frameId).toBeUndefined();
+    }
+    expect(host.stderr()).toBe("");
+  });
+
   it("stages authenticated remote uploads before fake extension dispatch", async () => {
     const reservation = net.createServer();
     await new Promise<void>((resolve) => reservation.listen(0, "127.0.0.1", resolve));
@@ -1108,8 +1192,79 @@ describe("native host protocol integration", () => {
     }
   });
 
-  it("preserves primary output and releases same-tab admission after an optional screenshot error", async () => {
-    const host = await startHostHarness();
+  it("replies before a local auto-screenshot and holds the tab until the file is written", async () => {
+    const surfTmp = fs.mkdtempSync(path.join(os.tmpdir(), "surf-auto-local-"));
+    tempDirs.push(surfTmp);
+    const host = await startHostHarness({ SURF_TMP: surfTmp });
+    const clickClient = await openClientTransport({
+      kind: "local",
+      connectionOptions: host.socketPath,
+    });
+    const clickResponse = clickClient.request({
+      type: "tool_request",
+      method: "execute_tool",
+      params: { tool: "click", args: { selector: "#go", autoScreenshot: true } },
+      tabId: 1,
+      id: "auto-screenshot-reply-first",
+    });
+    const click = await host.waitForMessage(
+      (message) => message.type === "CLICK_SELECTOR",
+      "reply-first primary action",
+    );
+    host.send({ id: click.id, success: true });
+    const replied = await clickResponse;
+    expect(replied.error).toBeUndefined();
+    const pendingPath = replied.result.content[0].text.match(
+      /^OK\nScreenshot \(pending\): (.+)$/,
+    )?.[1];
+    expect(pendingPath).toBeTruthy();
+    expect(fs.existsSync(pendingPath)).toBe(false);
+    // The CLI exits once it has the reply; that must not cancel the capture.
+    await clickClient.close();
+
+    const nextClient = await openClientTransport({
+      kind: "local",
+      connectionOptions: host.socketPath,
+    });
+    try {
+      const nextResponse = nextClient.request({
+        type: "tool_request",
+        method: "execute_tool",
+        params: { tool: "page.read", args: {} },
+        tabId: 1,
+        id: "same-tab-during-auto-screenshot",
+      });
+      const screenshot = await host.waitForMessage(
+        (message) => message.type === "EXECUTE_SCREENSHOT",
+        "background screenshot",
+      );
+      await host.expectNoMessage(
+        (message) => message.type === "READ_PAGE",
+        "same-tab request while the screenshot is pending",
+      );
+      host.send({
+        id: screenshot.id,
+        base64: Buffer.from("auto-png").toString("base64"),
+        width: 1,
+        height: 1,
+      });
+
+      const next = await host.waitForMessage(
+        (message) => message.type === "READ_PAGE",
+        "same-tab request after the screenshot",
+      );
+      expect(fs.readFileSync(pendingPath, "utf8")).toBe("auto-png");
+      host.send({ id: next.id, pageContent: "next request admitted" });
+      expect((await nextResponse).error).toBeUndefined();
+    } finally {
+      await nextClient.close();
+    }
+  });
+
+  it("releases the tab and writes no file when a background auto-screenshot fails", async () => {
+    const surfTmp = fs.mkdtempSync(path.join(os.tmpdir(), "surf-auto-local-fail-"));
+    tempDirs.push(surfTmp);
+    const host = await startHostHarness({ SURF_TMP: surfTmp });
     const transport = await openClientTransport({
       kind: "local",
       connectionOptions: host.socketPath,
@@ -1127,16 +1282,15 @@ describe("native host protocol integration", () => {
         "timed screenshot primary action",
       );
       host.send({ id: click.id, success: true });
+      const settled = await primaryResponse;
+      expect(settled.error).toBeUndefined();
+      expect(settled.result.content[0].text).toMatch(/^OK\nScreenshot \(pending\): /);
+
       const screenshot = await host.waitForMessage(
         (message) => message.type === "EXECUTE_SCREENSHOT",
         "timed optional screenshot",
       );
       host.send({ id: screenshot.id, error: "Screenshot capture timed out after 5000ms" });
-
-      const settled = await primaryResponse;
-      expect(settled.error).toBeUndefined();
-      expect(settled.result.content[0].text).toContain("OK");
-      expect(settled.result.content[0].text).toContain("Screenshot capture timed out after 5000ms");
 
       const nextResponse = transport.request({
         type: "tool_request",
@@ -1151,6 +1305,7 @@ describe("native host protocol integration", () => {
       );
       host.send({ id: next.id, pageContent: "next request admitted" });
       expect((await nextResponse).error).toBeUndefined();
+      expect(fs.readdirSync(surfTmp).filter((entry) => entry.includes("pi-auto-"))).toEqual([]);
     } finally {
       await transport.close();
     }
@@ -1855,6 +2010,39 @@ describe("native host protocol integration", () => {
     );
     host.send({ id: nextRequest.id, tabs: [] });
     second.destroy();
+  });
+
+  it("truncates a long page.read tree and saves the full tree to a private file", async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "surf-read-spill-"));
+    tempDirs.push(tmp);
+    const host = await startHostHarness({ SURF_TMP: tmp });
+    const tree = Array.from({ length: 3000 }, (_, i) => `button "Item ${i}" [e${i + 1}]`).join(
+      "\n",
+    );
+    const read = async (args: string[]) => {
+      const cliPromise = runCli(["page.read", "--no-text", ...args], host.socketPath);
+      const request = await host.waitForMessage(
+        (message) => message.type === "READ_PAGE",
+        "READ_PAGE",
+      );
+      host.send({ id: request.id, pageContent: tree });
+      return cliPromise;
+    };
+
+    const result = await read([]);
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain('button "Item 0" [e1]');
+    expect(result.stdout).not.toContain('"Item 2999"');
+    expect(Buffer.byteLength(result.stdout)).toBeLessThan(50_500);
+    const fullPath = result.stdout.match(/Full tree: (\S+)\./)?.[1] as string;
+    expect(fs.readFileSync(fullPath, "utf8")).toBe(tree);
+    if (process.platform !== "win32") {
+      expect(fs.statSync(fullPath).mode & 0o777).toBe(0o600);
+    }
+
+    const capped = await read(["--max-bytes", "1000"]);
+    expect(Buffer.byteLength(capped.stdout)).toBeLessThan(1_500);
+    expect(capped.stdout).toContain("Full tree: ");
   });
 
   it("propagates extension errors through the native host to CLI stderr", async () => {

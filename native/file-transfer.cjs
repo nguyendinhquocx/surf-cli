@@ -302,6 +302,8 @@ function isPlainObject(value) {
 }
 
 function rewriteTransferPaths(value, rewrites, depth = 0, seen = new Set(), budget = { remaining: 1000 }) {
+  // The walk budget must not fail a large response that has nothing to rewrite.
+  if (rewrites.length === 0) return value;
   if (budget.remaining-- <= 0 || depth > 8) throw transferError("response exceeds path rewrite limits", "SURF_TRANSFER_RESPONSE_LIMIT");
   if (value === null || value === undefined) return value;
   if (typeof value === "string") {
@@ -323,7 +325,7 @@ function rewriteTransferPaths(value, rewrites, depth = 0, seen = new Set(), budg
   return result;
 }
 
-const AUTO_SCREENSHOT_TOOLS = Object.freeze(["click", "type", "key", "smart_type", "form.fill", "form_input", "drag", "hover", "scroll", "scroll.top", "scroll.bottom", "scroll.to", "dialog.accept", "dialog.dismiss", "js", "eval"]);
+const AUTO_SCREENSHOT_TOOLS = Object.freeze(["click", "type", "key", "smart_type", "form.fill", "form_input", "drag", "hover", "scroll", "scroll.top", "scroll.bottom", "scroll.to", "dialog.accept", "dialog.dismiss", "eval"]);
 function generatedClientPath(prefix, extension) {
   return path.join(os.tmpdir(), `surf-${prefix}-${crypto.randomBytes(12).toString("hex")}${extension}`);
 }

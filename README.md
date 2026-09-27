@@ -252,11 +252,13 @@ surf tab.reload --hard
 
 ```bash
 surf read                           # Accessibility tree + visible text content
+surf read --all                     # Every visible element, including offscreen
+surf read --include-hidden          # Also hidden and aria-hidden elements
 surf read --no-text                 # Accessibility tree only (no text)
 surf read --depth 3                 # Limit tree depth (smaller output)
 surf read --compact                 # Remove empty structural elements
 surf read --depth 3 --compact       # Both (60% smaller output)
-surf read --max-bytes 2000          # Cap visible text on a UTF-8 byte boundary
+surf read --max-bytes 2000          # Cap the tree and visible text at 2000 bytes
 surf page.text                      # Raw text content only
 surf page.html                      # Rendered document HTML
 surf page.html --strip-scripts > artifact.html # Save a safe static Claude artifact
@@ -264,7 +266,9 @@ surf page.save --selector "#artifact" --strip-scripts --output artifact.html # S
 surf page.state                     # Modals, loading state, scroll position
 ```
 
-Use `surf page.html --strip-scripts` after the page loads when you need a static export of a Claude artifact or other rendered DOM. Use `--selector <css>` to export one element. Both commands target the active frame when `frame.switch` is active.
+Use `surf page.html --strip-scripts` after the page loads when you need a static export of a Claude artifact or other rendered DOM. Use `--selector <css>` to export one element.
+
+Trees over 50,000 bytes, or over `--max-bytes`, end with a note giving the path of a private file with the full tree. Remote clients get the note without a path; narrow with `--ref` or `--depth` instead.
 
 Element refs (`e1`, `e2`, `e3`...) are stable identifiers from the accessibility tree - semantic, predictable, and resilient to DOM changes.
 
@@ -297,14 +301,23 @@ surf frame.switch --index 0         # Switch to first iframe
 surf frame.switch --name "payment"  # Switch by frame name
 surf frame.switch --selector "#checkout-frame"  # Switch by CSS selector
 
-# Now all commands target the iframe
+# Page and interaction commands now target the iframe
 surf read                           # Read iframe content
+surf page.text                      # Read raw iframe text
+surf page.state                     # Inspect iframe UI state
 surf click e5                       # Click in iframe
 surf type "4242" --into "#card-number"
 surf locate.role button --action click
 
 surf frame.main                     # Return to main page
 ```
+
+| Command | After `frame.switch` |
+| --- | --- |
+| `read`, `page.text`, `page.state`, `click`, `type`, `select`, `locate.*` | Use the selected frame, including reachable out-of-process iframes. |
+| `js` | Fails with `UNSUPPORTED_FRAME_EXECUTION` instead of running in the main frame. Run `frame.main` first. |
+| `frame.js --id <id>` | Ignores `frame.switch` and takes a CDP frame ID, so it cannot reach frames missing from the CDP tree. |
+| Tab, window, browser, and network commands | Unaffected. |
 
 When a selector never matches, `frame.diagnose` shows the three frame views side by side (DOM `<iframe>` elements, the extension's frames with content-script reachability, and the CDP frame tree) and explains the mismatches: `srcdoc`/`about:blank` frames (matched to their CDP frame by `name`/`id`), sandboxes without `allow-scripts`, cross-origin frames, out-of-process frames that the CDP tree does not list (`frame.js` cannot reach them; `frame.switch` and `page.read` can when the content script answers), and frames still loading. The DOM inventory walks open shadow roots, so frames rendered by custom elements are listed with their `shadowHost` path. The text report abbreviates long frame URLs; `--json` keeps them whole.
 
@@ -368,7 +381,7 @@ surf snap                                   # Alias for screenshot
 
 To disable auto-save globally, set `autoSaveScreenshots: false` in `surf.json`.
 
-Actions like `click`, `type`, and `scroll` automatically capture a screenshot after execution - no extra command needed.
+Actions like `click`, `type`, and `scroll` automatically capture a screenshot after execution - no extra command needed. The command replies as soon as the action finishes with `Screenshot (pending): <path>`, and the file appears at that path shortly after. The next command on the same tab waits until it is written. Remote clients receive the file before the reply.
 
 ### Tabs
 

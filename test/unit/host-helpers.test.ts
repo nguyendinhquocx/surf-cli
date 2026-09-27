@@ -210,6 +210,18 @@ describe("mapToolToMessage", () => {
       ).toMatchObject({ type: "READ_PAGE", tabId: 71, frameId: 4 });
     });
 
+    it("maps --all and --include-hidden to the all filter", () => {
+      const read = (args: Record<string, unknown>) =>
+        helpers.mapToolToMessage("page.read", args).options;
+      expect(read({})).toMatchObject({ filter: "interactive", includeHidden: false });
+      expect(read({ all: true })).toMatchObject({ filter: "all", includeHidden: false });
+      expect(read({ all: true, filter: "interactive" }).filter).toBe("interactive");
+      expect(read({ "include-hidden": true })).toMatchObject({
+        filter: "all",
+        includeHidden: true,
+      });
+    });
+
     it("throws when max-bytes is not a positive integer", () => {
       for (const bad of ["abc", "0", "-5", "12abc", "1.5", " ", ""]) {
         expect(() => helpers.mapToolToMessage("page.read", { "max-bytes": bad })).toThrow(

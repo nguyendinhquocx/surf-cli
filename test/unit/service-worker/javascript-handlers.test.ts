@@ -104,6 +104,23 @@ describe("JavaScript command handlers", () => {
     expect(result).toEqual({ output: "3" });
   });
 
+  it("refuses selected-frame execution instead of evaluating in the main frame", async () => {
+    const handleMessage = await loadHandleMessage();
+    const chrome = (globalThis as any).chrome;
+    mockRuntimeEvaluate(chrome);
+
+    const result = await handleMessage(
+      { type: "EXECUTE_JAVASCRIPT", tabId: 1, frameId: 7, code: "location.href" },
+      {},
+    );
+
+    expect(result).toEqual({
+      error: "JavaScript cannot run in a selected frame. Run frame.main first.",
+      errorCode: "UNSUPPORTED_FRAME_EXECUTION",
+    });
+    expect(chrome.debugger.sendCommand).not.toHaveBeenCalled();
+  });
+
   it("returns multiline member chain expressions", async () => {
     const handleMessage = await loadHandleMessage();
     const chrome = (globalThis as any).chrome;
@@ -286,6 +303,29 @@ describe("JavaScript command handlers", () => {
       error:
         "Cannot control this page. Chrome restricts automation on chrome://, extensions, and web store pages.",
     });
+  });
+});
+
+describe("Page state handler", () => {
+  beforeEach(() => {
+    resetChromeMock();
+  });
+
+  it("reads state from the selected frame, or the main frame without one", async () => {
+    const handleMessage = await loadHandleMessage();
+    const chrome = (globalThis as any).chrome;
+    chrome.scripting.executeScript.mockResolvedValue([{ result: { hasModal: true } }]);
+
+    expect(await handleMessage({ type: "PAGE_STATE", tabId: 1, frameId: 7 }, {})).toEqual({
+      hasModal: true,
+    });
+    await handleMessage({ type: "PAGE_STATE", tabId: 1 }, {});
+
+    const targets = chrome.scripting.executeScript.mock.calls.map(([call]: any[]) => call.target);
+    expect(targets).toEqual([
+      { tabId: 1, frameIds: [7] },
+      { tabId: 1, frameIds: [0] },
+    ]);
   });
 });
 

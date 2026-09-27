@@ -399,12 +399,14 @@ surf drag --from-x 100 --from-y 100 --to-x 200 --to-y 200
 
 ```bash
 surf page.read                 # Accessibility tree with refs + page text
+surf page.read --all           # Every visible element, including offscreen
+surf page.read --include-hidden # Also hidden and aria-hidden elements
 surf page.read --no-text       # Interactive elements only (no text content)
 surf animate-audit --selector ".thing" --duration 2000 --fps 10  # JSON animation timeline
 surf page.read --ref e5        # Get specific element details
 surf page.read --depth 3       # Limit tree depth
 surf page.read --compact       # Minimal output for LLM efficiency
-surf page.read --max-bytes 2000 # Cap visible text at a UTF-8 byte boundary
+surf page.read --max-bytes 2000 # Cap the tree and visible text at 2000 bytes
 surf page.text                 # Plain text content only
 surf page.html --strip-scripts # Rendered HTML without scripts
 surf page.save --selector "#artifact" --strip-scripts --output page.html # Save one static element
@@ -425,7 +427,7 @@ surf wait.dom --stable 500
 surf page.html --selector "#artifact" --strip-scripts > artifact.html
 ```
 
-Use `--selector <css>` to export its matching element only. A selector miss fails with an error. `--strip-scripts` removes scripts from exported markup without changing the page. Without `--selector`, `page.html` exports the whole document with its doctype. `page.html` exports the selected frame when `frame.switch` is active. Use `page.read` first when you need refs or visible text.
+Use `--selector <css>` to export its matching element only. A selector miss fails with an error. `--strip-scripts` removes scripts from exported markup without changing the page. Without `--selector`, `page.html` exports the whole document with its doctype. Use `page.read` first when you need refs or visible text.
 
 ## Semantic Element Location
 
@@ -562,14 +564,18 @@ surf frame.switch --selector "#payment-iframe"
 surf frame.switch --name "checkout"
 surf frame.switch --index 0    # First iframe
 surf frame.main                # Return to main frame
-surf frame.js "return document.title" --id "FRAME_ID"
+surf frame.js "return document.title" --id "CDP_FRAME_ID"
 
-# After frame.switch, subsequent commands target that frame:
+# Page and interaction commands follow frame.switch:
 surf frame.switch --selector "#payment-iframe"
 surf page.read                 # Reads iframe content
+surf page.text                 # Reads raw iframe text
+surf page.state                # Inspects iframe UI state
 surf click --selector "#pay"   # Clicks in iframe
 surf frame.main                # Back to main page
 ```
+
+Selected frames include reachable out-of-process iframes. `js` fails with `UNSUPPORTED_FRAME_EXECUTION` until `frame.main`. `frame.js --id` ignores `frame.switch`, takes a CDP frame ID, and cannot reach frames missing from the CDP tree. Tab, window, browser, and network commands are not frame-scoped.
 
 ## Network Inspection
 

@@ -15,6 +15,7 @@ const net = require("net");
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
+const crypto = require("crypto");
 const { AsyncLocalStorage } = require("async_hooks");
 const requestStorage = new AsyncLocalStorage();
 const https = require("https");
@@ -801,7 +802,8 @@ function targetLaneKey(identity, tabId) {
 
 const FRAME_CONTEXT_MESSAGE_TYPES = new Set([
   "CLICK_TYPE", "CLICK_TYPE_SUBMIT", "AUTOCOMPLETE_SELECT", "SMART_TYPE",
-  "READ_PAGE", "GET_ELEMENT_COORDINATES", "FORM_INPUT", "EVAL_IN_PAGE",
+  "READ_PAGE", "GET_PAGE_TEXT", "PAGE_STATE", "EXECUTE_JAVASCRIPT",
+  "GET_ELEMENT_COORDINATES", "FORM_INPUT", "EVAL_IN_PAGE",
   "SCROLL_TO_ELEMENT", "LOCATE_ROLE", "LOCATE_TEXT", "LOCATE_LABEL",
   "GET_ELEMENT_STYLES", "SELECT_OPTION", "CLICK_REF", "HOVER_REF",
   "CLICK_SELECTOR", "WAIT_FOR_ELEMENT", "FORM_FILL", "UPLOAD_FILE", "SEARCH_PAGE",
@@ -1710,7 +1712,6 @@ function completeOwnedRequest(context, id, outcome) {
 
 async function sendRequestDownloads(context, request, result) {
   if (!request) return result;
-  let rewritten = result;
   for (const output of request.outputTransfers || []) {
     await streamFileDownload({
       writer: { send: (frame) => sendSocket(context.socket, frame) },
@@ -1720,8 +1721,27 @@ async function sendRequestDownloads(context, request, result) {
       original: output.original,
     });
   }
-  rewritten = rewriteTransferPaths(rewritten, request.pathRewrites || []);
-  return rewritten;
+  return rewriteTransferPaths(result, request.pathRewrites || []);
+}
+
+// A long tree would flood an agent's context, so reply with the first part and keep
+// the full tree in a private file. Remote clients cannot read host files. Semantic
+// commands parse every line, so their observations stay whole.
+async function truncatePageRead(context, request, output) {
+  if (!["page.read", "read_page"].includes(request?.tool) || typeof output?.pageContent !== "string" || output.semanticObservation !== undefined) return output;
+  const limit = Number(request.args?.["max-bytes"] ?? 50_000);
+  const full = Buffer.from(output.pageContent);
+  if (full.length <= limit) return output;
+  const lineEnd = full.lastIndexOf(10, limit);
+  const kept = full.subarray(0, lineEnd > 0 ? lineEnd : limit).toString("utf8");
+  let note = `[Truncated: showing ${Buffer.byteLength(kept)} of ${full.length} bytes.`;
+  if (!context?.isRemote) {
+    const fullPath = path.join(SURF_TMP, `surf-read-${crypto.randomUUID()}.txt`);
+    await fs.promises.writeFile(fullPath, full, { mode: 0o600, flag: "wx" });
+    note += ` Full tree: ${fullPath}.`;
+  }
+  note += " Narrow with --ref <ref> or --depth <n>.]";
+  return { ...output, pageContent: `${kept}\n\n${note}` };
 }
 
 function sendToolResponse(socket, id, result, error) {
@@ -1733,6 +1753,7 @@ function sendToolResponse(socket, id, result, error) {
     let output = result;
     try {
       if (!error) output = await sendRequestDownloads(context, request, result);
+      if (!error) output = await truncatePageRead(context, request, output);
       if (!error && output?.semanticObservation?.identity && request?.target) {
         output.semanticObservation.identity.browserEpoch = request.target.browserEpoch;
       }
@@ -1783,7 +1804,7 @@ function sendToolResponse(socket, id, result, error) {
     if (request?.notice) response.notice = request.notice;
     if (formattedError) response.error = formattedError;
     else {
-      response.result = { content: formatToolContent(output, log, { suppressImages: Boolean(context?.isRemote) }) };
+      response.result = { content: formatToolContent(output, log) };
       if (request?.tool === "tab.new" && Number.isInteger(output?.tabId) && output.tabId > 0) {
         response.result.tabId = output.tabId;
       }
@@ -2959,13 +2980,7 @@ function processInput() {
 
           const { socket, originalId, savePath, autoScreenshot, tabId: storedTabId } = pending;
           const tabId = storedTabId || msg._resolvedTabId;
-          const failAutoScreenshot = (message) => pending.autoScreenshotOutput
-            ? sendToolResponse(socket, originalId, null, `Auto-screenshot failed: ${message}`)
-            : sendToolResponse(socket, originalId, {
-                ...msg,
-                screenshotError: message,
-                autoScreenshotError: message,
-              }, null);
+          const failAutoScreenshot = (message) => sendToolResponse(socket, originalId, null, `Auto-screenshot failed: ${message}`);
           
           if (pending.networkExport && Array.isArray(msg.entries)) {
             try {
@@ -3021,41 +3036,40 @@ function processInput() {
                 try { fs.unlinkSync(path.join(SURF_TMP, f.name)); } catch (e) {}
               });
             }
-            require("./abort.cjs").abortableDelay(500, pending.request?.signal)
+            // Remote clients receive the file before the reply, so they wait for the capture.
+            // Local callers get the path now. The capture is detached from the request so the
+            // client exiting cannot cancel it, and it keeps the tab lane so the next command on
+            // this tab cannot show up in the screenshot.
+            const background = !pending.autoScreenshotOutput;
+            const captureRequest = background ? null : pending.request;
+            const laneToken = background ? pending.request?.admissionToken : null;
+            if (background) {
+              if (pending.request) pending.request.admissionToken = null;
+              sendToolResponse(socket, originalId, { ...msg, autoScreenshot: { path: screenshotPath, pending: true } }, null);
+            }
+            // Written under a name the pi-auto- rotation ignores, then renamed, so a reader
+            // never sees a partially written file.
+            const partialPath = path.join(path.dirname(screenshotPath), `.${path.basename(screenshotPath)}`);
+            abortableDelay(500, captureRequest?.signal)
               .then(() => requestCallExtension(
-                pending.request,
+                captureRequest,
                 "screenshot",
                 { type: "EXECUTE_SCREENSHOT", tabId, strictTarget: pending.request?.target?.strict === true },
               ))
               .then((screenshotMsg) => {
-                if (screenshotMsg.base64) {
-                  try {
-                    fs.writeFileSync(screenshotPath, Buffer.from(screenshotMsg.base64, "base64"), { mode: 0o600 });
-                    try { fs.chmodSync(screenshotPath, 0o600); } catch {}
-                    const origW = screenshotMsg.width || 0;
-                    const origH = screenshotMsg.height || 0;
-                    let finalW = origW, finalH = origH;
-                    const maxSize = 1200;
-                    if (origW > maxSize || origH > maxSize) {
-                      const result = resizeImage(screenshotPath, maxSize);
-                      if (result.success) {
-                        finalW = result.width;
-                        finalH = result.height;
-                      }
-                    }
-                    sendToolResponse(socket, originalId, {
-                      ...msg,
-                      autoScreenshot: { path: screenshotPath, width: finalW, height: finalH, originalWidth: origW, originalHeight: origH }
-                    }, null);
-                  } catch (e) {
-                    failAutoScreenshot(e.message);
-                  }
-                } else {
-                  const errMsg = screenshotMsg.error || "Failed to capture";
-                  failAutoScreenshot(errMsg);
-                }
+                if (!screenshotMsg.base64) throw new Error(screenshotMsg.error || "Failed to capture");
+                fs.writeFileSync(partialPath, Buffer.from(screenshotMsg.base64, "base64"), { mode: 0o600 });
+                try { fs.chmodSync(partialPath, 0o600); } catch {}
+                if (screenshotMsg.width > 1200 || screenshotMsg.height > 1200) resizeImage(partialPath, 1200);
+                fs.renameSync(partialPath, screenshotPath);
+                if (!background) sendToolResponse(socket, originalId, { ...msg, autoScreenshot: { path: screenshotPath } }, null);
               })
-              .catch((error) => failAutoScreenshot(error.message));
+              .catch((error) => {
+                fs.rmSync(partialPath, { force: true });
+                if (background) log(`Auto-screenshot failed for ${screenshotPath}: ${error.message}`);
+                else failAutoScreenshot(error.message);
+              })
+              .finally(() => laneToken?.release());
             continue;
           } else if (autoScreenshot && pending.autoScreenshotOutput && !msg.error) {
             failAutoScreenshot(tabId ? "screenshot response was invalid" : "no tab available");
