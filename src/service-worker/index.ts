@@ -1,5 +1,6 @@
-import { CDPController } from "../cdp/controller";
+import { CDPController, type PendingDialog } from "../cdp/controller";
 import { debugLog } from "../utils/debug";
+import type { PageChanges } from "../utils/page-changes";
 import {
   type CdpFrameEntry,
   DOM_IFRAME_INVENTORY_EXPRESSION,
@@ -1413,13 +1414,7 @@ export async function handleMessage(
       // Include visible text content if requested
       if (message.options?.includeText) {
         try {
-          const textResult = await chrome.tabs.sendMessage(tabId, {
-            type: "GET_PAGE_TEXT",
-            options: {
-              compact: message.options?.compact === true,
-              maxBytes: message.options?.maxBytes,
-            },
-          }, { frameId: readFrameId });
+          const textResult = await chrome.tabs.sendMessage(tabId, { type: "GET_PAGE_TEXT" }, { frameId: readFrameId });
           if (textResult?.text) {
             result.text = textResult.text;
           }
@@ -4358,6 +4353,104 @@ const COMMANDS_WITHOUT_TAB = new Set([
   "EMULATE_DEVICE_LIST"
 ]);
 
+const PAGE_CHANGES_BEGIN_TIMEOUT_MS = 2000;
+const PAGE_CHANGES_END_GRACE_MS = 5000;
+const TIMED_OUT = Symbol("timed out");
+const FAILED = Symbol("failed");
+
+function answerWithin<T>(promise: Promise<T>, ms: number): Promise<T | typeof TIMED_OUT | typeof FAILED> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  return Promise.race<T | typeof TIMED_OUT | typeof FAILED>([
+    promise.catch(() => FAILED),
+    new Promise<typeof TIMED_OUT>((resolve) => { timer = setTimeout(() => resolve(TIMED_OUT), ms); }),
+  ]).finally(() => clearTimeout(timer));
+}
+
+// Page changes never fail or hold up the action. A frame that is blocked (a JS dialog) or has
+// no content script gets no report; a document replaced during the action becomes `navigated`.
+// Every BEGIN that succeeded gets an END, even a late one, so the page watcher is released.
+async function runWithPageChanges(tabId: number, msg: any, run: () => Promise<any>): Promise<any> {
+  if (cdp.getDialogInfo(tabId)) return run();
+  const frameId = getFrameIdForTab(tabId, msg);
+  const capMs: number = msg.pageChanges.settleMs;
+  const token = crypto.randomUUID();
+  const send = (message: object) => chrome.tabs.sendMessage(tabId, message, { frameId });
+  const release = () => send({ type: "END_PAGE_CHANGES", token, capMs: 0 }).catch(() => {});
+  const beginRequest = send({ type: "BEGIN_PAGE_CHANGES", token });
+  const startedAt = Date.now();
+  const remainingMs = () => Math.max(0, startedAt + capMs - Date.now());
+  const begin = await answerWithin(beginRequest, PAGE_CHANGES_BEGIN_TIMEOUT_MS);
+  if (begin === TIMED_OUT) beginRequest.then((late) => late?.ok && release()).catch(() => {});
+  if (!begin?.ok) return run();
+
+  let result: any;
+  try {
+    result = await run();
+  } catch (error) {
+    release();
+    throw error;
+  }
+  if (result?.error || cdp.getDialogInfo(tabId)) {
+    release();
+    return result;
+  }
+  const end = await answerWithin(
+    send({ type: "END_PAGE_CHANGES", token, capMs }),
+    remainingMs() + PAGE_CHANGES_END_GRACE_MS,
+  );
+  if (end === TIMED_OUT) return result;
+  if (end !== FAILED && end?.error !== "unknown_token") return end?.settle ? { ...result, pageChanges: end } : result;
+
+  try {
+    let to: string;
+    let title = "";
+    let loaded = true;
+    if (frameId === 0) {
+      loaded = (await cdp.waitForLoad(tabId, remainingMs())).success;
+      const tab = await chrome.tabs.get(tabId);
+      to = tab.url ?? "";
+      title = tab.title ?? "";
+    } else {
+      const frame = await chrome.webNavigation.getFrame({ tabId, frameId });
+      if (!frame) return result;
+      to = frame.url;
+    }
+    const pageChanges: PageChanges = {
+      settle: { state: loaded ? "settled" : "unsettled", ms: Date.now() - startedAt },
+      navigated: { from: begin.url, to, title },
+      changes: [],
+      text: [],
+      omitted: 0,
+    };
+    return { ...result, pageChanges };
+  } catch {
+    return result;
+  }
+}
+
+// A native alert/confirm/prompt blocks the page, so the action that opened it (a CDP input
+// event, a content-script click, a script) gets no answer until the dialog closes. Answer as
+// soon as one opens so the caller can handle it with dialog.accept or dialog.dismiss; the
+// blocked action finishes on its own once the dialog is closed. Dialogs are reported only on
+// an attached tab, so actions attach first.
+async function returnOnNativeDialog(tabId: number, attachFirst: boolean, run: () => Promise<any>): Promise<any> {
+  if (attachFirst) await cdp.attachForDialogs(tabId);
+  let unsubscribe = () => {};
+  const opened = new Promise<PendingDialog>((resolve) => { unsubscribe = cdp.onDialogOpening(tabId, resolve); });
+  const action = run();
+  try {
+    const outcome = await Promise.race([
+      action.then((result) => ({ result })),
+      opened.then((dialog) => ({ dialog })),
+    ]);
+    if ("result" in outcome) return outcome.result;
+    const { type, message, defaultPrompt } = outcome.dialog;
+    return { success: true, nativeDialog: { type, message, ...(type === "prompt" ? { defaultPrompt } : {}) } };
+  } finally {
+    unsubscribe();
+  }
+}
+
 initNativeMessaging(async (msg) => {
   let tabId = msg.tabId;
   const windowId = msg.windowId;
@@ -4381,7 +4474,11 @@ initNativeMessaging(async (msg) => {
   }
 
   if (tabId && msg.frameId !== undefined) await validateRequestedFrame(tabId, msg.frameId);
-  const result = await handleMessage({ ...msg, tabId }, {} as chrome.runtime.MessageSender);
+  const handle = () => handleMessage({ ...msg, tabId }, {} as chrome.runtime.MessageSender);
+  const runAction = tabId && !isDialogCommand
+    ? () => returnOnNativeDialog(tabId, msg.watchDialogs === true, handle)
+    : handle;
+  const result = tabId && msg.pageChanges ? await runWithPageChanges(tabId, msg, runAction) : await runAction();
   const hints: string[] = [];
   if (autoCreatedTab) {
     hints.push(`Auto-created tab in window ${windowId} (no usable tabs existed). Navigate to your target URL.`);

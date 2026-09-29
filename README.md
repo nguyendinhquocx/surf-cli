@@ -259,6 +259,7 @@ surf read --depth 3                 # Limit tree depth (smaller output)
 surf read --compact                 # Remove empty structural elements
 surf read --depth 3 --compact       # Both (60% smaller output)
 surf read --max-bytes 2000          # Cap the tree and visible text at 2000 bytes
+surf read --summary                 # Title, headings, control counts per region, open dialogs (no refs)
 surf page.text                      # Raw text content only
 surf page.html                      # Rendered document HTML
 surf page.html --strip-scripts > artifact.html # Save a safe static Claude artifact
@@ -268,7 +269,7 @@ surf page.state                     # Modals, loading state, scroll position
 
 Use `surf page.html --strip-scripts` after the page loads when you need a static export of a Claude artifact or other rendered DOM. Use `--selector <css>` to export one element.
 
-Trees over 50,000 bytes, or over `--max-bytes`, end with a note giving the path of a private file with the full tree. Remote clients get the note without a path; narrow with `--ref` or `--depth` instead.
+Trees over 50,000 bytes and page text over 50,000 characters, or either over `--max-bytes`, end with a note giving the shown and total bytes and the path of a private file with the full content. Remote clients get the note without a path; narrow with `--ref` or `--depth` instead.
 
 Element refs (`e1`, `e2`, `e3`...) are stable identifiers from the accessibility tree - semantic, predictable, and resilient to DOM changes.
 
@@ -382,6 +383,8 @@ surf snap                                   # Alias for screenshot
 To disable auto-save globally, set `autoSaveScreenshots: false` in `surf.json`.
 
 Actions like `click`, `type`, and `scroll` automatically capture a screenshot after execution - no extra command needed. The command replies as soon as the action finishes with `Screenshot (pending): <path>`, and the file appears at that path shortly after. The next command on the same tab waits until it is written. Remote clients receive the file before the reply.
+
+These actions and `select` also report what changed on the page, waiting up to 2000ms for it to settle. Set `settleMs` in `surf.json` or `--settle <ms>` per command (max 30000), or turn it off with `--no-diff`.
 
 ### Tabs
 
@@ -966,6 +969,8 @@ Generated manifests declare provenance and authentication environment inputs. Su
 --soft-fail        # Host tool errors: stderr warning, exit 0, no JSON error output
 --no-lock          # Bypass the legacy lock for compound client-side commands
 --no-screenshot    # Skip auto-screenshot after actions
+--settle <ms>      # Max wait for the page to settle before actions report changes (default 2000, max 30000)
+--no-diff          # Skip the page-change report after actions
 --full             # Full resolution screenshots (skip resize)
 ```
 

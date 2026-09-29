@@ -40,6 +40,23 @@ function formatToolError(error) {
   return result;
 }
 
+// A silent cut reads as missing content, so cut page text ends with a marker.
+// Without maxBytes the cap is maxChars characters, never splitting a surrogate pair.
+function truncatePageText(text, { maxBytes, maxChars = 50_000, fullPath } = {}) {
+  const full = Buffer.from(text);
+  const cut = maxChars < text.length && /[\uD800-\uDBFF]/.test(text[maxChars - 1]) ? maxChars - 1 : maxChars;
+  let kept = text.substring(0, cut);
+  if (maxBytes !== undefined) {
+    let end = Math.min(maxBytes, full.length);
+    while (end > 0 && (full[end] & 0xc0) === 0x80) end--;
+    kept = full.subarray(0, end).toString("utf8");
+  }
+  if (kept === text) return { text };
+  const truncated = { shownBytes: Buffer.byteLength(kept), totalBytes: full.length, ...(fullPath ? { path: fullPath } : {}) };
+  const note = `[Truncated: showing ${truncated.shownBytes} of ${truncated.totalBytes} bytes.${fullPath ? ` Full text: ${fullPath}.` : ""}]`;
+  return { text: `${kept}\n\n${note}`, truncated };
+}
+
 /**
  * Format tool result content for MCP response
  * @param {*} result - The result object from the extension
@@ -50,6 +67,11 @@ function formatToolContent(result, log = () => {}) {
   const text = (s) => [{ type: "text", text: s }];
   
   if (!result) return text("OK");
+
+  if (result.nativeDialog) {
+    const { type, message } = result.nativeDialog;
+    return text(`OK\nNative ${type} dialog is open: ${JSON.stringify(message)}. Close it with dialog.accept or dialog.dismiss.`);
+  }
 
   if (result.session || Array.isArray(result.sessions) || Array.isArray(result.removed) || Object.hasOwn(result, "targetClosed")) {
     return text(JSON.stringify(result, null, 2));
@@ -252,10 +274,6 @@ function formatToolContent(result, log = () => {}) {
     }
     
     output += content;
-    
-    if (result.isIncremental && result.diff) {
-      output += `\n--- Diff from previous snapshot ---\n${result.diff}`;
-    }
     
     if (result.modalStates && result.modalStates.length > 0) {
       output += `\n\n[ACTION REQUIRED] Modal blocking page - dismiss before proceeding:`;
@@ -630,7 +648,6 @@ function mapToolToMessage(tool, args, tabId) {
           depth: a.depth,
           refId: a.ref_id,
           format: a.format,
-          forceFullSnapshot: a.forceFullSnapshot ?? false,
           includeScreenshot: a.includeScreenshot ?? false
         },
         ...baseMsg 
@@ -982,6 +999,14 @@ function mapToolToMessage(tool, args, tabId) {
       const files = a.files ? (typeof a.files === "string" ? a.files.split(",").map(f => f.trim()) : a.files) : [];
       return { type: "UPLOAD_FILE", ref: a.ref, files, ...baseMsg };
     case "page.read": {
+      if (a.summary === true) {
+        const conflicts = ["ref", "all", "include-hidden", "no-text", "depth", "compact", "max-bytes"]
+          .filter((flag) => a[flag] !== undefined && a[flag] !== false);
+        if (conflicts.length > 0) {
+          throw new Error(`--summary cannot be combined with ${conflicts.map((flag) => `--${flag}`).join(", ")}: the summary always covers the whole page and lists no elements`);
+        }
+        return { type: "READ_PAGE", options: { summary: true }, ...baseMsg };
+      }
       let maxBytes;
       if (a["max-bytes"] !== undefined) {
         const raw = String(a["max-bytes"]).trim();
@@ -1003,7 +1028,6 @@ function mapToolToMessage(tool, args, tabId) {
           depth: a.depth !== undefined ? parseInt(a.depth, 10) : undefined,
           compact: a.compact || false,
           maxBytes,
-          forceFullSnapshot: a.compact === true || maxBytes !== undefined,
           ...(a.semanticObservation === true ? { semanticObservation: true } : {}),
         },
         ...baseMsg
@@ -1388,4 +1412,4 @@ function applySemanticExpectedIdentity(request, extensionMessage, args) {
   };
 }
 
-module.exports = { mapToolToMessage, mapComputerAction, formatToolContent, formatToolError, buildProviderUploadMessage, readinessExpectations, applySemanticExpectedIdentity };
+module.exports = { mapToolToMessage, mapComputerAction, formatToolContent, formatToolError, buildProviderUploadMessage, readinessExpectations, applySemanticExpectedIdentity, truncatePageText };

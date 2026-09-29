@@ -2,8 +2,9 @@
 const fs = require("fs");
 const path = require("path");
 const { execFileSync, execSync } = require("child_process");
-const { loadConfig, getConfigPath, createStarterConfig } = require("./config.cjs");
+const { loadConfig, getConfigPath, createStarterConfig, STARTER_CONFIG } = require("./config.cjs");
 const networkFormatters = require("./formatters/network.cjs");
+const { formatPageChanges } = require("./formatters/page-changes.cjs");
 const {
   applyArgDefaults,
   formatStep,
@@ -36,7 +37,7 @@ const { createFrameParser, createSocketWriter, writeFrame } = require("./remote-
 const { resolveRequestDeadlineMs } = require("./host-sessions.cjs");
 const { classifyTool } = require("./tool-scope.cjs");
 const { parseVideoFps, validateVideoOutputPath } = require("./video-recorder.cjs");
-const { AUTO_SCREENSHOT_TOOLS, prepareRemoteTool, validateLocalToolPaths } = require("./file-transfer.cjs");
+const { AUTO_SCREENSHOT_TOOLS, MAX_SETTLE_MS, PAGE_CHANGES_TOOLS, isSettleMs, prepareRemoteTool, validateLocalToolPaths } = require("./file-transfer.cjs");
 const { authorizeClient, listClients, revokeClient, getStateDir } = require("./remote-auth.cjs");
 if (IS_WIN) { try { fs.mkdirSync(SURF_TMP, { recursive: true }); } catch {} }
 
@@ -714,6 +715,7 @@ const TOOLS = {
           depth: "Maximum tree depth (default: unlimited)",
           compact: "Remove empty structural elements",
           "max-bytes": "Maximum tree and visible text bytes (tree default: 50000)",
+          summary: "Short overview: title, headings, regions with control counts, dialogs; no refs",
         },
         examples: [
           { cmd: "page.read", desc: "Interactive elements + text content" },
@@ -1933,6 +1935,8 @@ Options:
   --auto-capture    On error: capture screenshot + console to /tmp
   --soft-fail       Host tool errors: warn on stderr, exit 0, no JSON error output
   --no-lock         Bypass the legacy lock for compound client-side commands
+  --settle <ms>     Max wait for the page to settle after actions (default 2000, max 30000, surf.json settleMs)
+  --no-diff         Skip reporting page changes after actions
 
 Host tool-response errors: stderr includes [code] on the first line when supplied;
 --json also writes {"error":{"code":"...","message":"..."}} to stdout; exit 1.
@@ -3030,7 +3034,7 @@ if (args[0] === "workflow.validate") {
   }
 }
 
-const BOOLEAN_FLAGS = ["auto-capture", "json", "stream", "dry-run", "stop-on-error", "fail-fast", "clear", "submit", "all", "include-hidden", "case-sensitive", "hard", "annotate", "fullpage", "full-page", "reset", "no-screenshot", "full", "soft-fail", "has-body", "exclude-static", "v", "vv", "request", "by-tab", "har", "jsonl", "no-save", "no-auto-wait", "no-lock", "no-wait", "window", "tab", "focused", "unfocused", "keep-target", "close-target", "replace", "refresh"];
+const BOOLEAN_FLAGS = ["auto-capture", "json", "stream", "dry-run", "stop-on-error", "fail-fast", "clear", "submit", "all", "include-hidden", "case-sensitive", "hard", "annotate", "fullpage", "full-page", "reset", "no-screenshot", "no-diff", "full", "soft-fail", "has-body", "exclude-static", "v", "vv", "request", "by-tab", "har", "jsonl", "no-save", "no-auto-wait", "no-lock", "no-wait", "window", "tab", "focused", "unfocused", "keep-target", "close-target", "replace", "refresh"];
 
 const parseArgs = (rawArgs) => {
   const result = { positional: [], options: {} };
@@ -3405,6 +3409,15 @@ delete toolArgs["auto-capture"];
 const noScreenshot = toolArgs["no-screenshot"] === true;
 delete toolArgs["no-screenshot"];
 
+const noDiff = toolArgs["no-diff"] === true;
+delete toolArgs["no-diff"];
+const settleFlag = toolArgs.settle;
+delete toolArgs.settle;
+if (settleFlag !== undefined && !isSettleMs(settleFlag)) {
+  console.error(`Error: --settle requires a whole number of milliseconds from 0 to ${MAX_SETTLE_MS}`);
+  process.exit(1);
+}
+
 const softFail = toolArgs["soft-fail"] === true;
 delete toolArgs["soft-fail"];
 
@@ -3511,6 +3524,15 @@ if (methodFlag === "js") {
     console.error("Error: smart_type uses the JS input path and cannot be combined with --method cdp");
     process.exit(1);
   }
+}
+
+if (!noDiff && PAGE_CHANGES_TOOLS.includes(finalTool)) {
+  const settleMs = settleFlag ?? config.settleMs ?? STARTER_CONFIG.settleMs;
+  if (!isSettleMs(settleMs)) {
+    console.error(`Error: settleMs in ${getConfigPath()} must be a whole number of milliseconds from 0 to ${MAX_SETTLE_MS}`);
+    process.exit(1);
+  }
+  toolArgs.pageChanges = { settleMs };
 }
 
 const finalClassification = classifyTool(finalTool, toolArgs);
@@ -4048,12 +4070,27 @@ async function handleResponse(response) {
   }
 
   if (wantJson) {
-    const output = response.target || response.notice
-      ? { result: data ?? null, target: response.target || null, notice: response.notice || null }
+    const output = response.target || response.notice || response.truncated || response.pageChanges
+      ? {
+        result: data ?? null,
+        target: response.target || null,
+        notice: response.notice || null,
+        ...(response.truncated ? { truncated: response.truncated } : {}),
+        ...(response.pageChanges ? { pageChanges: response.pageChanges } : {}),
+      }
       : data ?? null;
     console.log(JSON.stringify(output, null, 2));
     socket.end();
     process.exit(0);
+  }
+
+  const pageChangeLines = response.pageChanges ? formatPageChanges(response.pageChanges) : [];
+  if (pageChangeLines.length > 0 && typeof data === "string") {
+    // Changes belong after the action's own output and before its screenshot line.
+    const lines = data.split("\n");
+    const screenshotLine = lines.findIndex((line) => line.startsWith("Screenshot saved: ") || line.startsWith("Screenshot (pending): "));
+    lines.splice(screenshotLine === -1 ? lines.length : screenshotLine, 0, ...pageChangeLines);
+    data = lines.join("\n");
   }
 
   if (finalTool === "session.list") {
@@ -4178,6 +4215,21 @@ async function handleResponse(response) {
     }
   } else if (tool === "page.read" && data?.pageContent) {
     console.log(data.pageContent);
+  } else if (tool === "page.read" && Array.isArray(data?.regions)) {
+    const label = ({ role, name }) => (name ? `${role} "${name}"` : role);
+    const headings = data.headings.map(({ level, name }) => label({ role: `h${level}`, name }));
+    if (data.headingsOmitted > 0) headings.push(`+${data.headingsOmitted} more`);
+    const width = Math.max(...data.regions.map(({ region }) => region.length)) + 2;
+    const lines = [
+      data.title ? `${data.title} — ${data.url}` : data.url,
+      `headings: ${headings.join(", ") || "none"}`,
+      data.regions.length > 0 ? "regions:" : "regions: none",
+      ...data.regions.map(({ region, controls }) =>
+        `  ${region.padEnd(width)}${Object.entries(controls).map(([role, count]) => `${role} ${count}`).join(", ") || "no controls"}`),
+      `dialogs: ${data.dialogs.map(label).join(", ") || "none"}`,
+    ];
+    if (data.alerts.length > 0) lines.push(`alerts: ${data.alerts.map(label).join(", ")}`);
+    console.log(lines.join("\n"));
   } else if (tool === "page.text" && data?.text) {
     console.log(data.text);
   } else if (tool === "page.html" && typeof data?.html === "string") {
@@ -4422,6 +4474,7 @@ async function handleResponse(response) {
   } else {
     console.log(JSON.stringify(data, null, 2));
   }
+  if (pageChangeLines.length > 0 && typeof data !== "string") console.log(pageChangeLines.join("\n"));
 
   socket.end();
   process.exit(0);

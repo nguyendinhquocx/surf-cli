@@ -151,6 +151,44 @@ function fixturePages(request, { crossOriginBase }) {
 <body><main><h1>Sign in</h1><form><label>Email <input type="email" name="email"></label>
 <label>Password <input type="password" name="password"></label><button type="submit">Sign in</button></form></main></body></html>`;
   }
+  if (url.pathname === "/changes") {
+    return `<!doctype html><html><head><title>Surf page changes fixture</title></head>
+<body><main><h1>Project settings</h1>
+<button id="open-dialog">Delete project</button>
+<label><input type="checkbox" id="notify"> Email me</label>
+<button id="noop">Do nothing</button>
+<label>Password <input type="password" id="secret"></label>
+<button id="ticker-start">Start ticker</button><p id="ticker">0</p>
+<p id="outcome">Nothing deleted</p>
+<a id="leave" href="/changes-target">Leave settings</a>
+</main>
+<script>
+  document.querySelector("#open-dialog").addEventListener("click", () => {
+    const dialog = document.createElement("div");
+    dialog.setAttribute("role", "dialog");
+    dialog.setAttribute("aria-labelledby", "dialog-title");
+    dialog.innerHTML = '<h2 id="dialog-title">Delete project?</h2><button id="cancel">Cancel</button><button id="confirm">Delete</button>';
+    dialog.querySelector("#confirm").addEventListener("click", () => {
+      document.querySelector("#outcome").textContent = "Project deleted";
+      dialog.remove();
+    });
+    setTimeout(() => document.body.append(dialog), 50);
+  });
+  document.querySelector("#ticker-start").addEventListener("click", () => {
+    let count = 0;
+    setInterval(() => { document.querySelector("#ticker").textContent = String(++count); }, 50);
+  });
+</script></body></html>`;
+  }
+  if (url.pathname === "/changes-target") {
+    return `<!doctype html><html><head><title>Changes target</title></head><body><main><h1>Target</h1></main></body></html>`;
+  }
+  if (url.pathname === "/native-dialog") {
+    return `<!doctype html><html><head><title>Native dialog fixture</title></head>
+<body><main><button id="alert" onclick="alert('hi')">Alert</button>
+<button id="confirm" onclick="document.querySelector('#answer').textContent = confirm('Sure?') ? 'yes' : 'no'">Confirm</button>
+<p id="answer">none</p></main></body></html>`;
+  }
   if (url.pathname === "/list") {
     const empty = url.searchParams.get("empty") === "1";
     const items = empty
@@ -179,6 +217,35 @@ function fixturePages(request, { crossOriginBase }) {
     if (domValue === trackedValue) return; // framework sees no change
     trackedValue = domValue;
     document.querySelector("#mirror").textContent = domValue;
+  });
+</script></body></html>`;
+  }
+  if (url.pathname === "/summary") {
+    const sections = ["World", "Business", "Science", "Sport", "Culture", "Travel", "Opinion", "Archive"]
+      .map((name) => `<a href="/${name.toLowerCase()}">${name}</a>`)
+      .join(" ");
+    const stories = Array.from({ length: 120 }, (_, index) => {
+      const n = index + 1;
+      return `<div class="story"><h2>Story ${n}</h2><p>Story ${n} reports on a long-running local question in plain terms, with quotes from residents, figures from the council and a short note on what happens next.</p><a href="/story/${n}">Read story ${n}</a> <a href="/story/${n}#comments">${n} comments</a></div>`;
+    }).join("\n");
+    return `<!doctype html><html><head><title>Surf summary fixture</title></head>
+<body><header><h1>Surf News</h1></header><nav aria-label="Sections">${sections}</nav>
+<main><input type="search" aria-label="Search stories"><button>Search</button>
+${stories}</main>
+<dialog open aria-label="Cookie consent"><p>We use cookies.</p><button>Accept</button><button>Reject</button></dialog>
+</body></html>`;
+  }
+  if (url.pathname === "/rerender") {
+    return `<!doctype html><html><head><title>Surf rerender fixture</title></head>
+<body><label>Filter <input id="filter" type="text"></label><div id="app"></div><output id="log">none</output>
+<script>
+  // Re-renders replace the button node while its role and name stay the same.
+  // The click handler is delegated to the document, like React, so a detached node never reaches it.
+  const render = () => { document.querySelector("#app").innerHTML = "<button>Save</button>"; };
+  render();
+  document.querySelector("#filter").addEventListener("input", render);
+  document.addEventListener("click", (event) => {
+    if (event.target.closest("#app button")) document.querySelector("#log").textContent = "saved";
   });
 </script></body></html>`;
   }
@@ -471,6 +538,43 @@ try {
   }
   await runSurf("tab.close", "--id", String(loginTab.tabId), "--json");
 
+  // read --summary: a fixed content-heavy page, so summary size growth fails here.
+  const summaryTab = { tabId: tabIdFromOutput(await runSurf("tab.new", `${baseUrl}/summary`)) };
+  const summaryTabId = String(summaryTab.tabId);
+  await runSurf("wait.element", "dialog", "--tab-id", summaryTabId, "--json");
+  const fullRead = await runSurf("read", "--tab-id", summaryTabId);
+  const summaryRead = await runSurf("read", "--summary", "--tab-id", summaryTabId);
+  const summaryLines = summaryRead.split("\n");
+  if (
+    summaryLines[0] !== `Surf summary fixture — ${baseUrl}/summary` ||
+    !summaryLines.includes('headings: h1 "Surf News", h2 "Story 1", h2 "Story 2", h2 "Story 3", h2 "Story 4", h2 "Story 5", h2 "Story 6", h2 "Story 7", h2 "Story 8", h2 "Story 9", +111 more') ||
+    !summaryLines.includes("  main                     link 240, searchbox 1, button 1") ||
+    !summaryLines.includes('  navigation "Sections"    link 8') ||
+    !summaryLines.includes('dialogs: dialog "Cookie consent"') ||
+    /\be\d+\b/.test(summaryRead)
+  ) {
+    throw new Error(`read --summary did not summarize the fixture:\n${summaryRead}`);
+  }
+  const summaryBytes = Buffer.byteLength(summaryRead);
+  const fullReadBytes = Buffer.byteLength(fullRead);
+  if (summaryBytes > 700 || summaryBytes * 10 > fullReadBytes) {
+    throw new Error(`read --summary is ${summaryBytes} bytes; want at most 700 and a tenth of read's ${fullReadBytes}`);
+  }
+  const summaryJson = unwrapJson(await runSurf("read", "--summary", "--json", "--tab-id", summaryTabId));
+  if (
+    JSON.stringify(summaryJson.dialogs) !== JSON.stringify([{ role: "dialog", name: "Cookie consent" }]) ||
+    JSON.stringify(summaryJson.regions.find(({ region }) => region === 'dialog "Cookie consent"')) !==
+      JSON.stringify({ region: 'dialog "Cookie consent"', controls: { button: 2 } }) ||
+    summaryJson.headingsOmitted !== 111
+  ) {
+    throw new Error(`read --summary --json did not return the summary fields: ${JSON.stringify(summaryJson)}`);
+  }
+  const summaryConflict = await runSurfExpectingFailure("read", "--summary", "--depth", "2", "--tab-id", summaryTabId);
+  if (!summaryConflict.stderr.includes("--summary cannot be combined with --depth")) {
+    throw new Error(`read --summary --depth did not fail clearly: ${JSON.stringify(summaryConflict)}`);
+  }
+  await runSurf("tab.close", "--id", summaryTabId, "--json");
+
   // frame.diagnose
   const framesTab = { tabId: tabIdFromOutput(await runSurf("tab.new", `${baseUrl}/frames`)) };
   await runSurf("wait.element", "#sandboxed", "--tab-id", String(framesTab.tabId), "--json");
@@ -512,6 +616,23 @@ try {
     throw new Error(`framework-controlled input did not observe the typed value (mirror=${JSON.stringify(mirror)})`);
   }
   await runSurf("tab.close", "--id", String(listTab.tabId), "--json");
+
+  // Stale ref after a re-render
+  const rerenderTabId = String(tabIdFromOutput(await runSurf("tab.new", `${baseUrl}/rerender`)));
+  await runSurf("wait.element", "#app button", "--tab-id", rerenderTabId, "--json");
+  const staleRef = (await runSurf("read", "--tab-id", rerenderTabId)).match(/button "Save" \[(e\d+)\]/)?.[1];
+  if (!staleRef) throw new Error("read did not list the rerender fixture button");
+  await runSurf("type", "a", "--into", "#filter", "--tab-id", rerenderTabId, "--no-screenshot", "--json");
+  const staleClick = await runSurfExpectingFailure("click", staleRef, "--tab-id", rerenderTabId, "--no-screenshot");
+  const suggestedRef = staleClick.stderr.match(
+    new RegExp(`Element ${staleRef} no longer exists\\. Did you mean (e\\d+) \\(button "Save"\\)\\? Otherwise run surf read\\.`),
+  )?.[1];
+  if (!suggestedRef) throw new Error(`stale ref click did not suggest the new ref: ${JSON.stringify(staleClick)}`);
+  await runSurf("click", suggestedRef, "--tab-id", rerenderTabId, "--no-screenshot", "--json");
+  const rerenderPage = (await browser.pages()).find((page) => page.url() === `${baseUrl}/rerender`);
+  const rerenderLog = await rerenderPage?.evaluate(() => document.querySelector("#log")?.textContent);
+  if (rerenderLog !== "saved") throw new Error(`suggested ref click did not reach the new button (log=${rerenderLog})`);
+  await runSurf("tab.close", "--id", rerenderTabId, "--json");
 
   // js --file with statements and --options
   const optionsScript = join(repo, "test/e2e/fixtures/list-items.js");
@@ -583,6 +704,104 @@ try {
     throw new Error("extract leaked an owned tab");
   }
 
+  // Page changes after actions
+  const changesTab = String(tabIdFromOutput(await runSurf("tab.new", `${baseUrl}/changes`)));
+  await runSurf("wait.ready", "--json", "--tab-id", changesTab, "--selector", "#leave");
+  const dialogOutput = await runSurf("click", "--selector", "#open-dialog", "--tab-id", changesTab);
+  const dialogButtons = Object.fromEntries(
+    [...dialogOutput.matchAll(/^ {6}(e\d+) button "(Cancel|Delete)"$/gm)].map((match) => [match[2], match[1]]),
+  );
+  if (!/^changed \(settled in \d+ms\):$/m.test(dialogOutput) || !dialogOutput.includes('  + dialog "Delete project?"\n') || !dialogButtons.Cancel || !dialogButtons.Delete) {
+    throw new Error(`click did not report the opened dialog and its buttons: ${dialogOutput}`);
+  }
+  const confirmOutput = await runSurf("click", dialogButtons.Delete, "--settle", "1000", "--no-screenshot", "--tab-id", changesTab);
+  if (!confirmOutput.includes('  - dialog "Delete project?"')) {
+    throw new Error(`clicking the reported dialog ref did not remove the dialog: ${confirmOutput}`);
+  }
+  if (!(await runSurf("page.text", "--tab-id", changesTab)).includes("Project deleted")) {
+    throw new Error("clicking the reported dialog ref did not reach the dialog button");
+  }
+  const checkbox = JSON.parse(await runSurf("click", "--selector", "#notify", "--settle", "1000", "--no-screenshot", "--tab-id", changesTab, "--json"));
+  const checkboxChanges = checkbox.pageChanges?.changes;
+  if (checkboxChanges?.length !== 1 || checkboxChanges[0].kind !== "changed" || checkboxChanges[0].name !== "Email me" || checkboxChanges[0].property !== "checked" || checkboxChanges[0].to !== true) {
+    throw new Error(`checkbox toggle did not report one state change: ${JSON.stringify(checkbox)}`);
+  }
+  const timeNoop = async (...flags) => {
+    const startedAt = Date.now();
+    const output = await runSurf("click", "--selector", "#noop", "--no-screenshot", "--tab-id", changesTab, ...flags);
+    return { ms: Date.now() - startedAt, output };
+  };
+  const noopRuns = [];
+  for (let run = 0; run < 3; run++) noopRuns.push({ plain: await timeNoop("--no-diff"), diff: await timeNoop() });
+  const median = (values) => values.sort((a, b) => a - b)[1];
+  const noopLatency = {
+    noDiffMs: median(noopRuns.map((run) => run.plain.ms)),
+    diffMs: median(noopRuns.map((run) => run.diff.ms)),
+  };
+  noopLatency.addedMs = noopLatency.diffMs - noopLatency.noDiffMs;
+  if (noopRuns.some((run) => !/^no visible change \(quiet \d+ms\)$/m.test(run.diff.output) || run.plain.output.includes("visible change"))) {
+    throw new Error(`no-op click did not report no visible change: ${JSON.stringify(noopRuns)}`);
+  }
+  if (noopLatency.addedMs > 1500) {
+    throw new Error(`page changes added too much latency to a no-op click: ${JSON.stringify(noopLatency)}`);
+  }
+  const secret = "hunter2-page-changes";
+  const typedOutput = await runSurf("type", secret, "--into", "#secret", "--settle", "1000", "--no-screenshot", "--tab-id", changesTab);
+  const typedJson = await runSurf("type", `${secret}-json`, "--into", "#secret", "--settle", "1000", "--no-screenshot", "--tab-id", changesTab, "--json");
+  if (!/"Password" {2}value changed$/m.test(typedOutput) || typedOutput.includes(secret) || typedJson.includes(secret)) {
+    throw new Error(`typing into a password field leaked or missed the change: ${typedOutput}\n${typedJson}`);
+  }
+  const tickerOutput = await runSurf("click", "--selector", "#ticker-start", "--settle", "600", "--no-screenshot", "--tab-id", changesTab);
+  if (!/^still changing after \d+ms \(partial\):$/m.test(tickerOutput)) {
+    throw new Error(`a page that keeps changing was not reported as partial: ${tickerOutput}`);
+  }
+  const leaveOutput = await runSurf("click", "--selector", "#leave", "--no-screenshot", "--tab-id", changesTab);
+  const navigatedLines = leaveOutput.split("\n").filter((line) => line.startsWith("navigated: "));
+  if (navigatedLines.length !== 1 || navigatedLines[0] !== `navigated: ${baseUrl}/changes -> ${baseUrl}/changes-target "Changes target"` || leaveOutput.includes("changed (")) {
+    throw new Error(`a navigating click did not report one navigation line: ${leaveOutput}`);
+  }
+  await runSurf("tab.close", "--id", changesTab, "--json");
+
+  // Native JS dialogs (#343): the click that opens one returns, and dialog.* handle it.
+  const nativeDialogNotice = (type, message) =>
+    `Native ${type} dialog is open: ${JSON.stringify(message)}. Close it with dialog.accept or dialog.dismiss.`;
+  const expectNativeDialog = async (tabId, type, message) => {
+    const info = unwrapJson(await runSurf("dialog.info", "--tab-id", tabId, "--json"));
+    if (info?.hasDialog !== true || info.type !== type || info.message !== message) {
+      throw new Error(`dialog.info did not report the open ${type} dialog: ${JSON.stringify(info)}`);
+    }
+  };
+  // CDP click (--selector) on a tab the debugger already controls.
+  const cdpDialogTab = String(tabIdFromOutput(await runSurf("tab.new", `${baseUrl}/native-dialog`)));
+  await runSurf("wait.ready", "--json", "--tab-id", cdpDialogTab, "--selector", "#confirm");
+  for (const flags of [[], ["--no-diff", "--no-screenshot"]]) {
+    const clicked = await runSurf("click", "--selector", "#alert", "--tab-id", cdpDialogTab, ...flags);
+    if (clicked.trim() !== `OK\n${nativeDialogNotice("alert", "hi")}`) {
+      throw new Error(`a click that opened alert() did not report it (${flags.join(" ")}): ${clicked}`);
+    }
+    await expectNativeDialog(cdpDialogTab, "alert", "hi");
+    await runSurf("dialog.accept", "--tab-id", cdpDialogTab, "--no-screenshot");
+    if (unwrapJson(await runSurf("dialog.info", "--tab-id", cdpDialogTab, "--json"))?.hasDialog !== false) {
+      throw new Error("dialog.accept did not close the alert");
+    }
+  }
+  await runSurf("tab.close", "--id", cdpDialogTab, "--json");
+  // Content-script click (ref) on a tab no command has attached the debugger to yet.
+  const refDialogTab = String(tabIdFromOutput(await runSurf("tab.new", `${baseUrl}/native-dialog`)));
+  const confirmRef = (await runSurf("page.read", "--tab-id", refDialogTab)).match(/button "Confirm" \[(e\d+)\]/)?.[1];
+  for (const [flags, verb, answer] of [[[], "dialog.dismiss", "no"], [["--no-diff", "--no-screenshot"], "dialog.accept", "yes"]]) {
+    const clicked = await runSurf("click", confirmRef, "--tab-id", refDialogTab, ...flags);
+    if (clicked.trim() !== `OK\n${nativeDialogNotice("confirm", "Sure?")}`) {
+      throw new Error(`a ref click that opened confirm() did not report it (${flags.join(" ")}): ${clicked}`);
+    }
+    await expectNativeDialog(refDialogTab, "confirm", "Sure?");
+    await runSurf(verb, "--tab-id", refDialogTab, "--no-screenshot");
+    if (!(await runSurf("page.text", "--tab-id", refDialogTab)).includes(`Alert Confirm ${answer}`)) {
+      throw new Error(`${verb} did not answer the confirm() with ${answer}`);
+    }
+  }
+  await runSurf("tab.close", "--id", refDialogTab, "--json");
+
   await runSurf("screenshot", "--output", screenshotPath);
   const png = readFileSync(screenshotPath);
   if (png.length < 100 || png.subarray(0, 8).toString("hex") !== "89504e470d0a1a0a") {
@@ -628,6 +847,7 @@ try {
         readiness: { fixture: readiness.state, loginAccepted: acceptedLogin.state },
         frameDiagnoseWarnings: diagnosis.warnings.length,
         scriptOptions: { js: jsOutput.total, frameJs: frameOutput.total, frozen: frameInline.frozen },
+        pageChanges: { noopLatency },
         screenshotBytes: png.length,
         serviceWorker: workerTarget.url(),
       },

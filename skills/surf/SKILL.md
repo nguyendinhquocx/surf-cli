@@ -407,6 +407,7 @@ surf page.read --ref e5        # Get specific element details
 surf page.read --depth 3       # Limit tree depth
 surf page.read --compact       # Minimal output for LLM efficiency
 surf page.read --max-bytes 2000 # Cap the tree and visible text at 2000 bytes
+surf page.read --summary       # Short overview: headings, control counts per region, dialogs (no refs)
 surf page.text                 # Plain text content only
 surf page.html --strip-scripts # Rendered HTML without scripts
 surf page.save --selector "#artifact" --strip-scripts --output page.html # Save one static element
@@ -820,6 +821,8 @@ surf wait.element ".missing" --auto-capture --timeout 2000
 --json                # Raw JSON including target metadata
 --auto-capture        # Screenshot + console on error
 --timeout <ms>        # Override default timeout
+--settle <ms>         # Max wait before actions report page changes (default 2000, max 30000, surf.json settleMs)
+--no-diff             # Skip the page-change report after actions
 ```
 
 ## Tips

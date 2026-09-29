@@ -117,6 +117,26 @@ class FakeInputElement extends FakeElement {}
 class FakeSelectElement extends FakeElement {}
 class FakeTextAreaElement extends FakeElement {}
 
+class FakeMutationObserver {
+  static active = new Set<FakeMutationObserver>();
+
+  constructor(private callback: (records: unknown[]) => void) {}
+
+  observe(): void {
+    FakeMutationObserver.active.add(this);
+  }
+
+  disconnect(): void {
+    FakeMutationObserver.active.delete(this);
+  }
+
+  static mutate(records: unknown[] = [{ type: "attributes", target: {} }]): void {
+    for (const observer of FakeMutationObserver.active) {
+      observer.callback(records);
+    }
+  }
+}
+
 function text(value: string): FakeText {
   return new FakeText(value);
 }
@@ -147,6 +167,8 @@ describe("accessibility tree", () => {
     (globalThis as any).HTMLSelectElement = FakeSelectElement;
     (globalThis as any).HTMLTextAreaElement = FakeTextAreaElement;
     (globalThis as any).Node = FakeNode;
+    (globalThis as any).MutationObserver = FakeMutationObserver;
+    FakeMutationObserver.active.clear();
 
     (globalThis as any).window = {
       innerWidth: 1024,
@@ -180,6 +202,353 @@ describe("accessibility tree", () => {
     };
 
     await import("../../src/content/accessibility-tree");
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  const sendMessage = (message: Record<string, unknown>): any => {
+    let response: any;
+    messageHandler?.(message, {}, (result) => {
+      response = result;
+    });
+    return response;
+  };
+
+  // Resolves after the full cap so every settle outcome has delivered its async response.
+  const endPageChanges = async (capMs = 2000): Promise<{ keptOpen: unknown; result: any }> => {
+    let result: any;
+    const keptOpen = messageHandler?.(
+      { type: "END_PAGE_CHANGES", token: "action-1", capMs },
+      {},
+      (response) => {
+        result = response;
+      },
+    );
+    await vi.advanceTimersByTimeAsync(capMs);
+    return { keptOpen, result };
+  };
+
+  const beginPageChanges = (): any => {
+    vi.useFakeTimers();
+    (document as any).documentElement = new FakeElement("html");
+    return sendMessage({ type: "BEGIN_PAGE_CHANGES", token: "action-1" });
+  };
+
+  it("reports an opened dialog and its buttons with refs that the next click resolves", async () => {
+    const open = element("button");
+    open.append(text("Delete project"));
+    const body = document.body as unknown as FakeElement;
+    body.append(open);
+    expect(beginPageChanges()).toEqual({
+      ok: true,
+      url: "https://example.test/page",
+      title: "Example",
+    });
+
+    await vi.advanceTimersByTimeAsync(40);
+    const dialog = element("div", { role: "dialog", "aria-label": "Delete project?" });
+    const warning = element("p");
+    warning.append(text("This cannot be undone."));
+    const cancel = element("button");
+    cancel.append(text("Cancel"));
+    const confirm = element("button");
+    confirm.append(text("Delete"));
+    dialog.append(warning, cancel, confirm);
+    body.append(dialog);
+    FakeMutationObserver.mutate();
+
+    const { keptOpen, result } = await endPageChanges();
+    expect(keptOpen).toBe(true);
+    const dialogRef = result.changes[0].ref;
+    expect(result).toEqual({
+      settle: { state: "settled", ms: 340 },
+      navigated: null,
+      changes: [
+        { kind: "added", ref: dialogRef, role: "dialog", name: "Delete project?" },
+        {
+          kind: "added",
+          ref: expect.any(String),
+          role: "button",
+          name: "Cancel",
+          within: dialogRef,
+        },
+        {
+          kind: "added",
+          ref: expect.any(String),
+          role: "button",
+          name: "Delete",
+          within: dialogRef,
+        },
+      ],
+      text: [{ region: 'dialog "Delete project?"', added: 1, removed: 0 }],
+      omitted: 0,
+    });
+    expect(dialogRef).toEqual(expect.any(String));
+
+    expect(
+      sendMessage({ type: "CLICK_ELEMENT", ref: result.changes[2].ref, button: "left" }),
+    ).toEqual({
+      success: true,
+    });
+    expect(confirm.clicked).toBe(true);
+    expect(cancel.clicked).toBe(false);
+  });
+
+  it("gives added elements refs that suggest their replacement after a re-render", async () => {
+    const label = "Save ".repeat(20).trim();
+    const body = document.body as unknown as FakeElement;
+    beginPageChanges();
+    const first = element("button");
+    first.append(text(label));
+    body.append(first);
+    FakeMutationObserver.mutate();
+    const { result } = await endPageChanges();
+    const staleRef = result.changes[0].ref;
+
+    first.isConnected = false;
+    body.childNodes = body.childNodes.filter((child) => child !== first);
+    const replacement = element("button");
+    replacement.append(text(label));
+    body.append(replacement);
+
+    expect(sendMessage({ type: "CLICK_ELEMENT", ref: staleRef, button: "left" }).error).toMatch(
+      new RegExp(
+        `^Element ${staleRef} no longer exists\\. Did you mean e\\d+ \\(button "${label}"\\)\\?`,
+      ),
+    );
+  });
+
+  it("reports a toggled checkbox as one checked state change", async () => {
+    const checkbox = new FakeInputElement("input");
+    checkbox.setAttribute("type", "checkbox");
+    checkbox.setAttribute("aria-label", "Remember me");
+    (document.body as unknown as FakeElement).append(checkbox);
+    beginPageChanges();
+
+    checkbox.checked = true;
+
+    const { result } = await endPageChanges();
+    expect(result.changes).toEqual([
+      {
+        kind: "changed",
+        ref: expect.any(String),
+        role: "checkbox",
+        name: "Remember me",
+        property: "checked",
+        from: false,
+        to: true,
+      },
+    ]);
+  });
+
+  it("does not report a re-render that swaps a button for an identical node", async () => {
+    const body = document.body as unknown as FakeElement;
+    const original = element("button");
+    original.append(text("Save"));
+    body.append(original);
+    beginPageChanges();
+
+    const replacement = element("button");
+    replacement.append(text("Save"));
+    body.childNodes = [];
+    body.append(replacement);
+    FakeMutationObserver.mutate();
+
+    const { result } = await endPageChanges();
+    expect(result).toMatchObject({
+      settle: { state: "settled" },
+      changes: [],
+      text: [],
+      omitted: 0,
+    });
+  });
+
+  it("redacts sensitive field value changes and reports ordinary values", async () => {
+    const password = new FakeInputElement("input");
+    password.setAttribute("type", "password");
+    password.setAttribute("aria-label", "Password");
+    password.value = "old-password-sentinel";
+    const card = new FakeInputElement("input");
+    card.setAttribute("autocomplete", "billing cc-number");
+    card.setAttribute("aria-label", "Card");
+    const email = new FakeInputElement("input");
+    email.setAttribute("type", "email");
+    email.setAttribute("aria-label", "Email");
+    (document.body as unknown as FakeElement).append(password, card, email);
+    beginPageChanges();
+
+    password.value = "new-password-sentinel";
+    card.value = "4111-card-sentinel";
+    email.value = "me@example.test";
+
+    const { result } = await endPageChanges();
+    expect(result.changes).toEqual([
+      {
+        kind: "changed",
+        ref: expect.any(String),
+        role: "textbox",
+        name: "Password",
+        property: "value",
+        redacted: true,
+      },
+      {
+        kind: "changed",
+        ref: expect.any(String),
+        role: "textbox",
+        name: "Card",
+        property: "value",
+        redacted: true,
+      },
+      {
+        kind: "changed",
+        ref: expect.any(String),
+        role: "textbox",
+        name: "Email",
+        property: "value",
+        from: "",
+        to: "me@example.test",
+      },
+    ]);
+    const serialized = JSON.stringify(result);
+    expect(serialized).not.toContain("password-sentinel");
+    expect(serialized).not.toContain("card-sentinel");
+  });
+
+  it("reports quiet when nothing but the surf indicator mutates", async () => {
+    beginPageChanges();
+    const glow = element("div", { id: "pi-agent-glow" });
+    (document.body as unknown as FakeElement).append(glow);
+    FakeMutationObserver.mutate([
+      { type: "childList", target: document.body, addedNodes: [glow], removedNodes: [] },
+    ]);
+
+    const { result } = await endPageChanges();
+    expect(result).toEqual({
+      settle: { state: "quiet", ms: 300 },
+      navigated: null,
+      changes: [],
+      text: [],
+      omitted: 0,
+    });
+  });
+
+  it("reports unsettled with partial changes when mutations continue past the cap", async () => {
+    beginPageChanges();
+    const ticker = setInterval(() => FakeMutationObserver.mutate(), 50);
+
+    const { result } = await endPageChanges(1000);
+    clearInterval(ticker);
+    expect(result.settle).toEqual({ state: "unsettled", ms: 1000 });
+  });
+
+  it("returns unknown_token when the document holding the before snapshot is gone", () => {
+    expect(sendMessage({ type: "END_PAGE_CHANGES", token: "never-begun", capMs: 2000 })).toEqual({
+      error: "unknown_token",
+    });
+  });
+
+  it("returns a full tree on back-to-back reads instead of a hidden diff", () => {
+    const button = element("button");
+    button.append(text("Continue"));
+    (document.body as unknown as FakeElement).append(button);
+
+    sendMessage({ type: "GENERATE_ACCESSIBILITY_TREE", options: { filter: "interactive" } });
+    const second = sendMessage({
+      type: "GENERATE_ACCESSIBILITY_TREE",
+      options: { filter: "interactive" },
+    });
+    expect(second.pageContent).toContain('button "Continue"');
+    expect(second).not.toHaveProperty("diff");
+    expect(second).not.toHaveProperty("isIncremental");
+  });
+
+  it("summarizes headings, control counts per region, open dialogs and alerts without refs", () => {
+    const withText = (node: FakeElement, value: string): FakeElement => {
+      node.append(text(value));
+      return node;
+    };
+    const banner = element("header");
+    banner.append(
+      withText(element("h1"), "Example Store"),
+      withText(element("a", { href: "/" }), "Home"),
+    );
+    const nav = element("nav", { "aria-label": "Primary" });
+    nav.append(
+      withText(element("a", { href: "/deals" }), "Deals"),
+      withText(element("a", { href: "/help" }), "Help"),
+    );
+    const main = element("main");
+    main.append(
+      withText(element("h2"), "Products"),
+      element("input", { type: "search", "aria-label": "Search products" }),
+      withText(element("button"), "Add lamp"),
+      withText(element("button"), "Add chair"),
+      withText(element("a", { href: "/cart" }), "Cart"),
+    );
+    const alert = withText(element("div", { role: "alert" }), "Saved to cart");
+    const status = withText(element("div", { role: "status" }), "2 items");
+    const dialog = element("div", { role: "dialog", "aria-label": "Sign in" });
+    dialog.append(
+      withText(element("div", { role: "heading", "aria-level": "3" }), "Welcome back"),
+      element("input", { type: "email", "aria-label": "Email" }),
+      withText(element("button"), "Continue"),
+    );
+    (document.body as unknown as FakeElement).append(
+      banner,
+      nav,
+      main,
+      withText(element("button"), "Feedback"),
+      alert,
+      status,
+      dialog,
+    );
+
+    const summary = sendMessage({
+      type: "GENERATE_ACCESSIBILITY_TREE",
+      options: { summary: true },
+    });
+
+    expect(summary).toEqual({
+      title: "Example",
+      url: "https://example.test/page",
+      headings: [
+        { level: 1, name: "Example Store" },
+        { level: 2, name: "Products" },
+        { level: 3, name: "Welcome back" },
+      ],
+      headingsOmitted: 0,
+      regions: [
+        { region: "banner", controls: { link: 1 } },
+        { region: 'navigation "Primary"', controls: { link: 2 } },
+        { region: "main", controls: { button: 2, searchbox: 1, link: 1 } },
+        { region: "page", controls: { button: 1 } },
+        { region: 'dialog "Sign in"', controls: { textbox: 1, button: 1 } },
+      ],
+      dialogs: [{ role: "dialog", name: "Sign in" }],
+      alerts: [{ role: "alert", name: "Saved to cart" }],
+    });
+    expect(JSON.stringify(summary)).not.toMatch(/\be\d+\b/);
+  });
+
+  it("caps summary headings and counts the rest", () => {
+    const body = document.body as unknown as FakeElement;
+    for (let index = 1; index <= 12; index++) {
+      const heading = element("div", { role: "heading" });
+      heading.append(text(`Section ${index}`));
+      body.append(heading);
+    }
+
+    const summary = sendMessage({
+      type: "GENERATE_ACCESSIBILITY_TREE",
+      options: { summary: true },
+    });
+
+    expect(summary.headings).toHaveLength(10);
+    expect(summary.headings[9]).toEqual({ level: 2, name: "Section 10" });
+    expect(summary.headingsOmitted).toBe(2);
+    expect(summary.regions).toEqual([]);
   });
 
   it("routes visual indicator commands through the sole content-message listener", () => {
@@ -856,36 +1225,124 @@ describe("accessibility tree", () => {
     expect(staleScope).toMatchObject({ success: false, reason: "stale_scroll_scope" });
   });
 
-  it("caps visible text in compact mode", () => {
-    (document.body as unknown as FakeElement).append(text("abcdef"));
-
-    let response: any;
-    messageHandler?.(
-      { type: "GET_PAGE_TEXT", options: { compact: true, maxBytes: 3 } },
-      {},
-      (result) => {
+  describe("refs whose element was re-rendered", () => {
+    const send = (message: Record<string, unknown>) => {
+      let response: any;
+      messageHandler?.(message, {}, (result) => {
         response = result;
-      },
-    );
+      });
+      return response;
+    };
+    const body = () => document.body as unknown as FakeElement;
+    const button = (label: string) => {
+      const node = element("button");
+      node.append(text(label));
+      return node;
+    };
+    const readRef = (label: string) => {
+      const content = send({
+        type: "GENERATE_ACCESSIBILITY_TREE",
+        options: { filter: "interactive" },
+      }).pageContent;
+      return content.match(new RegExp(`button "${label}" \\[(e\\d+)\\]`))[1] as string;
+    };
+    const replaceBody = (...children: FakeElement[]) => {
+      for (const child of body().children) {
+        child.isConnected = false;
+      }
+      body().childNodes = [];
+      body().append(...children);
+    };
 
-    expect(response).toMatchObject({
-      text: "abc",
-      title: "Example",
-      url: "https://example.test/page",
+    it("names the replacement element when role and name match exactly one", () => {
+      const original = button("Save");
+      body().append(original);
+      const staleRef = readRef("Save");
+
+      const replacement = button("Save");
+      const otherRole = element("a", { href: "/save" });
+      otherRole.append(text("Save"));
+      replaceBody(button("Save draft"), otherRole, replacement);
+
+      const stale = send({ type: "CLICK_ELEMENT", ref: staleRef, button: "left" });
+      const suggested = stale.error.match(/Did you mean (e\d+) /)?.[1];
+      expect(stale.error).toBe(
+        `Element ${staleRef} no longer exists. Did you mean ${suggested} (button "Save")? Otherwise run surf read.`,
+      );
+      expect(suggested).not.toBe(staleRef);
+      expect(original.clicked).toBe(false);
+
+      expect(send({ type: "CLICK_ELEMENT", ref: suggested, button: "left" })).toEqual({
+        success: true,
+      });
+      expect(replacement.clicked).toBe(true);
+    });
+
+    it("returns a plain error when no single element has the same role and name", () => {
+      body().append(button("Save"));
+      const staleRef = readRef("Save");
+      const plain = `Element ${staleRef} no longer exists. Run surf read to get current refs.`;
+
+      const link = element("a", { href: "/save" });
+      link.append(text("Save"));
+      replaceBody(button("Save as"), link);
+      expect(send({ type: "CLICK_ELEMENT", ref: staleRef, button: "left" })).toEqual({
+        error: plain,
+      });
+
+      replaceBody(button("Save"), button("Save"));
+      expect(send({ type: "SCROLL_TO_ELEMENT", ref: staleRef })).toEqual({
+        success: false,
+        error: plain,
+      });
+
+      expect(send({ type: "GET_ELEMENT_COORDINATES", ref: "e999" })).toMatchObject({
+        error: "Element e999 not found. Run surf read to get current refs.",
+      });
+    });
+
+    it("matches a located ref by the element's own name, not the locator query", () => {
+      (document as any).querySelectorAll = (selector: string) =>
+        selector === "button" ? body().children.filter((child) => child.tagName === "BUTTON") : [];
+      body().append(button("Save changes"));
+      const staleRef = send({ type: "LOCATE_ROLE", role: "button", name: "Save" }).ref;
+
+      replaceBody(button("Save"));
+      expect(send({ type: "CLICK_ELEMENT", ref: staleRef, button: "left" })).toEqual({
+        error: `Element ${staleRef} no longer exists. Run surf read to get current refs.`,
+      });
+
+      const replacement = button("Save changes");
+      replaceBody(button("Save"), replacement);
+      const { error } = send({ type: "CLICK_ELEMENT", ref: staleRef, button: "left" });
+      const suggested = error.match(/Did you mean (e\d+) \(button "Save changes"\)\?/)?.[1];
+      send({ type: "CLICK_ELEMENT", ref: suggested, button: "left" });
+      expect(replacement.clicked).toBe(true);
+    });
+
+    it("does not suggest an element inside an aria-hidden container", () => {
+      body().append(button("Save"));
+      const staleRef = readRef("Save");
+
+      const hidden = element("div", { "aria-hidden": "true" });
+      hidden.append(button("Save"));
+      replaceBody(hidden);
+      expect(send({ type: "CLICK_ELEMENT", ref: staleRef, button: "left" })).toEqual({
+        error: `Element ${staleRef} no longer exists. Run surf read to get current refs.`,
+      });
     });
   });
 
-  it("preserves the existing 50000-character default when max-bytes is not given", () => {
+  it("returns the whole visible text so the host can mark a cut", () => {
     const long = "😀".repeat(30000);
     (document.body as unknown as FakeElement).append(text(long));
 
     let response: any;
-    messageHandler?.({ type: "GET_PAGE_TEXT", options: { compact: true } }, {}, (result) => {
+    messageHandler?.({ type: "GET_PAGE_TEXT" }, {}, (result) => {
       response = result;
     });
 
-    expect(response.text.length).toBe(50000);
-    expect(new TextEncoder().encode(response.text).length).toBe(100000);
+    expect(response).toEqual({ text: long, title: "Example", url: "https://example.test/page" });
   });
 
   it("types into a selector in the content-script frame", () => {
@@ -1003,24 +1460,5 @@ describe("accessibility tree", () => {
     }
     expect(checkbox.checked).toBe(true);
     expect(select.value).toBe("chosen");
-  });
-
-  it("truncates multi-byte utf-8 text on a byte boundary, not a surrogate", () => {
-    (document.body as unknown as FakeElement).append(text("😀😀"));
-
-    let response: any;
-    messageHandler?.(
-      { type: "GET_PAGE_TEXT", options: { compact: true, maxBytes: 3 } },
-      {},
-      (result) => {
-        response = result;
-      },
-    );
-
-    expect(response.text).not.toContain("\uD83D");
-    expect(response.text).not.toContain("\uDE00");
-    const byteLen = new TextEncoder().encode(response.text).length;
-    expect(byteLen).toBeLessThanOrEqual(3);
-    expect(response.text).toBe("");
   });
 });

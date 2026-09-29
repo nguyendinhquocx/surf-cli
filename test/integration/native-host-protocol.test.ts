@@ -1192,6 +1192,42 @@ describe("native host protocol integration", () => {
     }
   });
 
+  it("forwards pageChanges to the extension and returns its result at the top level", async () => {
+    const host = await startHostHarness();
+    const transport = await openClientTransport({
+      kind: "local",
+      connectionOptions: host.socketPath,
+    });
+    const pageChanges = {
+      settle: { state: "settled", ms: 120 },
+      navigated: null,
+      changes: [{ kind: "added", ref: "e4", role: "button", name: "Delete" }],
+      text: [],
+      omitted: 0,
+    };
+    try {
+      const response = transport.request({
+        type: "tool_request",
+        method: "execute_tool",
+        params: { tool: "click", args: { selector: "#go", pageChanges: { settleMs: 500 } } },
+        tabId: 1,
+        id: "page-changes",
+      });
+      const click = await host.waitForMessage(
+        (message) => message.type === "CLICK_SELECTOR",
+        "click with page changes",
+      );
+      expect(click.pageChanges).toEqual({ settleMs: 500 });
+      host.send({ id: click.id, success: true, pageChanges });
+      const replied = await response;
+      expect(replied.error).toBeUndefined();
+      expect(replied.pageChanges).toEqual(pageChanges);
+      expect(replied.result.content).toEqual([{ type: "text", text: "OK" }]);
+    } finally {
+      await transport.close();
+    }
+  });
+
   it("replies before a local auto-screenshot and holds the tab until the file is written", async () => {
     const surfTmp = fs.mkdtempSync(path.join(os.tmpdir(), "surf-auto-local-"));
     tempDirs.push(surfTmp);
@@ -1258,6 +1294,93 @@ describe("native host protocol integration", () => {
       expect((await nextResponse).error).toBeUndefined();
     } finally {
       await nextClient.close();
+    }
+  });
+
+  it("reports a native dialog opened by an action without capturing a screenshot", async () => {
+    const surfTmp = fs.mkdtempSync(path.join(os.tmpdir(), "surf-native-dialog-"));
+    tempDirs.push(surfTmp);
+    const host = await startHostHarness({ SURF_TMP: surfTmp });
+    const transport = await openClientTransport({
+      kind: "local",
+      connectionOptions: host.socketPath,
+    });
+    try {
+      const response = transport.request({
+        type: "tool_request",
+        method: "execute_tool",
+        params: { tool: "click", args: { selector: "#alert", autoScreenshot: true } },
+        tabId: 1,
+        id: "click-opens-alert",
+      });
+      const click = await host.waitForMessage(
+        (message) => message.type === "CLICK_SELECTOR",
+        "click that opens an alert",
+      );
+      expect(click.watchDialogs).toBe(true);
+      host.send({ id: click.id, success: true, nativeDialog: { type: "alert", message: "hi" } });
+      expect((await response).result.content).toEqual([
+        {
+          type: "text",
+          text: 'OK\nNative alert dialog is open: "hi". Close it with dialog.accept or dialog.dismiss.',
+        },
+      ]);
+      // A page blocked by a native dialog cannot be captured; the capture starts after 500ms.
+      await host.expectNoMessage(
+        (message) => message.type === "EXECUTE_SCREENSHOT",
+        "screenshot of a page blocked by a native dialog",
+        800,
+      );
+    } finally {
+      await transport.close();
+    }
+  });
+
+  it("handles a native dialog while the action that opened it still holds the tab", async () => {
+    const host = await startHostHarness();
+    const clickClient = await openClientTransport({
+      kind: "local",
+      connectionOptions: host.socketPath,
+    });
+    const dialogClient = await openClientTransport({
+      kind: "local",
+      connectionOptions: host.socketPath,
+    });
+    try {
+      const clickResponse = clickClient.request({
+        type: "tool_request",
+        method: "execute_tool",
+        params: { tool: "click", args: { selector: "#alert" } },
+        tabId: 1,
+        id: "click-blocked-by-alert",
+      });
+      const click = await host.waitForMessage(
+        (message) => message.type === "CLICK_SELECTOR",
+        "click blocked by an alert",
+      );
+      for (const [tool, type] of [
+        ["dialog.info", "DIALOG_INFO"],
+        ["dialog.accept", "DIALOG_ACCEPT"],
+      ]) {
+        const dialogResponse = dialogClient.request({
+          type: "tool_request",
+          method: "execute_tool",
+          params: { tool, args: {} },
+          tabId: 1,
+          id: `${tool}-during-blocked-click`,
+        });
+        const dialog = await host.waitForMessage(
+          (message) => message.type === type,
+          `${tool} while the click holds the tab`,
+        );
+        host.send({ id: dialog.id, success: true });
+        expect((await dialogResponse).error).toBeUndefined();
+      }
+      host.send({ id: click.id, success: true });
+      expect((await clickResponse).error).toBeUndefined();
+    } finally {
+      await dialogClient.close();
+      await clickClient.close();
     }
   });
 
@@ -1389,6 +1512,39 @@ describe("native host protocol integration", () => {
         "primary click failure",
       );
       expect(fs.existsSync(primaryFailure.downloads[0].destination)).toBe(false);
+
+      const dialogAction = fileTransfer.prepareRemoteTool("click", {
+        selector: "#alert",
+        autoScreenshot: true,
+      });
+      const dialogActionResponse = transport.request(
+        {
+          type: "tool_request",
+          method: "execute_tool",
+          params: { tool: "click", args: dialogAction.args },
+          tabId: 1,
+          id: "auto-native-dialog",
+        },
+        30000,
+        dialogAction,
+      );
+      const dialogClick = await host.waitForMessage(
+        (message) => message.type === "CLICK_SELECTOR",
+        "auto native-dialog click",
+      );
+      host.send({
+        id: dialogClick.id,
+        success: true,
+        nativeDialog: { type: "confirm", message: "Sure?" },
+      });
+      expect((await dialogActionResponse).error.content[0].text).toContain(
+        "a native confirm dialog is open; close it with dialog.accept or dialog.dismiss",
+      );
+      await host.expectNoMessage(
+        (message) => message.type === "EXECUTE_SCREENSHOT",
+        "remote screenshot of a page blocked by a native dialog",
+      );
+      expect(fs.existsSync(dialogAction.downloads[0].destination)).toBe(false);
 
       const nextPromise = transport.request({
         type: "tool_request",
@@ -2043,6 +2199,55 @@ describe("native host protocol integration", () => {
     const capped = await read(["--max-bytes", "1000"]);
     expect(Buffer.byteLength(capped.stdout)).toBeLessThan(1_500);
     expect(capped.stdout).toContain("Full tree: ");
+  });
+
+  it("marks truncated page text and saves the full text to a private file", async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "surf-text-spill-"));
+    tempDirs.push(tmp);
+    const host = await startHostHarness({ SURF_TMP: tmp });
+    const longText = "word ".repeat(12_000).trim();
+    const run = async (args: string[], type: string, reply: Record<string, unknown>) => {
+      const cliPromise = runCli(args, host.socketPath);
+      const request = await host.waitForMessage((message) => message.type === type, type);
+      host.send({ id: request.id, ...reply });
+      return cliPromise;
+    };
+    const pageText = (text: string, args: string[] = []) =>
+      run(["page.text", ...args], "GET_PAGE_TEXT", {
+        text,
+        title: "Long",
+        url: "https://example.test/",
+      });
+
+    const plain = await pageText(longText);
+    expect(plain.code).toBe(0);
+    expect(plain.stdout).toContain("[Truncated: showing 50000 of 59999 bytes. Full text: ");
+    const fullPath = plain.stdout.match(/Full text: (\S+)\.\]/)?.[1] as string;
+    expect(fs.readFileSync(fullPath, "utf8")).toBe(longText);
+    if (process.platform !== "win32") {
+      expect(fs.statSync(fullPath).mode & 0o777).toBe(0o600);
+    }
+
+    const json = JSON.parse((await pageText(longText, ["--json"])).stdout);
+    expect(json.truncated).toEqual({
+      shownBytes: 50000,
+      totalBytes: 59999,
+      path: expect.any(String),
+    });
+    expect(fs.readFileSync(json.truncated.path, "utf8")).toBe(longText);
+
+    const read = await run(["read", "--max-bytes", "2000"], "READ_PAGE", {
+      pageContent: 'button "Go" [e1]',
+      text: longText,
+    });
+    expect(read.code).toBe(0);
+    expect(read.stdout).toMatch(
+      /--- Page Text ---\n(word ){400}\n\n\[Truncated: showing 2000 of 59999 bytes\. Full text: \S+\.\]/,
+    );
+
+    const short = await pageText("short page", ["--json"]);
+    expect(short.stdout).toContain("short page");
+    expect(short.stdout).not.toMatch(/truncated/i);
   });
 
   it("propagates extension errors through the native host to CLI stderr", async () => {

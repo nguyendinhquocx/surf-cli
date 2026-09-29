@@ -10,13 +10,21 @@ import {
   moveSemanticScrollScope,
   scrollToPosition,
 } from "../utils/scroll-position";
+import {
+  diffPageSnapshots,
+  PAGE_CONTAINER_ROLES,
+  PAGE_TRACKED_ROLES,
+  type PageChanges,
+  type PageNode,
+  type PageSnapshot,
+  type PageStateValue,
+} from "../utils/page-changes";
 
 export {};
 
 declare global {
   interface Window {
     __piElementMap?: Record<string, { element: WeakRef<Element>; role: string; name: string }>;
-    __piLastSnapshot?: { content: string; timestamp: number };
     __piHelpers?: typeof piHelpersImpl;
     piHelpers?: typeof piHelpersImpl;
     __piRefs?: Record<string, Element>;
@@ -460,6 +468,82 @@ function getResolvedRole(element: Element): string {
   return explicitRole;
 }
 
+function getName(element: Element): string {
+  const tag = element.tagName.toLowerCase();
+
+  const labelledBy = element.getAttribute('aria-labelledby');
+  if (labelledBy) {
+    const names = labelledBy.split(/\s+/).map(id => {
+      const el = document.getElementById(id);
+      return el?.textContent?.trim() || '';
+    }).filter(Boolean);
+    if (names.length) {
+      const joined = names.join(' ');
+      return joined.length > 100 ? joined.substring(0, 100) + '...' : joined;
+    }
+  }
+
+  if (tag === "select") {
+    const select = element as HTMLSelectElement;
+    const selected = select.querySelector("option[selected]") ||
+      (select.selectedIndex >= 0 ? select.options[select.selectedIndex] : null);
+    if (selected?.textContent?.trim()) return selected.textContent.trim();
+  }
+
+  const ariaLabel = element.getAttribute("aria-label");
+  if (ariaLabel?.trim()) return ariaLabel.trim();
+
+  const placeholder = element.getAttribute("placeholder");
+  if (placeholder?.trim()) return placeholder.trim();
+
+  const title = element.getAttribute("title");
+  if (title?.trim()) return title.trim();
+
+  const alt = element.getAttribute("alt");
+  if (alt?.trim()) return alt.trim();
+
+  if (element.id) {
+    const label = document.querySelector(`label[for="${element.id}"]`);
+    if (label?.textContent?.trim()) return label.textContent.trim();
+  }
+
+  if (tag === "input") {
+    const input = element as HTMLInputElement;
+    const type = element.getAttribute("type") || "";
+    const value = element.getAttribute("value");
+    if (type === "submit" && value?.trim()) return value.trim();
+    if (input.value && input.value.length < 50 && input.value.trim()) return input.value.trim();
+  }
+
+  if (["button", "a", "summary"].includes(tag)) {
+    const textContent = element.textContent || "";
+    if (textContent.trim()) return textContent.trim();
+  }
+
+  if (/^h[1-6]$/.test(tag)) {
+    const text = element.textContent;
+    if (text?.trim()) {
+      const t = text.trim();
+      return t.length > 100 ? t.substring(0, 100) + "..." : t;
+    }
+  }
+
+  if (tag === "img") return "";
+
+  let directText = "";
+  for (const node of element.childNodes) {
+    if (node.nodeType === Node.TEXT_NODE) {
+      directText += node.textContent;
+    }
+  }
+  if (directText?.trim() && directText.trim().length >= 3) {
+    const text = directText.trim();
+    return text.length > 100 ? text.substring(0, 100) + "..." : text;
+  }
+
+  return "";
+}
+
 if (!window.__piElementMap) window.__piElementMap = {};
 
 interface ElementRef {
@@ -469,6 +553,8 @@ interface ElementRef {
 }
 
 const elementRefs = new WeakMap<Element, ElementRef>();
+// Unlike __piElementMap entries, these outlive the element so a stale ref can name its replacement.
+const refIdentities: Record<string, { role: string; name: string }> = {};
 let globalRefCounter = 0;
 
 function getOrAssignRef(element: Element, role: string, name: string): string {
@@ -479,6 +565,7 @@ function getOrAssignRef(element: Element, role: string, name: string): string {
   
   const ref = `e${++globalRefCounter}`;
   elementRefs.set(element, { role, name, ref });
+  refIdentities[ref] = { role, name };
   return ref;
 }
 
@@ -692,103 +779,55 @@ function getElementMap() {
   return window.__piElementMap!;
 }
 
+function resolveRef(ref: string): { element: Element; error?: undefined } | { element?: undefined; error: string } {
+  const elementMap = getElementMap();
+  const element = elementMap[ref]?.element.deref() || window.__piRefs?.[ref];
+  // A re-rendered node stays reachable through __piRefs; acting on it would silently do nothing.
+  if (element?.isConnected) return { element };
+  const identity = refIdentities[ref];
+  if (!identity) return { error: `Element ${ref} not found. Run surf read to get current refs.` };
+
+  const matches: Element[] = [];
+  const pending: Element[] = identity.name ? [document.body] : [];
+  while (pending.length) {
+    const candidate = pending.pop()!;
+    if (candidate.getAttribute("aria-hidden") === "true") continue;
+    pending.push(...candidate.children);
+    if (getResolvedRole(candidate) !== identity.role || getName(candidate) !== identity.name) continue;
+    const style = window.getComputedStyle(candidate);
+    if (
+      style.display !== "none" && style.visibility !== "hidden" && style.opacity !== "0" &&
+      (candidate as HTMLElement).offsetWidth > 0 && (candidate as HTMLElement).offsetHeight > 0
+    ) matches.push(candidate);
+  }
+  if (matches.length !== 1) return { error: `Element ${ref} no longer exists. Run surf read to get current refs.` };
+
+  const suggested = getOrAssignRef(matches[0], identity.role, identity.name);
+  window.__piRefs = window.__piRefs || {};
+  window.__piRefs[suggested] = matches[0];
+  elementMap[suggested] = { element: new WeakRef(matches[0]), role: identity.role, name: identity.name };
+  const label = JSON.stringify(identity.name.replace(/\s+/g, " "));
+  return { error: `Element ${ref} no longer exists. Did you mean ${suggested} (${identity.role} ${label})? Otherwise run surf read.` };
+}
+
 function generateAccessibilityTree(
   filter: "all" | "interactive" = "interactive",
   maxDepth = 15,
   refId?: string,
-  forceFullSnapshot = false,
   compact = false,
   includeHidden = false
 ): { 
   pageContent: string;
-  diff?: string;
   viewport: { width: number; height: number }; 
   error?: string;
   modalStates?: ModalState[];
   modalLimitations?: string;
-  isIncremental?: boolean;
 } {
   try {
     window.__piRefs = {};
 
     function getRole(element: Element): string {
       return getResolvedRole(element);
-    }
-
-    function getName(element: Element): string {
-      const tag = element.tagName.toLowerCase();
-
-      const labelledBy = element.getAttribute('aria-labelledby');
-      if (labelledBy) {
-        const names = labelledBy.split(/\s+/).map(id => {
-          const el = document.getElementById(id);
-          return el?.textContent?.trim() || '';
-        }).filter(Boolean);
-        if (names.length) {
-          const joined = names.join(' ');
-          return joined.length > 100 ? joined.substring(0, 100) + '...' : joined;
-        }
-      }
-
-      if (tag === "select") {
-        const select = element as HTMLSelectElement;
-        const selected = select.querySelector("option[selected]") || 
-          (select.selectedIndex >= 0 ? select.options[select.selectedIndex] : null);
-        if (selected?.textContent?.trim()) return selected.textContent.trim();
-      }
-
-      const ariaLabel = element.getAttribute("aria-label");
-      if (ariaLabel?.trim()) return ariaLabel.trim();
-
-      const placeholder = element.getAttribute("placeholder");
-      if (placeholder?.trim()) return placeholder.trim();
-
-      const title = element.getAttribute("title");
-      if (title?.trim()) return title.trim();
-
-      const alt = element.getAttribute("alt");
-      if (alt?.trim()) return alt.trim();
-
-      if (element.id) {
-        const label = document.querySelector(`label[for="${element.id}"]`);
-        if (label?.textContent?.trim()) return label.textContent.trim();
-      }
-
-      if (tag === "input") {
-        const input = element as HTMLInputElement;
-        const type = element.getAttribute("type") || "";
-        const value = element.getAttribute("value");
-        if (type === "submit" && value?.trim()) return value.trim();
-        if (input.value && input.value.length < 50 && input.value.trim()) return input.value.trim();
-      }
-
-      if (["button", "a", "summary"].includes(tag)) {
-        const textContent = element.textContent || "";
-        if (textContent.trim()) return textContent.trim();
-      }
-
-      if (/^h[1-6]$/.test(tag)) {
-        const text = element.textContent;
-        if (text?.trim()) {
-          const t = text.trim();
-          return t.length > 100 ? t.substring(0, 100) + "..." : t;
-        }
-      }
-
-      if (tag === "img") return "";
-
-      let directText = "";
-      for (const node of element.childNodes) {
-        if (node.nodeType === Node.TEXT_NODE) {
-          directText += node.textContent;
-        }
-      }
-      if (directText?.trim() && directText.trim().length >= 3) {
-        const text = directText.trim();
-        return text.length > 100 ? text.substring(0, 100) + "..." : text;
-      }
-
-      return "";
     }
 
     interface AriaProps {
@@ -1001,85 +1040,14 @@ function generateAccessibilityTree(
       return lines;
     }
 
-    function normalizeLineForDiff(line: string): string {
-      return line.replace(/\[e\d+\]/g, '[REF]');
-    }
-
-    function countOccurrences(lines: string[]): Map<string, number> {
-      const counts = new Map<string, number>();
-      for (const line of lines) {
-        if (!line.trim()) continue;
-        const norm = normalizeLineForDiff(line);
-        counts.set(norm, (counts.get(norm) || 0) + 1);
-      }
-      return counts;
-    }
-
-    function computeSimpleDiff(oldContent: string, newContent: string): { diff: string; hasChanges: boolean } {
-      const oldLines = oldContent.split('\n');
-      const newLines = newContent.split('\n');
-      
-      const oldCounts = countOccurrences(oldLines);
-      const newCounts = countOccurrences(newLines);
-      
-      const added: string[] = [];
-      const removed: string[] = [];
-      
-      for (const line of newLines) {
-        if (!line.trim()) continue;
-        const norm = normalizeLineForDiff(line);
-        const oldCount = oldCounts.get(norm) || 0;
-        const newCount = newCounts.get(norm) || 0;
-        if (newCount > oldCount) {
-          added.push(line);
-          oldCounts.set(norm, oldCount + 1);
-        }
-      }
-      
-      const oldCountsReset = countOccurrences(oldLines);
-      for (const line of oldLines) {
-        if (!line.trim()) continue;
-        const norm = normalizeLineForDiff(line);
-        const oldCount = oldCountsReset.get(norm) || 0;
-        const newCount = newCounts.get(norm) || 0;
-        if (oldCount > newCount) {
-          removed.push(line);
-          oldCountsReset.set(norm, oldCount - 1);
-        }
-      }
-      
-      if (added.length === 0 && removed.length === 0) {
-        return { diff: '[NO CHANGES]', hasChanges: false };
-      }
-      
-      const diffLines: string[] = [];
-      if (removed.length > 0) {
-        diffLines.push(...removed.map(l => `- ${l}`));
-      }
-      if (added.length > 0) {
-        diffLines.push(...added.map(l => `+ ${l}`));
-      }
-      
-      return { diff: diffLines.join('\n'), hasChanges: true };
-    }
-
     const elementMap = getElementMap();
     let startElement: Element | null = null;
 
     if (refId) {
-      const elemRef = elementMap[refId];
-      if (!elemRef) {
-        return {
-          error: `Element with ref_id '${refId}' not found. Use read_page without ref_id to get current elements.`,
-          pageContent: "",
-          viewport: { width: window.innerWidth, height: window.innerHeight },
-        };
-      }
-      const element = elemRef.element.deref();
+      const { element, error } = resolveRef(refId);
       if (!element) {
-        delete elementMap[refId];
         return {
-          error: `Element with ref_id '${refId}' no longer exists. Use read_page without ref_id to get current elements.`,
+          error,
           pageContent: "",
           viewport: { width: window.innerWidth, height: window.innerHeight },
         };
@@ -1101,26 +1069,11 @@ function generateAccessibilityTree(
 
     const modalStates = detectModalStates();
 
-    let diff: string | undefined;
-    let isIncremental = false;
-    const lastSnapshot = window.__piLastSnapshot;
-
-    if (!forceFullSnapshot && !refId && lastSnapshot && 
-        Date.now() - lastSnapshot.timestamp < 5000) {
-      const diffResult = computeSimpleDiff(lastSnapshot.content, content);
-      diff = diffResult.diff;
-      isIncremental = true;
-    }
-
-    window.__piLastSnapshot = { content, timestamp: Date.now() };
-
     return {
       pageContent: content + `\n\n[Viewport: ${window.innerWidth}x${window.innerHeight}]`,
-      diff: isIncremental ? diff : undefined,
       viewport: { width: window.innerWidth, height: window.innerHeight },
       modalStates: modalStates.length > 0 ? modalStates : undefined,
       modalLimitations: 'Only custom modals ([role=dialog]) detected. Native alert/confirm/prompt dialogs and system file choosers cannot be detected from content scripts.',
-      isIncremental,
     };
   } catch (err) {
     return {
@@ -1151,82 +1104,6 @@ function generateYamlTree(
 
     function getRole(element: Element): string {
       return getResolvedRole(element);
-    }
-
-    function getName(element: Element): string {
-      const tag = element.tagName.toLowerCase();
-
-      const labelledBy = element.getAttribute('aria-labelledby');
-      if (labelledBy) {
-        const names = labelledBy.split(/\s+/).map(id => {
-          const el = document.getElementById(id);
-          return el?.textContent?.trim() || '';
-        }).filter(Boolean);
-        if (names.length) {
-          const joined = names.join(' ');
-          return joined.length > 100 ? joined.substring(0, 100) + '...' : joined;
-        }
-      }
-
-      if (tag === "select") {
-        const select = element as HTMLSelectElement;
-        const selected = select.querySelector("option[selected]") || 
-          (select.selectedIndex >= 0 ? select.options[select.selectedIndex] : null);
-        if (selected?.textContent?.trim()) return selected.textContent.trim();
-      }
-
-      const ariaLabel = element.getAttribute("aria-label");
-      if (ariaLabel?.trim()) return ariaLabel.trim();
-
-      const placeholder = element.getAttribute("placeholder");
-      if (placeholder?.trim()) return placeholder.trim();
-
-      const title = element.getAttribute("title");
-      if (title?.trim()) return title.trim();
-
-      const alt = element.getAttribute("alt");
-      if (alt?.trim()) return alt.trim();
-
-      if (element.id) {
-        const label = document.querySelector(`label[for="${element.id}"]`);
-        if (label?.textContent?.trim()) return label.textContent.trim();
-      }
-
-      if (tag === "input") {
-        const input = element as HTMLInputElement;
-        const type = element.getAttribute("type") || "";
-        const value = element.getAttribute("value");
-        if (type === "submit" && value?.trim()) return value.trim();
-        if (input.value && input.value.length < 50 && input.value.trim()) return input.value.trim();
-      }
-
-      if (["button", "a", "summary"].includes(tag)) {
-        const textContent = element.textContent || "";
-        if (textContent.trim()) return textContent.trim();
-      }
-
-      if (/^h[1-6]$/.test(tag)) {
-        const text = element.textContent;
-        if (text?.trim()) {
-          const t = text.trim();
-          return t.length > 100 ? t.substring(0, 100) + "..." : t;
-        }
-      }
-
-      if (tag === "img") return "";
-
-      let directText = "";
-      for (const node of element.childNodes) {
-        if (node.nodeType === Node.TEXT_NODE) {
-          directText += node.textContent;
-        }
-      }
-      if (directText?.trim() && directText.trim().length >= 3) {
-        const text = directText.trim();
-        return text.length > 100 ? text.substring(0, 100) + "..." : text;
-      }
-
-      return "";
     }
 
     interface AriaProps {
@@ -1462,23 +1339,9 @@ function generateYamlTree(
 }
 
 function getElementCoordinates(ref: string): { x: number; y: number; error?: string } {
-  const elementMap = getElementMap();
-  const elemRef = elementMap[ref];
-  let element: Element | undefined;
-  
-  if (elemRef) {
-    element = elemRef.element.deref();
-    if (!element) {
-      delete elementMap[ref];
-    }
-  }
-  
-  if (!element && window.__piRefs) {
-    element = window.__piRefs[ref];
-  }
-  
+  const { element, error } = resolveRef(ref);
   if (!element) {
-    return { x: 0, y: 0, error: `Element ${ref} not found. Use read_page to get current elements.` };
+    return { x: 0, y: 0, error };
   }
 
   const rect = element.getBoundingClientRect();
@@ -1489,23 +1352,9 @@ function getElementCoordinates(ref: string): { x: number; y: number; error?: str
 }
 
 function setFormValue(ref: string, value: string | boolean | number): { success: boolean; error?: string } {
-  const elementMap = getElementMap();
-  const elemRef = elementMap[ref];
-  let element: Element | undefined;
-  
-  if (elemRef) {
-    element = elemRef.element.deref();
-    if (!element) {
-      delete elementMap[ref];
-    }
-  }
-  
-  if (!element && window.__piRefs) {
-    element = window.__piRefs[ref];
-  }
-  
+  const { element, error } = resolveRef(ref);
   if (!element) {
-    return { success: false, error: `Element ${ref} not found. Use read_page to get current elements.` };
+    return { success: false, error };
   }
 
   const tagName = element.tagName.toLowerCase();
@@ -1590,27 +1439,16 @@ function smartType(selector: string, text: string, clear = true, submit = false)
   }
 }
 
-function truncateToUtf8Bytes(input: string, maxBytes: number): string {
-  const encoder = new TextEncoder();
-  const encoded = encoder.encode(input);
-  if (encoded.length <= maxBytes) return input;
-  let end = maxBytes;
-  while (end > 0 && (encoded[end] & 0xc0) === 0x80) end--;
-  return new TextDecoder("utf-8", { fatal: false }).decode(encoded.subarray(0, end));
-}
-
-function getPageText(options: { maxBytes?: number } = {}): { text: string; title: string; url: string; error?: string } {
+// The native host caps the text so it can mark the cut and keep the full copy.
+function getPageText(): { text: string; title: string; url: string; error?: string } {
   try {
     const article = document.querySelector("article");
     const main = document.querySelector("main");
     const content = article || main || document.body;
 
-    const normalized = content.textContent
+    const text = content.textContent
       ?.replace(/\s+/g, " ")
       .trim() || "";
-    const text = Number.isFinite(options.maxBytes) && options.maxBytes! > 0
-      ? truncateToUtf8Bytes(normalized, options.maxBytes!)
-      : normalized.substring(0, 50000);
 
     return {
       text,
@@ -1628,23 +1466,9 @@ function getPageText(options: { maxBytes?: number } = {}): { text: string; title
 }
 
 function scrollToElement(ref: string): { success: boolean; error?: string } {
-  const elementMap = getElementMap();
-  const elemRef = elementMap[ref];
-  let element: Element | undefined;
-  
-  if (elemRef) {
-    element = elemRef.element.deref();
-    if (!element) {
-      delete elementMap[ref];
-    }
-  }
-  
-  if (!element && window.__piRefs) {
-    element = window.__piRefs[ref];
-  }
-  
+  const { element, error } = resolveRef(ref);
   if (!element) {
-    return { success: false, error: `Element ${ref} not found. Run read_page to get current element refs.` };
+    return { success: false, error };
   }
 
   element.scrollIntoView({ behavior: "smooth", block: "center" });
@@ -1670,23 +1494,11 @@ function uploadImage(
     let targetElement: HTMLElement | null = null;
 
     if (ref) {
-      const elementMap = getElementMap();
-      const elemRef = elementMap[ref];
-      
-      if (elemRef) {
-        targetElement = elemRef.element.deref() as HTMLElement | null;
-        if (!targetElement) {
-          delete elementMap[ref];
-        }
+      const { element, error } = resolveRef(ref);
+      if (!element) {
+        return { success: false, error };
       }
-      
-      if (!targetElement && window.__piRefs) {
-        targetElement = window.__piRefs[ref] as HTMLElement | null;
-      }
-      
-      if (!targetElement) {
-        return { success: false, error: `Element ${ref} not found. Run read_page to get current element refs.` };
-      }
+      targetElement = element as HTMLElement;
     } else if (coordinate) {
       targetElement = document.elementFromPoint(coordinate[0], coordinate[1]) as HTMLElement | null;
       if (!targetElement) {
@@ -1766,6 +1578,197 @@ if (typeof window.addEventListener === "function") {
   window.addEventListener("hashchange", () => postWatchEvent("navigation"));
 }
 
+type PageChangeSession = {
+  before: PageSnapshot;
+  startedAt: number;
+  lastMutationAt: number | null;
+  observer: MutationObserver;
+};
+
+const pageChangeSessions = new Map<string, PageChangeSession>();
+
+const PAGE_SUMMARY_HEADING_CAP = 10;
+
+const PAGE_NAME_FROM_CONTENT_ROLES = new Set([
+  "button", "link", "checkbox", "radio", "switch", "tab", "menuitem", "menuitemcheckbox", "menuitemradio",
+  "option", "treeitem", "heading", "alert", "status",
+]);
+
+// FNV-1a salted per document: detects a change without the snapshot keeping the text or value.
+function pageFingerprint(value: string): string {
+  const input = `${semanticDocumentToken}\u0000${value}`;
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < input.length; index++) {
+    hash ^= input.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0).toString(16);
+}
+
+function isSensitiveField(element: Element): boolean {
+  if (element.tagName.toLowerCase() === "input" && semanticElementType(element) === "password") return true;
+  return (element.getAttribute("autocomplete") || "").toLowerCase().split(/\s+/).some((token) =>
+    ["current-password", "new-password", "one-time-code"].includes(token) || token.startsWith("cc-"));
+}
+
+function pageFieldValue(element: Element): string | undefined {
+  const tag = element.tagName.toLowerCase();
+  if (tag === "input") {
+    const type = semanticElementType(element);
+    return ["checkbox", "radio", "button", "submit", "reset", "file", "image"].includes(type)
+      ? undefined
+      : (element as HTMLInputElement).value;
+  }
+  if (tag === "textarea") return (element as HTMLTextAreaElement).value;
+  if (tag === "select") {
+    const select = element as HTMLSelectElement;
+    return select.selectedIndex >= 0 ? select.options[select.selectedIndex].text : "";
+  }
+  if (element.getAttribute("contenteditable") === "true") return element.textContent || "";
+  return undefined;
+}
+
+function pageNodeName(element: Element, role: string): string {
+  const name = getValueFreeSemanticName(element);
+  if (name) return boundedText(name, 80);
+  if (element.tagName.toLowerCase() === "input" && ["button", "submit", "reset"].includes(semanticElementType(element))) {
+    return boundedText(element.getAttribute("value"), 80);
+  }
+  if (PAGE_NAME_FROM_CONTENT_ROLES.has(role)) {
+    // collectValueFreeText skips control roots, so read the children of the element itself.
+    const text = Array.from(element.childNodes).map((child) =>
+      child instanceof Element ? collectValueFreeText(child, 80) : boundedText(child.textContent, 80));
+    const content = boundedText(text.join(" "), 80);
+    if (content) return content;
+  }
+  if (role === "dialog" || role === "alertdialog") {
+    const heading = element.querySelector('[role="heading"], h1, h2, h3');
+    return heading ? collectValueFreeText(heading, 80) : "";
+  }
+  const label = element.closest("label");
+  return label && label !== element ? collectValueFreeText(label, 80) : "";
+}
+
+function pageNodeState(element: Element): PageNode["state"] {
+  const aria = (attribute: string): PageStateValue => {
+    const value = element.getAttribute(attribute);
+    if (value === "true") return true;
+    if (value === "false") return false;
+    return value === "mixed" ? "mixed" : null;
+  };
+  const interactive = semanticInteractiveState(element);
+  return {
+    checked: interactive?.checked ?? null,
+    disabled: element.getAttribute("aria-disabled") === "true" ||
+      (isSemanticControl(element) && (element as HTMLButtonElement).disabled === true) ||
+      element.closest("fieldset:disabled") !== null,
+    expanded: aria("aria-expanded"),
+    selected: interactive?.selected ?? null,
+    pressed: aria("aria-pressed"),
+  };
+}
+
+// Change reports and read --summary must name the same region the same way.
+function pageRegionLabel(node: PageNode): string {
+  return node.name ? `${node.role} "${node.name}"` : node.role;
+}
+
+function capturePageSnapshot(): { snapshot: PageSnapshot; elements: Element[] } {
+  const nodes: PageNode[] = [];
+  const elements: Element[] = [];
+  const text: PageSnapshot["text"] = {};
+  // A null region marks text that belongs to a tracked element's name or value rather than body text.
+  const visit = (element: Element, container: number | null, region: string | null): void => {
+    const tag = element.tagName.toLowerCase();
+    if (["script", "style", "noscript", "template"].includes(tag) || element.id.startsWith("pi-agent-")) return;
+    const style = window.getComputedStyle(element);
+    if (element.getAttribute("aria-hidden") === "true" || style.display === "none" || style.opacity === "0") return;
+    const shown = style.visibility !== "hidden";
+    const role = getResolvedRole(element);
+    let childContainer = container;
+    let childRegion = isSemanticControl(element) ? null : region;
+    if (
+      shown && PAGE_TRACKED_ROLES.has(role) &&
+      (element as HTMLElement).offsetWidth > 0 && (element as HTMLElement).offsetHeight > 0
+    ) {
+      const name = pageNodeName(element, role);
+      const node: PageNode = {
+        role,
+        name,
+        scope: container === null ? "" : `${nodes[container].role} ${nodes[container].name}`,
+        container,
+        state: pageNodeState(element),
+      };
+      const value = pageFieldValue(element);
+      if (value !== undefined) {
+        node.valueHash = pageFingerprint(value);
+        if (isSensitiveField(element)) node.sensitive = true;
+        else node.value = boundedText(value, 80);
+      }
+      nodes.push(node);
+      elements.push(element);
+      if (PAGE_CONTAINER_ROLES.has(role)) {
+        childContainer = nodes.length - 1;
+        childRegion = pageRegionLabel(node);
+      } else {
+        childRegion = null;
+      }
+    }
+    for (const child of Array.from(element.childNodes)) {
+      if (child instanceof Element) {
+        visit(child, childContainer, childRegion);
+      } else if (child.nodeType === Node.TEXT_NODE && shown && childRegion !== null) {
+        const normalized = (child.textContent || "").replace(/\s+/g, " ").trim();
+        if (!normalized) continue;
+        const counts = text[childRegion] || (text[childRegion] = {});
+        const hash = pageFingerprint(normalized);
+        counts[hash] = (counts[hash] || 0) + 1;
+      }
+    }
+  };
+  if (document.body) visit(document.body, null, "page");
+  return { snapshot: { nodes, text }, elements };
+}
+
+// Ref identity uses the same name as `surf read` so stale-ref suggestions match.
+function registerPageRef(element: Element, role: string): string {
+  const name = getName(element);
+  const ref = elementRefs.get(element)?.ref ?? getOrAssignRef(element, role, name);
+  window.__piRefs = window.__piRefs || {};
+  window.__piRefs[ref] = element;
+  getElementMap()[ref] = { element: new WeakRef(element), role, name };
+  return ref;
+}
+
+// The visual indicator toggles its own overlay nodes around tool use; that is not a page change.
+function isSurfIndicatorMutation(record: MutationRecord): boolean {
+  const target = record.target instanceof Element ? record.target : record.target.parentElement;
+  if (target?.closest('[id^="pi-agent-"]')) return true;
+  return record.type === "childList" &&
+    [...Array.from(record.addedNodes), ...Array.from(record.removedNodes)]
+      .every((node) => node instanceof Element && node.id.startsWith("pi-agent-"));
+}
+
+function waitForPageSettle(session: PageChangeSession, capMs: number, quietMs: number): Promise<PageChanges["settle"]> {
+  return new Promise((resolve) => {
+    const check = () => {
+      const now = Date.now();
+      const elapsed = now - session.startedAt;
+      const quietSince = session.lastMutationAt ?? session.startedAt;
+      if (session.lastMutationAt === null && (now - quietSince >= quietMs || elapsed >= capMs)) {
+        resolve({ state: "quiet", ms: elapsed });
+      } else if (session.lastMutationAt !== null && now - quietSince >= quietMs) {
+        resolve({ state: "settled", ms: elapsed });
+      } else if (elapsed >= capMs) {
+        resolve({ state: "unsettled", ms: elapsed });
+      } else {
+        setTimeout(check, Math.min(quietSince + quietMs, session.startedAt + capMs) - now);
+      }
+    };
+    check();
+  });
+}
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   switch (message.type) {
     case "PLAYBOOK_WATCH_START":
@@ -1793,6 +1796,51 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     case "GENERATE_ACCESSIBILITY_TREE": {
       const options = message.options || {};
       
+      if (options.summary === true) {
+        const { snapshot, elements } = capturePageSnapshot();
+        const headings: Array<{ level: number; name: string }> = [];
+        let headingCount = 0;
+        // Controls outside every landmark and dialog count under "page".
+        const regions = new Map<string, Record<string, number>>();
+        const dialogs: Array<{ role: string; name: string }> = [];
+        const alerts: Array<{ role: string; name: string }> = [];
+        snapshot.nodes.forEach((node, index) => {
+          if (PAGE_CONTAINER_ROLES.has(node.role)) {
+            if (!regions.has(pageRegionLabel(node))) regions.set(pageRegionLabel(node), {});
+            if (node.role === "dialog" || node.role === "alertdialog") dialogs.push({ role: node.role, name: node.name });
+          } else if (node.role === "heading") {
+            headingCount++;
+            if (headings.length === PAGE_SUMMARY_HEADING_CAP) return;
+            const tag = elements[index].tagName.toLowerCase();
+            // Same level rule as the tree; ARIA's default heading level is 2.
+            const level = /^h[1-6]$/.test(tag)
+              ? parseInt(tag[1], 10)
+              : parseInt(elements[index].getAttribute("aria-level") || "", 10) || 2;
+            headings.push({ level, name: node.name });
+          } else if (node.role === "alert") {
+            alerts.push({ role: node.role, name: node.name });
+          } else if (node.role !== "status") {
+            const region = node.container === null ? "page" : pageRegionLabel(snapshot.nodes[node.container]);
+            const controls = regions.get(region) || {};
+            controls[node.role] = (controls[node.role] || 0) + 1;
+            regions.set(region, controls);
+          }
+        });
+        sendResponse({
+          title: document.title,
+          url: window.location.href,
+          headings,
+          headingsOmitted: headingCount - headings.length,
+          regions: Array.from(regions, ([region, controls]) => ({
+            region,
+            controls: Object.fromEntries(Object.entries(controls).sort((a, b) => b[1] - a[1])),
+          })),
+          dialogs,
+          alerts,
+        });
+        break;
+      }
+
       if (options.format === "yaml") {
         const result = generateYamlTree(
           options.filter || "interactive",
@@ -1815,7 +1863,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           options.filter || "interactive",
           options.depth ?? 15,
           options.refId,
-          options.forceFullSnapshot ?? false,
           options.compact ?? false,
           options.includeHidden === true
         );
@@ -1894,23 +1941,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       break;
     }
     case "CLICK_ELEMENT": {
-      const elementMap = getElementMap();
-      const elemRef = elementMap[message.ref];
-      let element: Element | undefined;
-      if (elemRef) {
-        element = elemRef.element.deref();
-        if (!element) delete elementMap[message.ref];
-      }
-      if (!element && window.__piRefs) {
-        element = window.__piRefs[message.ref];
-      }
-      if (!element) {
-        sendResponse({ error: `Element ${message.ref} not found. Use read_page to get current elements.` });
-        break;
-      }
+      const { element, error } = resolveRef(message.ref);
       const guardError = semanticGuardError(element, message.expectedIdentity);
       if (guardError) {
         sendResponse({ error: guardError, code: guardError });
+        break;
+      }
+      if (!element) {
+        sendResponse({ error });
         break;
       }
       if (message.button === "triple") {
@@ -1959,7 +1997,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       break;
     }
     case "GET_PAGE_TEXT": {
-      const result = getPageText(message.options || {});
+      const result = getPageText();
       sendResponse(result);
       break;
     }
@@ -2064,10 +2102,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         
         // Generate refs for matches
         const results = matches.map(el => {
-          const ref = getOrAssignRef(el, role, name || '');
+          const elRole = getResolvedRole(el);
+          const elName = getName(el);
+          const ref = getOrAssignRef(el, elRole, elName);
           window.__piRefs = window.__piRefs || {};
           window.__piRefs[ref] = el;
-          elementMap[ref] = { element: new WeakRef(el), role, name: name || '' };
+          elementMap[ref] = { element: new WeakRef(el), role: elRole, name: elName };
           return { ref, text: el.textContent?.trim().slice(0, 50) };
         });
         
@@ -2119,10 +2159,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         )[0];
         
         const role = getResolvedRole(el);
-        const ref = getOrAssignRef(el, role, text);
+        const name = getName(el);
+        const ref = getOrAssignRef(el, role, name);
         window.__piRefs = window.__piRefs || {};
         window.__piRefs[ref] = el;
-        elementMap[ref] = { element: new WeakRef(el), role, name: text };
+        elementMap[ref] = { element: new WeakRef(el), role, name };
         
         sendResponse({ ref, text: el.textContent?.trim().slice(0, 50) });
       } catch (err) {
@@ -2171,10 +2212,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         }
         
         const role = getResolvedRole(input);
-        const ref = getOrAssignRef(input, role, label);
+        const name = getName(input);
+        const ref = getOrAssignRef(input, role, name);
         window.__piRefs = window.__piRefs || {};
         window.__piRefs[ref] = input;
-        elementMap[ref] = { element: new WeakRef(input), role, name: label };
+        elementMap[ref] = { element: new WeakRef(input), role, name };
         
         sendResponse({ ref, label });
       } catch (err) {
@@ -2185,8 +2227,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     case "GET_ELEMENT_STYLES": {
       try {
         const { selector } = message;
-        const elementMap = getElementMap();
-        
         // Helper to extract styles from an element
         const extractStyles = (el: Element) => {
           const s = getComputedStyle(el);
@@ -2216,18 +2256,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         
         // Check if selector is a ref (e.g., "e5")
         if (/^e\d+$/.test(selector)) {
-          const elemRef = elementMap[selector];
-          let element: Element | undefined;
-          if (elemRef) {
-            element = elemRef.element.deref();
-            if (!element) delete elementMap[selector];
-          }
-          if (!element && window.__piRefs) {
-            element = window.__piRefs[selector];
-          }
-          
+          const { element, error } = resolveRef(selector);
           if (!element) {
-            sendResponse({ error: `Element ${selector} not found` });
+            sendResponse({ error });
             break;
           }
           
@@ -2251,24 +2282,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     case "SELECT_OPTION": {
       try {
         const { selector, values, by } = message;
-        const elementMap = getElementMap();
-        
         // Find the select element
         let selectEl: HTMLSelectElement | null = null;
         
         if (/^e\d+$/.test(selector)) {
-          const elemRef = elementMap[selector];
-          let element: Element | undefined;
-          if (elemRef) {
-            element = elemRef.element.deref();
-            if (!element) delete elementMap[selector];
-          }
-          if (!element && window.__piRefs) {
-            element = window.__piRefs[selector];
-          }
-          
+          const { element, error } = resolveRef(selector);
           if (!element) {
-            sendResponse({ error: `Element ${selector} not found` });
+            sendResponse({ error });
             break;
           }
           if (element.tagName !== 'SELECT') {
@@ -2346,20 +2366,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     case "GET_ELEMENT_TEXT": {
       try {
         const { ref } = message;
-        const elementMap = getElementMap();
-        const elemRef = elementMap[ref];
-        
-        let element: Element | undefined;
-        if (elemRef) {
-          element = elemRef.element.deref();
-          if (!element) delete elementMap[ref];
-        }
-        if (!element && window.__piRefs) {
-          element = window.__piRefs[ref];
-        }
-        
+        const { element, error } = resolveRef(ref);
         if (!element) {
-          sendResponse({ error: `Element ${ref} not found` });
+          sendResponse({ error });
           break;
         }
         
@@ -2449,7 +2458,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           });
           return;
         }
-        const treeResult = generateAccessibilityTree("interactive", 15, undefined, true);
+        const treeResult = generateAccessibilityTree("interactive", 15);
         sendResponse({ ...treeResult, waited: waitResult.waited });
       });
       return true;
@@ -2521,7 +2530,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           });
           return;
         }
-        const treeResult = generateAccessibilityTree("interactive", 15, undefined, true);
+        const treeResult = generateAccessibilityTree("interactive", 15);
         sendResponse({ ...treeResult, waited: waitResult.waited });
       });
       return true;
@@ -2587,7 +2596,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           });
           return;
         }
-        const treeResult = generateAccessibilityTree("interactive", 15, undefined, true);
+        const treeResult = generateAccessibilityTree("interactive", 15);
         sendResponse({ ...treeResult, waited: waitResult.waited });
       });
       return true;
@@ -2602,7 +2611,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         sendResponse({ error: "guarded fill requires exactly one field", code: "stale_observation" });
         return true;
       }
-      const elementMap = getElementMap();
       const results: { ref: string; success: boolean; error?: string }[] = [];
       for (const item of data) {
         const { ref, value } = item;
@@ -2610,21 +2618,16 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           results.push({ ref: ref || "unknown", success: false, error: "Missing ref" });
           continue;
         }
-        const elemRef = elementMap[ref];
-        if (!elemRef) {
-          results.push({ ref, success: false, error: "Element not found (run page.read first)" });
-          continue;
-        }
-        const el = elemRef.element.deref() as HTMLElement | null;
-        if (!el) {
-          delete elementMap[ref];
-          results.push({ ref, success: false, error: "Element no longer exists" });
-          continue;
-        }
-        const guardError = semanticGuardError(el, message.expectedIdentity);
+        const { element, error } = resolveRef(ref);
+        const guardError = semanticGuardError(element, message.expectedIdentity);
         if (guardError) {
           sendResponse({ success: false, error: guardError, code: guardError, filled: 0, failed: 1, results: [] });
           return true;
+        }
+        const el = element as HTMLElement | undefined;
+        if (!el) {
+          results.push({ ref, success: false, error });
+          continue;
         }
         try {
           if (el instanceof HTMLInputElement) {
@@ -2673,16 +2676,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         sendResponse({ error: "No ref provided" });
         return true;
       }
-      const elementMap = getElementMap();
-      const elemRef = elementMap[ref];
-      if (!elemRef) {
-        sendResponse({ error: "Element not found (run page.read first)" });
-        return true;
-      }
-      const el = elemRef.element.deref() as HTMLElement | null;
+      const { element: el, error } = resolveRef(ref);
       if (!el) {
-        delete elementMap[ref];
-        sendResponse({ error: "Element no longer exists" });
+        sendResponse({ error });
         return true;
       }
       if (!(el instanceof HTMLInputElement) || el.type !== "file") {
@@ -2769,7 +2765,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           });
           return;
         }
-        const treeResult = generateAccessibilityTree("interactive", 15, undefined, true);
+        const treeResult = generateAccessibilityTree("interactive", 15);
         sendResponse({ ...treeResult, waited: waitResult.waited });
       });
       return true;
@@ -2807,6 +2803,46 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       
       sendResponse({ elements });
       break;
+    }
+    case "BEGIN_PAGE_CHANGES": {
+      const { snapshot } = capturePageSnapshot();
+      const session: PageChangeSession = {
+        before: snapshot,
+        startedAt: Date.now(),
+        lastMutationAt: null,
+        observer: new MutationObserver((records) => {
+          if (records.some((record) => !isSurfIndicatorMutation(record))) session.lastMutationAt = Date.now();
+        }),
+      };
+      session.observer.observe(document.documentElement, {
+        subtree: true,
+        attributes: true,
+        childList: true,
+        characterData: true,
+      });
+      pageChangeSessions.set(message.token, session);
+      sendResponse({ ok: true, url: window.location.href, title: document.title });
+      break;
+    }
+    case "END_PAGE_CHANGES": {
+      const session = pageChangeSessions.get(message.token);
+      if (!session) {
+        sendResponse({ error: "unknown_token" });
+        break;
+      }
+      pageChangeSessions.delete(message.token);
+      waitForPageSettle(session, message.capMs, message.quietMs ?? 300).then((settle) => {
+        session.observer.disconnect();
+        const after = capturePageSnapshot();
+        const result: PageChanges = {
+          settle,
+          navigated: null,
+          ...diffPageSnapshots(session.before, after.snapshot, (index) =>
+            registerPageRef(after.elements[index], after.snapshot.nodes[index].role)),
+        };
+        sendResponse(result);
+      });
+      return true;
     }
     default:
       return false;

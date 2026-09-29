@@ -28,7 +28,7 @@ const grokClient = require("./grok-client.cjs");
 const kimiClient = require("./kimi-client.cjs");
 const aistudioClient = require("./aistudio-client.cjs");
 const aistudioBuild = require("./aistudio-build.cjs");
-const { mapToolToMessage, mapComputerAction, formatToolContent, formatToolError, buildProviderUploadMessage, applySemanticExpectedIdentity } = require("./host-helpers.cjs");
+const { mapToolToMessage, mapComputerAction, formatToolContent, formatToolError, buildProviderUploadMessage, applySemanticExpectedIdentity, truncatePageText } = require("./host-helpers.cjs");
 const { createOracleHost } = require("./oracle-host.cjs");
 
 const IS_WIN = process.platform === "win32";
@@ -41,7 +41,7 @@ const { HostSessionManager, resolveRequestDeadlineMs } = require("./host-session
 const { abortError, abortableDelay, throwIfAborted } = require("./abort.cjs");
 const { BoundedAiQueue } = require("./ai-queue.cjs");
 const { RequestPendingMap } = require("./request-pending.cjs");
-const { cleanupFilePaths, createStagingDirectory, createTransferState, materializeRemoteTool, rewriteTransferPaths, streamFileDownload, transferError } = require("./file-transfer.cjs");
+const { PAGE_CHANGES_TOOLS, cleanupFilePaths, createStagingDirectory, createTransferState, materializeRemoteTool, rewriteTransferPaths, streamFileDownload, transferError } = require("./file-transfer.cjs");
 const { writeNetworkExport } = require("./network-export.cjs");
 const networkStore = require("./network-store.cjs");
 const { redactUrlSecrets } = require("./redaction.cjs");
@@ -1744,6 +1744,18 @@ async function truncatePageRead(context, request, output) {
   return { ...output, pageContent: `${kept}\n\n${note}` };
 }
 
+// Page text gets the same treatment as the tree: a marked cut, with the full text
+// in a private file for local clients.
+async function truncatePageTextResult(context, request, output) {
+  if (!["page.read", "page.text", "get_page_text"].includes(request?.tool) || typeof output?.text !== "string" || output.semanticObservation !== undefined) return output;
+  const maxBytes = request.tool === "page.read" && request.args?.["max-bytes"] !== undefined ? Number(request.args["max-bytes"]) : undefined;
+  const fullPath = context?.isRemote ? undefined : path.join(SURF_TMP, `surf-text-${crypto.randomUUID()}.txt`);
+  const cut = truncatePageText(output.text, { maxBytes, fullPath });
+  if (!cut.truncated) return output;
+  if (fullPath) await fs.promises.writeFile(fullPath, output.text, { mode: 0o600, flag: "wx" });
+  return { ...output, text: cut.text, truncated: cut.truncated };
+}
+
 function sendToolResponse(socket, id, result, error) {
   const context = socketContexts.get(socket);
   if (context && !sessionManager.canRespond(context, id)) return;
@@ -1754,6 +1766,7 @@ function sendToolResponse(socket, id, result, error) {
     try {
       if (!error) output = await sendRequestDownloads(context, request, result);
       if (!error) output = await truncatePageRead(context, request, output);
+      if (!error) output = await truncatePageTextResult(context, request, output);
       if (!error && output?.semanticObservation?.identity && request?.target) {
         output.semanticObservation.identity.browserEpoch = request.target.browserEpoch;
       }
@@ -1761,6 +1774,8 @@ function sendToolResponse(socket, id, result, error) {
       finalError = transferFailure.message;
     }
     const formattedError = finalError ? formatToolError(finalError) : null;
+    let pageChanges;
+    if (!formattedError && output?.pageChanges) ({ pageChanges, ...output } = output);
     if (formattedError && request) {
       const rewrittenMessage = rewriteTransferPaths(
         formattedError.content[0].text,
@@ -1802,9 +1817,11 @@ function sendToolResponse(socket, id, result, error) {
       };
     }
     if (request?.notice) response.notice = request.notice;
+    if (pageChanges) response.pageChanges = pageChanges;
     if (formattedError) response.error = formattedError;
     else {
       response.result = { content: formatToolContent(output, log) };
+      if (output?.truncated) response.truncated = output.truncated;
       if (request?.tool === "tab.new" && Number.isInteger(output?.tabId) && output.tabId > 0) {
         response.result.tabId = output.tabId;
       }
@@ -1940,6 +1957,9 @@ function handleToolRequest(msg, socket, requestContext = requestStorage.getStore
     sendToolResponse(socket, originalId, null, `Unknown tool: ${tool}`);
     return;
   }
+  if (args?.pageChanges) extensionMsg.pageChanges = args.pageChanges;
+  // An action can open a native dialog, which Chrome reports only to an attached debugger.
+  if (PAGE_CHANGES_TOOLS.includes(tool)) extensionMsg.watchDialogs = true;
   if (requestContext.target?.strict) extensionMsg.strictTarget = true;
   applyFrameContextToMessage(requestContext, extensionMsg);
   try {
@@ -2020,7 +2040,7 @@ function handleToolRequest(msg, socket, requestContext = requestStorage.getStore
         if (pageResult && !pageResult.error) {
           pageContext = {
             url: pageResult.url,
-            text: pageResult.text || pageResult.pageContent || ""
+            text: truncatePageText(pageResult.text || pageResult.pageContent || "").text
           };
         }
       }
@@ -2094,7 +2114,7 @@ function handleToolRequest(msg, socket, requestContext = requestStorage.getStore
         if (pageResult && !pageResult.error) {
           pageContext = {
             url: pageResult.url,
-            text: pageResult.text || pageResult.pageContent || ""
+            text: truncatePageText(pageResult.text || pageResult.pageContent || "").text
           };
         }
       }
@@ -2162,7 +2182,7 @@ function handleToolRequest(msg, socket, requestContext = requestStorage.getStore
         if (pageResult && !pageResult.error) {
           pageContext = {
             url: pageResult.url,
-            text: pageResult.text || pageResult.pageContent || ""
+            text: truncatePageText(pageResult.text || pageResult.pageContent || "").text
           };
         }
       }
@@ -2248,7 +2268,7 @@ function handleToolRequest(msg, socket, requestContext = requestStorage.getStore
         if (pageResult && !pageResult.error) {
           pageContext = {
             url: pageResult.url,
-            text: pageResult.text || pageResult.pageContent || ""
+            text: truncatePageText(pageResult.text || pageResult.pageContent || "").text
           };
         }
       }
@@ -2402,7 +2422,7 @@ function handleToolRequest(msg, socket, requestContext = requestStorage.getStore
             if (pageResult && !pageResult.error) {
               pageContext = {
                 url: pageResult.url,
-                text: pageResult.text || pageResult.pageContent || ""
+                text: truncatePageText(pageResult.text || pageResult.pageContent || "").text
               };
             }
           }
@@ -2513,7 +2533,7 @@ function handleToolRequest(msg, socket, requestContext = requestStorage.getStore
         if (pageResult && !pageResult.error) {
           pageContext = {
             url: pageResult.url,
-            text: pageResult.text || pageResult.pageContent || ""
+            text: truncatePageText(pageResult.text || pageResult.pageContent || "", { maxChars: 20_000 }).text
           };
         }
       }
@@ -2521,13 +2541,7 @@ function handleToolRequest(msg, socket, requestContext = requestStorage.getStore
       // 2. Build full prompt
       let fullPrompt = query || "";
       if (pageContext) {
-        const MAX_PAGE_CONTEXT_CHARS = 20000;
-        const pageText = String(pageContext.text || "");
-        const truncated = pageText.length > MAX_PAGE_CONTEXT_CHARS
-          ? pageText.slice(0, MAX_PAGE_CONTEXT_CHARS) + "\n\n[...truncated...]"
-          : pageText;
-
-        fullPrompt = `Page: ${pageContext.url}\n\n${truncated}\n\n---\n\n${fullPrompt}`;
+        fullPrompt = `Page: ${pageContext.url}\n\n${pageContext.text}\n\n---\n\n${fullPrompt}`;
       }
 
       // 3. Call AI Studio client
@@ -3023,6 +3037,10 @@ function processInput() {
             } catch (e) {
               sendToolResponse(socket, originalId, null, `Failed to save: ${e.message}`);
             }
+          } else if (autoScreenshot && msg.nativeDialog) {
+            // An open native dialog blocks page capture until the dialog closes.
+            if (pending.autoScreenshotOutput) failAutoScreenshot(`a native ${msg.nativeDialog.type} dialog is open; close it with dialog.accept or dialog.dismiss`);
+            else sendToolResponse(socket, originalId, msg, null);
           } else if (autoScreenshot && tabId && !msg.error && !msg.base64) {
             
             const screenshotPath = pending.autoScreenshotOutput || path.join(SURF_TMP, `pi-auto-${Date.now()}.png`);
