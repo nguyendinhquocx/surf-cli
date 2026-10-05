@@ -5,6 +5,7 @@ const {
   chooseAction,
   filter,
   find,
+  semanticModel,
   verify,
 } = require("../../native/semantic-core.cjs");
 
@@ -57,16 +58,6 @@ describe("semantic decision core", () => {
       model: "jev-1.13.0",
       timeoutMs: 5000,
       probabilitySumTolerance: 0.01,
-      thresholds: {
-        find: 0.7,
-        filter: 0.65,
-        verifyPositive: 0.85,
-        verifyNegative: 0.85,
-        prerequisiteSupported: 0.75,
-        prerequisiteBlocked: 0.9,
-        write: 0.95,
-        exactRefWrite: 0.65,
-      },
       limits: {
         stateBytes: 24 * 1024,
         candidates: 64,
@@ -87,6 +78,72 @@ describe("semantic decision core", () => {
         staleRefreshes: 2,
         identicalObservationHashes: 2,
       },
+    });
+  });
+
+  it("registers only models with a complete measured threshold set", () => {
+    const keys = [
+      "find",
+      "filter",
+      "verifyPositive",
+      "verifyNegative",
+      "prerequisiteSupported",
+      "prerequisiteBlocked",
+      "write",
+      "exactRefWrite",
+    ];
+    expect(Object.keys(SEMANTIC_POLICY.models)).toEqual(["jev-1.13.0", "clef", "clef-flash"]);
+    expect(Object.isFrozen(SEMANTIC_POLICY.models)).toBe(true);
+    for (const entry of Object.values(SEMANTIC_POLICY.models) as Array<{
+      provider: string;
+      thresholds: Record<string, number>;
+    }>) {
+      expect(["typesafe", "cloudflare"]).toContain(entry.provider);
+      expect(Object.keys(entry.thresholds).sort()).toEqual([...keys].sort());
+      for (const value of Object.values(entry.thresholds)) {
+        expect(Number.isFinite(value) && value > 0 && value <= 1).toBe(true);
+      }
+      expect(Object.isFrozen(entry) && Object.isFrozen(entry.thresholds)).toBe(true);
+    }
+    expect(semanticModel("clef-flash")).toBe(SEMANTIC_POLICY.models["clef-flash"]);
+  });
+
+  it("rejects unknown models with the list of valid model ids", () => {
+    expect(() => semanticModel("jev-9")).toThrow(
+      expect.objectContaining({
+        code: "semantic_invalid_request",
+        message: expect.stringContaining("jev-1.13.0, clef, clef-flash"),
+      }),
+    );
+  });
+
+  it("applies Clef measured thresholds through the model option", async () => {
+    const click = { id: "click", kind: "click", ref: "ref.1" };
+    const exactRef = (probability: number) =>
+      chooseAction({
+        state: {},
+        goal: "save",
+        actions: [click],
+        origin: "https://example.test",
+        allowWrite: true,
+        allowRefs: ["ref.1"],
+        model: "clef",
+        evaluate: evaluateWith({ action: "click" }, probability),
+      });
+    expect(await exactRef(0.78)).toMatchObject({ status: "uncertain", appliedThreshold: 0.79 });
+    expect(await exactRef(0.79)).toMatchObject({ status: "selected", appliedThreshold: 0.79 });
+
+    const negative = (probability: number) =>
+      verify({
+        state: {},
+        outcome: "saved",
+        model: "clef-flash",
+        evaluate: evaluateWith({ verdict: "not_satisfied" }, probability),
+      });
+    expect(await negative(0.93)).toMatchObject({ status: "uncertain", appliedThreshold: 0.94 });
+    expect(await negative(0.94)).toMatchObject({
+      status: "not_satisfied",
+      appliedThreshold: 0.94,
     });
   });
 
@@ -394,7 +451,7 @@ describe("semantic decision core", () => {
       action: broadAction,
       appliedThreshold: 0.85,
     });
-    expect(SEMANTIC_POLICY.thresholds.write).toBe(0.95);
+    expect(SEMANTIC_POLICY.models["jev-1.13.0"].thresholds.write).toBe(0.95);
 
     const exactOptions = {
       ...broadOptions,
