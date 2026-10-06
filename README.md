@@ -1079,6 +1079,47 @@ printf '%s\n' "$TYPESAFE_KEY" | surf semantic auth set
 printf '%s\n%s\n' "$CLOUDFLARE_ACCOUNT_ID" "$CLOUDFLARE_API_TOKEN" | surf semantic auth set --provider cloudflare
 ```
 
+#### Icon-only controls (`--vision`)
+
+A button with only an icon and no label, title, or alt text has no name, so the
+model sees several identical `button` candidates. `--vision` on `semantic.find`
+and `semantic.act` lets it tell them apart:
+
+```bash
+surf semantic.find "the download icon" --model clef --vision
+surf semantic.act "Open settings" --model clef --vision --allow-write
+```
+
+- **What is sent.** One extra PNG image of the controls in the main frame that have no name (at most 16), with each tile tagged with its ref. It goes to the selected model's provider along with the usual page observation.
+- **Where the tiles come from.** Each tile is the control's own icon drawn on a blank white canvas at the control's size. Surf uses the first of these it finds in the control:
+  1. an inline SVG, including a `<use>` of a symbol in the same page;
+  2. an image (`<img>`, `<picture>` or `<input type=image>`);
+  3. an icon-font glyph, from the element's text (a ligature such as Material Icons' `home`) or its `::before`/`::after` content (Font Awesome style);
+  4. a CSS `mask-image`, filled with the element's background color or text color;
+  5. a CSS `background-image` (its first `url()` layer, with its size and position).
+
+  No screenshot of the page is taken or sent, so field content, pickers, validation messages, popovers, frames and anything else on the page can't appear in the image. The icon is drawn with the control's current styles; hover and focus states aren't reproduced.
+- **Images.** Same-origin, `data:` and CORS-readable images are drawn as the page has them. For a cross-origin image the page can't share, the extension fetches it again from its URL, over HTTPS only, without cookies or redirects, preferring the browser cache, and only up to 512 KiB and 2 seconds.
+- **Skipped.** A control gets no tile, and is counted in `skipped`, when:
+  - its icon is drawn on a `<canvas>` or with CSS gradients or borders;
+  - it uses `content: url()`, or an SVG `<use>` that points to an external file;
+  - its text isn't in a web font the page loaded (plain text is not an icon), or the icon font failed to load;
+  - it has a cross-origin mask without CORS (the page itself doesn't draw that one) or several mask layers;
+  - its image can't be loaded or fetched;
+  - its background or mask position can't be read (more than two values, or lengths such as `calc()`), or its icon is inside the control's own shadow DOM;
+  - it is past the first 16 such controls, or the read is of a frame other than the main one.
+- **Caveats.** Canvas can't set an icon font's variable axes, so Material Symbols with `FILL` or `wght` set show as the default outline. Children of a `<use>` symbol that are styled only by page style sheet selectors lose those styles (inherited colors and `currentColor` still work). An image fetched again may differ from what the page showed if its URL now returns different bytes. Background and mask images are placed approximately: `background-repeat` and `object-fit` aren't reproduced.
+- **When.** Only when the page has such controls. On a fully labeled page nothing extra is sent.
+- **Models.** Only image-capable models: `clef` and `clef-flash`. With `jev-1.13.0`, the command fails before anything is sent: `--vision needs an image-capable model such as --model clef`. `semantic.verify`, `semantic.filter`, and `surf do` don't take it.
+- **Results.** `vision: { tiles, skipped }` counts the controls shown and the ones left out. For `semantic.act` the counts come from the read behind the last action decision. The `find` candidate, an `act` trace step, or an `act` decision whose control was shown as a tile carries `"tile": true`. It records what the model was shown, not why it chose. Before relying on a tiled write target, take a screenshot.
+- **Safety.** Confidence thresholds, `--allow-write`, and `--allow-ref` work exactly as without `--vision`.
+- **Failures.** If the tiles can't be built, the command fails with `semantic vision failed: <cause>`. It never silently falls back to text only.
+
+How much `--vision` helps, and what it costs, is measured in
+[Semantic model evaluation](docs/semantic-models.md#icon-only-controls---vision).
+On that page it also made the model less sure about a labeled button, so use
+`--vision` when the target is likely an icon-only control, not by default.
+
 The provider-neutral shared schema is `{"version":1,"apiKey":"..."}`. Persisted
 setup lives at `${XDG_CONFIG_HOME:-~/.config}/typesafe/credentials.json` on
 Unix/macOS and `%APPDATA%\TypeSafe\credentials.json` on Windows, independent of
@@ -1124,6 +1165,8 @@ remains adversarial data; model output never grants authority.
 
 The real-model evaluation harness is opt-in and excluded from CI:
 `SURF_REAL_SEMANTIC=1 npm run eval:semantic -- --models jev-1.13.0,clef,clef-flash`.
+`SURF_REAL_SEMANTIC=1 npm run eval:vision` measures `--vision` in real Chrome
+(run `npm run build` first).
 
 ## Environment Variables
 
