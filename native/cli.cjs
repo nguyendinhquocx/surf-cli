@@ -1630,7 +1630,17 @@ Choose with --model <id> or SURF_SEMANTIC_MODEL. Results report provider, model,
   semantic.act "Open notification settings" --max-steps 5
   semantic.act "Fill email" --input email="$EMAIL" --allow-write
   semantic.find "the export button" --model clef-flash
+  semantic.find "the download icon" --model clef --vision
   semantic auth set|status|clear [--provider typesafe|cloudflare]
+
+--vision (find and act, clef or clef-flash only) also sends one image of the controls that have no
+name, such as icon-only buttons. Each tile is drawn from the control's own icon (its SVG, image,
+icon-font glyph, CSS mask or background image) on a blank canvas; no screenshot of the page is sent,
+so field content and anything else on the page can't appear in it. Controls whose icon can't be drawn
+are counted as skipped: canvas icons, CSS gradients, content: url(), external <use> files, text not in
+a loaded icon font, cross-origin masks without CORS, images that fail to load, and controls in child
+frames. Icon fonts lose their variable axes (Material Symbols FILL/wght), and <use> symbol children
+styled only by page style sheet selectors lose those styles.
 
 Every click/fill requires --allow-write. This broadly authorizes even high-impact controls;
 repeat --allow-ref <ref> to narrow authorization to exact observed refs.
