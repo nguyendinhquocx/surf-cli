@@ -356,6 +356,28 @@ describe("bounded semantic workflow runtime", () => {
     expect(request.mock.calls.some(([tool]) => tool === "click")).toBe(false);
   });
 
+  it("rejects an unknown runtime model at construction", () => {
+    expect(() =>
+      createSemanticWorkflowRuntime({ request: boundary(), evaluate: provider(), model: "jev-9" }),
+    ).toThrow(expect.objectContaining({ code: "semantic_invalid_request" }));
+  });
+
+  it("applies the runtime model's verification threshold to semantic assertions", async () => {
+    const assertWith = async (model: string) => {
+      const runtime = createSemanticWorkflowRuntime({
+        request: boundary(),
+        evaluate: provider("not_satisfied", 0.93),
+        model,
+      });
+      return runtime.executeStep(
+        { id: "check", op: "assert", mode: "semantic", claim: "Added" },
+        runtime.createContext(),
+      );
+    };
+    expect(await assertWith("jev-1.13.0")).toMatchObject({ semanticStatus: "not_satisfied" });
+    expect(await assertWith("clef-flash")).toMatchObject({ semanticStatus: "uncertain" });
+  });
+
   it("does not dispatch a model-derived write outside the declared target type", async () => {
     const request = boundary();
     const runtime = createSemanticWorkflowRuntime({

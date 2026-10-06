@@ -1,5 +1,5 @@
 const crypto = require("node:crypto");
-const { SEMANTIC_POLICY, find, verify } = require("./semantic-core.cjs");
+const { SEMANTIC_POLICY, find, semanticModel, verify } = require("./semantic-core.cjs");
 const {
   buildLogicalCandidates,
   canonicalSameOriginDestination,
@@ -64,8 +64,9 @@ function scanCoverage(intervals, scrollHeight, truncated, invalidated = false) {
 }
 
 function createSemanticWorkflowRuntime(dependencies) {
-  const { request, evaluate, attemptStore = null, createAttemptStore, now = () => Date.now(), sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)) } = dependencies;
+  const { request, evaluate, attemptStore = null, createAttemptStore, model = SEMANTIC_POLICY.model, now = () => Date.now(), sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)) } = dependencies;
   if (typeof request !== "function" || typeof evaluate !== "function") throw new TypeError("semantic workflow requires request and evaluate boundaries");
+  const writeThreshold = semanticModel(model).thresholds.write;
 
   function createContext(options = {}) {
     const deadlineMs = options.deadlineMs ?? WORKFLOW_POLICY.defaultDeadlineMs;
@@ -111,7 +112,6 @@ function createSemanticWorkflowRuntime(dependencies) {
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
       const response = await evaluate(state, questions, { ...options, signal: controller.signal, timeoutMs });
-      context.model = response.model;
       context.usage.inputTokens += response.usage?.input_tokens || 0;
       context.usage.outputTokens += response.usage?.output_tokens || 0;
       return response;
@@ -145,6 +145,7 @@ function createSemanticWorkflowRuntime(dependencies) {
       },
       goal: query,
       candidates,
+      model,
       evaluate: (s, q, o) => evaluator(context, s, q, o),
     });
     return {
@@ -191,7 +192,7 @@ function createSemanticWorkflowRuntime(dependencies) {
       if (decision?.candidate &&
           (!target.role || decision.candidate.role === target.role) &&
           (!target.type || decision.candidate.type === target.type)) {
-        if (!write || decision.decision.probability >= SEMANTIC_POLICY.thresholds.write) {
+        if (!write || decision.decision.probability >= writeThreshold) {
           const concrete = observation.candidates.find((item) => item.ref === decision.candidate.id);
           if (binding) {
             const priorDestination = canonicalSameOriginDestination(binding.candidate, binding.fullUrl);
@@ -202,7 +203,7 @@ function createSemanticWorkflowRuntime(dependencies) {
           }
           return { observation, candidate: concrete, query, decision, coverage };
         }
-        return { error: failure("low_confidence", { probability: decision.decision.probability, appliedThreshold: SEMANTIC_POLICY.thresholds.write }) };
+        return { error: failure("low_confidence", { probability: decision.decision.probability, appliedThreshold: writeThreshold }) };
       }
       if (coverage.atBottom) return { error: failure(coverage.complete ? "target_not_found" : "incomplete_search", { coverage }) };
       if (index + 1 === maximum) return { error: failure("incomplete_search", { coverage }) };
@@ -255,6 +256,7 @@ function createSemanticWorkflowRuntime(dependencies) {
         state,
         outcome: expectation.claim,
         evidence: state.chunks,
+        model,
         evaluate: (s, q, o) => evaluator(context, s, q, o),
       });
       return result.status === "satisfied";
@@ -314,7 +316,10 @@ function createSemanticWorkflowRuntime(dependencies) {
     if (!context || !(context.bindings instanceof Map)) throw new TypeError("invalid semantic workflow context");
     if (++context.steps > WORKFLOW_POLICY.maxSteps) return failure("budget_exhaustion");
     if (remaining(context) < 1) return failure("budget_exhaustion");
-    if (!context.acquired && context.attemptStore) { await context.attemptStore.acquire(); context.acquired = true; }
+    if (!context.acquired && context.attemptStore) {
+      try { await context.attemptStore.acquire(); } catch (error) { return failure("checkpoint_failure", { error: error.message }); }
+      context.acquired = true;
+    }
     try {
       if (step.op === "find") {
         const resolved = await resolve(context, step.target, false, step.search);
@@ -336,7 +341,7 @@ function createSemanticWorkflowRuntime(dependencies) {
       if (step.op === "assert" && step.mode === "semantic") {
         const observation = await observe(context);
         const state = providerState(observation);
-        const result = await verify({ state, outcome: step.claim, evidence: state.chunks, evaluate: (s, q, o) => evaluator(context, s, q, o) });
+        const result = await verify({ state, outcome: step.claim, evidence: state.chunks, model, evaluate: (s, q, o) => evaluator(context, s, q, o) });
         return result.status === "satisfied" ? success("verified", { probability: result.decision.probability }) : failure("assertion_mismatch", { semanticStatus: result.status });
       }
       if (step.op === "assert") {
