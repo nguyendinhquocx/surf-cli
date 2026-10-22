@@ -572,7 +572,10 @@ surf select e5 --by index 2                  # By index (0-based)
 ```bash
 surf upload --ref e5 --files "/path/to/file.txt"
 surf upload --ref e5 --files "/path/file1.txt,/path/file2.txt"
+surf upload --ref e640 --files ./resume.pdf      # e640 is the "Upload resume" button
 ```
+
+Pass the button's ref when `page.read` shows only the upload button and not its hidden file input (e.g. LinkedIn Easy Apply). Surf clicks it and answers the file chooser it opens.
 
 ## Iframe Handling
 
@@ -608,9 +611,14 @@ surf network.stats             # Capture statistics
 surf network -vv --body-mode text --per-body-bytes 65536
 surf network.export --har --output ./trace.har
 surf network.clear             # Clear captured requests
+surf network.wait --match "/api/*/feed" --open <url> --json   # Next matching response (id, url, status, json)
+surf network.replay r_123 --set query.cursor=abc   # Re-send it from the tab with edits (GET/HEAD unless --allow-post)
+surf collect --item article --key 'a@href' --field title=h2 --format jsonl   # Scroll a list, one record per item
 ```
 
 Response-body capture supports `none`, `text`, and `all` modes plus per-body and per-tab-session byte caps. HAR exports carry body completeness metadata. Persistent network state is private under `~/.surf/state/network/` by default; configure `SURF_NETWORK_PATH` in the native host environment to change it.
+
+For long threads and feeds, prefer the page's own API over scrolling and re-reading: `network.wait` gets one response, `network.replay` fetches the next page with `--set <cursor-param>=<cursor>`, and an `api` playbook strategy does both in a loop. `collect` scrolls and reads items when there is no usable API. Scrolling needs a visible tab, so in a background session `collect` fails with a "needs a visible tab" error; use `surf session.ensure <name> <url> --window --focused`.
 
 ## Console
 
@@ -792,6 +800,8 @@ surf playbook list
 surf pb show page
 surf pb ops page
 surf use page read --json
+surf use x thread --url https://x.com/<user>/status/<id> --format md   # Whole X thread, from X's own API
+surf use <playbook> <op> --format jsonl   # Records one per line (md for Markdown)
 ```
 
 Resolution order is project (`./.surf/playbooks/`), user (`~/.surf/playbooks/`), then built-in. Provider compatibility commands stay on their validated command paths until provider playbooks have real login-flow validation. A write op requires `--write`; Surf records semantic intent before dispatch so a timeout or concurrent retry cannot silently double-submit.
@@ -840,6 +850,8 @@ surf wait.element ".missing" --auto-capture --timeout 2000
 --timeout <ms>        # Override default timeout
 --settle <ms>         # Max wait before actions report page changes (default 2000, max 30000, surf.json settleMs)
 --no-diff             # Skip the page-change report after actions
+                      # A cut-short report ends with "+N more changes..." naming
+                      # surf locate.role <role> --name "<text>" or surf read --ref <ref> --all --no-text; use those, not a full read
 ```
 
 ## Tips

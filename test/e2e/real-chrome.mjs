@@ -23,7 +23,7 @@ const repo = process.cwd();
 const extensionKey =
   "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEArWZVsRzpoyzuyQFqRzGOnkxv9FNaX/SR/VMw2f9ld+DKmUMxJhi/14olehkLWRJQumFPYTzWr1oqb1LwwI2KhBtn9mbaqzPSrrRGQ1VobTx7ZmxU+ooppXNdb2KGh/WXVqahS0D1nsQplAE6hCqQWPjsPCnXnWjUIH/B0EsInIUDwA8PKfuMG8p2HDlLj8hEpmLwOA48W4aHbl2S6bZHu9O50Lbd0L94aSwJLBNLKuXpBt/kFwlnpHd3zoJme9DIbqnDU/nMNh9SlA+EXRT6FhyiKdo6ZBMdtJeUPLQI2uHeoF8wikkNhIXX/E2EXlBqtZJJaFEi895x2s40+j/iZQIDAQAB"; // gitleaks:allow -- public test manifest key
 const extensionId = "nionemkjcnknfdhdolfloigkhpjnifmf";
-const pinnedChromeVersion = "154.0.8037.57";
+const pinnedChromeVersion = "155.0.8059.79";
 const scratch = mkdtempSync(join(tmpdir(), "surf-real-chrome-"));
 const home = join(scratch, "home");
 const extensionDir = join(scratch, "extension");
@@ -189,6 +189,25 @@ function fixturePages(request, { crossOriginBase }) {
 <button id="confirm" onclick="document.querySelector('#answer').textContent = confirm('Sure?') ? 'yes' : 'no'">Confirm</button>
 <p id="answer">none</p></main></body></html>`;
   }
+  if (url.pathname === "/upload") {
+    return `<!doctype html><html><head><title>Upload fixture</title>
+<script>
+  addEventListener("DOMContentLoaded", () => {
+    const report = (input, target) => input.addEventListener("change", () => {
+      document.querySelector(target).textContent = "Uploaded " + input.files.length + " file: " + input.files[0].name;
+    });
+    const hidden = document.querySelector("#hidden-input");
+    report(hidden, "#resume");
+    report(document.querySelector("#cover-input"), "#cover");
+    document.querySelector("#upload-button").addEventListener("click", () => hidden.click());
+  });
+</script></head>
+<body><main><h1>Apply</h1>
+<button id="upload-button">Upload resume</button><p id="resume">No resume</p>
+<button id="nothing">Does nothing</button>
+<input type="file" id="cover-input" aria-label="Cover letter"><p id="cover">No cover letter</p>
+</main><input type="file" id="hidden-input" style="display:none"></body></html>`;
+  }
   if (url.pathname === "/list") {
     const empty = url.searchParams.get("empty") === "1";
     const items = empty
@@ -253,7 +272,97 @@ ${stories}</main>
     return `<!doctype html><html><head><title>Surf type fixture</title></head>
 <body><input id="plain" type="text"><textarea id="notes"></textarea></body></html>`;
   }
+  if (url.pathname === "/harvest") {
+    // A feed that loads a cursor-paginated JSON API with a token header set by page JS and
+    // renders a virtualized list (about five rows in the DOM). `?nonce` adds a one-time nonce
+    // header per request, so a replayed request is rejected.
+    return `<!doctype html><html><head><title>Surf harvest fixture</title>
+<style>body{margin:0}#list{position:relative}.row{position:absolute;left:0;right:0;height:200px;margin:0}</style></head>
+<body><div id="list" data-loaded="0"></div>
+<script>
+  const ROW = 200;
+  const token = ["page", "token", "7f3a"].join("-");
+  const nonceMode = new URLSearchParams(location.search).has("nonce");
+  const list = document.getElementById("list");
+  const items = [];
+  let cursor;
+  let loading = false;
+  let done = false;
+  function render() {
+    list.style.height = (items.length + 1) * ROW + "px";
+    const first = Math.max(0, Math.floor(scrollY / ROW) - 1);
+    list.replaceChildren(...items.slice(first, first + 5).map((item, offset) => {
+      const row = document.createElement("article");
+      row.className = "row";
+      row.dataset.id = item.id;
+      row.style.top = (first + offset) * ROW + "px";
+      const text = document.createElement("p");
+      text.className = "text";
+      text.textContent = item.text;
+      row.append(text);
+      return row;
+    }));
+    list.dataset.loaded = String(items.length);
+    if (!done && scrollY + innerHeight >= list.offsetHeight - ROW) load();
+  }
+  async function load() {
+    if (loading || done) return;
+    loading = true;
+    const headers = { "x-harvest-token": token };
+    if (nonceMode) headers["x-harvest-nonce"] = crypto.randomUUID();
+    const variables = JSON.stringify(cursor ? { cursor } : {});
+    const response = await fetch("/harvest-api/v1/feed?variables=" + encodeURIComponent(variables), { headers });
+    const page = await response.json();
+    items.push(...page.data.items);
+    cursor = page.data.cursors.find((entry) => entry.type === "Bottom")?.value;
+    done = !cursor;
+    loading = false;
+    render();
+  }
+  addEventListener("scroll", render);
+  load();
+</script></body></html>`;
+  }
   return null;
+}
+
+const harvestStats = { rejected: 0 };
+const usedNonces = new Set();
+
+/** The /harvest page's feed API: 5 pages of 4 items, Bottom cursors c1..c4. */
+function harvestApi(request, response) {
+  const url = new URL(request.url, "http://127.0.0.1");
+  if (url.pathname !== "/harvest-api/v1/feed") return false;
+  const send = (status, body) => {
+    response.writeHead(status, { "content-type": "application/json" });
+    response.end(JSON.stringify(body));
+  };
+  if (request.headers["x-harvest-token"] !== "page-token-7f3a") {
+    send(401, { error: "missing token" });
+    return true;
+  }
+  const nonce = request.headers["x-harvest-nonce"];
+  if (nonce !== undefined) {
+    if (usedNonces.has(nonce)) {
+      harvestStats.rejected++;
+      send(403, { error: "nonce reused" });
+      return true;
+    }
+    usedNonces.add(nonce);
+  }
+  let page = Number.NaN;
+  try {
+    const cursor = JSON.parse(url.searchParams.get("variables") || "{}").cursor;
+    page = cursor === undefined ? 0 : Number(/^c([1-4])$/.exec(cursor)?.[1]);
+  } catch {}
+  if (!Number.isInteger(page)) {
+    send(400, { error: "bad cursor" });
+    return true;
+  }
+  const items = Array.from({ length: 4 }, (_, index) => ({ id: `item-${page * 4 + index + 1}`, text: `Item ${page * 4 + index + 1}` }));
+  const cursors = [{ type: "Top", value: "top" }, ...(page < 4 ? [{ type: "Bottom", value: `c${page + 1}` }] : [])];
+  send(200, { data: { items, cursors } });
+  return true;
 }
 
 try {
@@ -349,6 +458,7 @@ try {
   const crossOriginBase = `http://127.0.0.1:${crossOriginServer.address().port}`;
 
   server = createServer((request, response) => {
+    if (harvestApi(request, response)) return;
     const extraPage = fixturePages(request, { crossOriginBase });
     if (extraPage !== null) {
       response.writeHead(200, { "content-type": "text/html; charset=utf-8" });
@@ -822,6 +932,38 @@ try {
   }
   await runSurf("tab.close", "--id", refDialogTab, "--json");
 
+  // Upload through the visible button that opens a hidden file input's chooser (#363).
+  const uploadTab = String(tabIdFromOutput(await runSurf("tab.new", `${baseUrl}/upload`)));
+  await runSurf("wait.ready", "--json", "--tab-id", uploadTab, "--selector", "#upload-button");
+  const uploadFile = join(scratch, "resume.txt");
+  writeFileSync(uploadFile, "resume\n");
+  const uploadRead = await runSurf("page.read", "--tab-id", uploadTab);
+  const uploadRef = (label) => {
+    const ref = uploadRead.match(new RegExp(`"${label}" \\[(e\\d+)\\]`))?.[1];
+    if (!ref) throw new Error(`page.read did not list "${label}": ${uploadRead}`);
+    return ref;
+  };
+  await runSurf("upload", "--ref", uploadRef("Upload resume"), "--files", uploadFile, "--tab-id", uploadTab);
+  if (!(await runSurf("page.text", "--tab-id", uploadTab)).includes("Uploaded 1 file: resume.txt")) {
+    throw new Error("upload --ref <button> did not set the file on the hidden input it opens");
+  }
+  const coverFile = join(scratch, "cover.txt");
+  writeFileSync(coverFile, "cover\n");
+  await runSurf("upload", "--ref", uploadRef("Cover letter"), "--files", coverFile, "--tab-id", uploadTab);
+  if (!(await runSurf("page.text", "--tab-id", uploadTab)).includes("Uploaded 1 file: cover.txt")) {
+    throw new Error("upload --ref <file input> no longer sets the file");
+  }
+  const noChooserStart = Date.now();
+  const noChooser = await runSurfExpectingFailure("upload", "--ref", uploadRef("Does nothing"), "--files", uploadFile, "--tab-id", uploadTab);
+  const noChooserMs = Date.now() - noChooserStart;
+  if (noChooserMs > 15_000 || !`${noChooser.stdout}${noChooser.stderr}`.includes("No file chooser opened")) {
+    throw new Error(`upload --ref <button that opens nothing> did not fail naming the file chooser (${noChooserMs}ms): ${JSON.stringify(noChooser)}`);
+  }
+  if (!(await runSurf("page.read", "--tab-id", uploadTab)).includes("Upload resume")) {
+    throw new Error("page.read failed on the tab after a failed upload");
+  }
+  await runSurf("tab.close", "--id", uploadTab, "--json");
+
   await runSurf("screenshot", "--output", screenshotPath);
   const png = readFileSync(screenshotPath);
   if (png.length < 100 || png.subarray(0, 8).toString("hex") !== "89504e470d0a1a0a") {
@@ -857,6 +999,96 @@ try {
     "visual indicator removal",
   );
 
+  // Site harvesting through a project playbook: replay, replay rejected -> drive, and DOM collect.
+  const harvestUrl = `${baseUrl}/harvest`;
+  const harvestProject = join(scratch, "harvest-project");
+  const harvestPlaybook = join(harvestProject, ".surf/playbooks/harvest");
+  mkdirSync(join(harvestPlaybook, "ops"), { recursive: true });
+  writeFileSync(
+    join(harvestPlaybook, "playbook.json"),
+    JSON.stringify({ id: "harvest", version: "1.0.0", origins: [baseUrl] }),
+  );
+  const feedRecords = { find: { exists: ["id", "text"] }, key: "id", fields: { id: "id", text: "text" } };
+  const collectFeed = {
+    using: "collect",
+    open: "{{url}}",
+    item: ".row",
+    key: ":scope@data-id",
+    fields: { id: ":scope@data-id", text: ".text" },
+    scrollDelayMs: 300,
+  };
+  const feedOp = (id, api) => ({
+    id,
+    args: { url: { required: true } },
+    run: [{ using: "api", open: "{{url}}", records: feedRecords, expect: { minItems: 1 }, ...api }, collectFeed],
+  });
+  writeFileSync(
+    join(harvestPlaybook, "ops/feed.json"),
+    JSON.stringify(
+      feedOp("feed", {
+        match: "/harvest-api/*/feed",
+        cursor: { find: { equals: { type: "Bottom" } }, path: "value", into: "query.variables.cursor" },
+      }),
+    ),
+  );
+  writeFileSync(
+    join(harvestPlaybook, "ops/feed-unmatched.json"),
+    JSON.stringify(feedOp("feed-unmatched", { match: "/harvest-api/*/never", timeoutMs: 3000 })),
+  );
+  const expectedFeed = JSON.stringify(
+    Array.from({ length: 20 }, (_, index) => ({ id: `item-${index + 1}`, text: `Item ${index + 1}` })),
+  );
+  const harvestTab = tabIdFromOutput(await runSurf("tab.new", fixtureUrl, "--json"));
+  const useHarvest = async (...args) =>
+    (
+      await execFileAsync(
+        process.execPath,
+        [join(repo, "native/cli.cjs"), "use", "harvest", ...args, "--tab-id", String(harvestTab)],
+        { cwd: harvestProject, env, timeout: 90_000, maxBuffer: 10 * 1024 * 1024 },
+      )
+    ).stdout;
+  const loadedByPage = async (url) => {
+    const page = (await browser.pages()).find((candidate) => candidate.url() === url);
+    if (!page) throw new Error(`Puppeteer could not find ${url}`);
+    return page.evaluate(() => document.querySelector("#list").dataset.loaded);
+  };
+
+  const replayed = JSON.parse(await useHarvest("feed", "--url", harvestUrl, "--json"));
+  const replayLoaded = await loadedByPage(harvestUrl);
+  if (replayed.strategy !== "api" || JSON.stringify(replayed.value) !== expectedFeed || replayLoaded !== "4") {
+    throw new Error(`api replay did not return the whole feed: ${JSON.stringify({ replayed, replayLoaded })}`);
+  }
+
+  const nonceUrl = `${harvestUrl}?nonce=1`;
+  const driven = JSON.parse(await useHarvest("feed", "--url", nonceUrl, "--json"));
+  const drivenLoaded = await loadedByPage(nonceUrl);
+  if (
+    driven.strategy !== "api" ||
+    JSON.stringify(driven.value) !== expectedFeed ||
+    harvestStats.rejected !== 1 ||
+    drivenLoaded !== "20"
+  ) {
+    throw new Error(
+      `api auto mode did not fall back to driving the page: ${JSON.stringify({ driven, drivenLoaded, harvestStats })}`,
+    );
+  }
+
+  const collectedJsonl = await useHarvest("feed-unmatched", "--url", harvestUrl, "--format", "jsonl");
+  const collected = collectedJsonl.trim().split("\n").map((line) => JSON.parse(line));
+  if (JSON.stringify(collected) !== expectedFeed) {
+    throw new Error(`collect fallback did not return the whole feed: ${collectedJsonl}`);
+  }
+
+  const firstFeedPage = unwrapJson(
+    await runSurf("network.wait", "--match", "/harvest-api/*/feed", "--open", harvestUrl, "--json", "--tab-id", String(harvestTab)),
+  );
+  const secondPage = unwrapJson(
+    await runSurf("network.replay", firstFeedPage.id, "--set", "query.variables.cursor=c1", "--json", "--tab-id", String(harvestTab)),
+  );
+  if (firstFeedPage.json?.data?.items?.[0]?.id !== "item-1" || secondPage.status !== 200 || secondPage.json?.data?.items?.[0]?.id !== "item-5") {
+    throw new Error(`network.wait/network.replay failed: ${JSON.stringify({ firstFeedPage, secondPage })}`);
+  }
+
   console.log(
     JSON.stringify(
       {
@@ -868,6 +1100,8 @@ try {
         frameDiagnoseWarnings: diagnosis.warnings.length,
         scriptOptions: { js: jsOutput.total, frameJs: frameOutput.total, frozen: frameInline.frozen },
         pageChanges: { noopLatency },
+        upload: { viaButton: "resume.txt", viaInput: "cover.txt", noChooserMs },
+        harvest: { replay: replayed.value.length, drive: driven.value.length, collect: collected.length },
         screenshotBytes: png.length,
         serviceWorker: workerTarget.url(),
       },

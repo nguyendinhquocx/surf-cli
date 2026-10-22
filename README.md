@@ -47,6 +47,7 @@ Surf takes a different approach:
 | CLI interface | Yes | No | No | No | No |
 | Free | Yes | No | No | Yes | Yes |
 | AI via browser cookies | Yes | No | No | No | No |
+| Whole threads and feeds as records, via the site's own API | Yes | No | No | Partial (reads responses) | No |
 
 ## Installation
 
@@ -354,6 +355,15 @@ surf select e5 --by label "United States"   # Select by visible text
 surf select e5 --by index 0                 # Select first option
 ```
 
+Upload files:
+
+```bash
+surf upload --ref e5 --files ./report.pdf      # The file input's ref
+surf upload --ref e640 --files ./resume.pdf    # Or the button that opens the file picker
+```
+
+With a button ref, surf clicks it and answers the native file chooser, so a hidden `input[type=file]` doesn't need a ref.
+
 ### Element Inspection
 
 Get computed styles from elements:
@@ -384,7 +394,7 @@ To disable auto-save globally, set `autoSaveScreenshots: false` in `surf.json`.
 
 Actions like `click`, `type`, and `scroll` automatically capture a screenshot after execution - no extra command needed. The command replies as soon as the action finishes with `Screenshot (pending): <path>`, and the file appears at that path shortly after. The next command on the same tab waits until it is written. Remote clients receive the file before the reply.
 
-These actions and `select` also report what changed on the page, waiting up to 2000ms for it to settle. Set `settleMs` in `surf.json` or `--settle <ms>` per command (max 30000), or turn it off with `--no-diff`.
+These actions and `select` also report what changed on the page, waiting up to 2000ms for it to settle. Set `settleMs` in `surf.json` or `--settle <ms>` per command (max 30000), or turn it off with `--no-diff`. When the report is cut short, its last line names a small follow-up instead of a full read: `surf locate.role <role> --name "<text>"` or `surf read --ref <ref> --all --no-text`.
 
 ### Tabs
 
@@ -959,6 +969,47 @@ surf pb client verify ./client
 ```
 
 Generated manifests declare provenance and authentication environment inputs. Surf excludes cookies, bearer tokens, and captured credentials and does not export write-capable clients without explicit review.
+
+### Threads and Feeds
+
+Get a whole thread or feed as clean records in seconds, instead of having an agent scroll and re-read the page. Sites like X and Bluesky keep only a few posts on screen at a time, so scrolling takes dozens of calls and long posts can come back cut short. The page itself gets its posts as data from the site's own API, a page at a time. Surf reads that data directly through your logged-in browser, so sites that need you signed in work and you don't need API keys.
+
+X threads work out of the box:
+
+```bash
+# Every post the author wrote in the thread: long posts in full, quoted posts, images, links
+surf use x thread --url https://x.com/<user>/status/<id> --format md
+```
+
+For any other site, write a recipe once. A recipe is a few dozen lines of JSON, not code, that tell Surf three things:
+
+```
+which request   the API call that holds the posts    /xrpc/app.bsky.feed.getAuthorFeed
+which fields    what to keep from each post          author, time, text, link
+next page       where the next-page cursor is        cursor
+```
+
+Save it in `~/.surf/playbooks/<site>/` (or `.surf/playbooks/<site>/` in a project), and from then on any agent reads that site with one command:
+
+```bash
+surf use bsky feed --url https://bsky.app/profile/bsky.app --format md
+```
+
+| Run | Browser calls | Time |
+|-----|---------------|------|
+| 13-post X thread, scrolling and re-reading the page | about 30 | — |
+| 13-post X thread, `surf use x thread` | 4 | 4.9 s |
+| 83-post Bluesky feed (3 pages), `surf use bsky feed` with a recipe | 14 | 4.3 s |
+
+To write a recipe, or to grab a single response by hand, the building blocks also work on their own:
+
+```bash
+surf network.wait --match "/api/*/feed" --open https://example.com/feed   # the page's own API response
+surf network.replay r_123 --set query.cursor=abc                           # the next page, re-sent from the tab
+surf collect --item article --key 'a@href' --field title=h2                # scroll and read, when there's no API
+```
+
+A step-by-step guide to writing a recipe, the full format, and the limits (scrolling needs a visible tab; replay re-sends only GET and HEAD by default) are in [docs/threads-and-feeds.md](docs/threads-and-feeds.md).
 
 ## Global Options
 

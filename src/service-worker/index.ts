@@ -476,6 +476,46 @@ async function uploadFilesWithChooser(
   }
 }
 
+async function uploadFilesThroughControl(tabId: number, ref: string, selector: string, files: string[]): Promise<void> {
+  const timeoutMs = 10000;
+  let timeoutId: ReturnType<typeof setTimeout> | undefined;
+  let onOpened: (backendNodeId?: number) => void = () => {};
+  const opened = new Promise<number | undefined>((resolve, reject) => {
+    onOpened = resolve;
+    timeoutId = setTimeout(() => reject(new Error(
+      `No file chooser opened within ${timeoutMs / 1000}s after clicking ${ref}. Pass the ref of the file input itself, or of a control that opens a file picker.`,
+    )), timeoutMs);
+  });
+  opened.catch(() => {});
+  const handler = (source: chrome.debugger.Debuggee, method: string, params: any) => {
+    if (source.tabId === tabId && method === "Page.fileChooserOpened") onOpened(params?.backendNodeId);
+  };
+  chrome.debugger.onEvent.addListener(handler);
+  try {
+    await cdp.sendCommand(tabId, "Page.setInterceptFileChooserDialog", { enabled: true });
+    // Click from the page with userGesture: a script-driven click (as in CLICK_ELEMENT) has no
+    // user activation, so the site's own input.click() would not open a chooser.
+    // The selector goes in as an argument to fixed code, never spliced into the source.
+    const doc = await cdp.sendCommand(tabId, "Runtime.evaluate", { expression: "document" });
+    const clicked = await cdp.sendCommand(tabId, "Runtime.callFunctionOn", {
+      objectId: doc?.result?.objectId,
+      functionDeclaration: "function (selector) { const el = this.querySelector(selector); if (!el) return false; el.click(); return true; }",
+      arguments: [{ value: selector }],
+      userGesture: true,
+      returnByValue: true,
+    });
+    if (clicked?.result?.value !== true) throw new Error(`Could not click ${ref} to open its file chooser`);
+    const backendNodeId = await opened;
+    if (!backendNodeId) throw new Error("The file chooser did not identify its file input");
+    await cdp.sendCommand(tabId, "DOM.setFileInputFiles", { files, backendNodeId });
+  } finally {
+    // Always stop intercepting: a tab left intercepting silently swallows the user's own file pickers.
+    clearTimeout(timeoutId);
+    chrome.debugger.onEvent.removeListener(handler);
+    try { await cdp.sendCommand(tabId, "Page.setInterceptFileChooserDialog", { enabled: false }); } catch {}
+  }
+}
+
 async function uploadFilesToProviderTab(
   provider: "gemini" | "chatgpt",
   tabId: number,
@@ -2362,6 +2402,10 @@ export async function handleMessage(
         ref: message.ref,
       }, { frameId: getFrameIdForTab(tabId, message) });
       if (selectorResult.error) throw new Error(selectorResult.error);
+      if (selectorResult.isFileInput === false) {
+        await uploadFilesThroughControl(tabId, message.ref, selectorResult.selector, message.files);
+        return { success: true, filesSet: message.files.length };
+      }
       const setResult = await cdp.setFileInputBySelector(tabId, selectorResult.selector, message.files);
       if (!setResult.success) throw new Error(setResult.error);
       return { success: true, filesSet: message.files.length };
@@ -3189,18 +3233,37 @@ export async function handleMessage(
       if (!message.requestId) throw new Error("No requestId provided");
       await cdp.drainNetworkEvents(tabId);
 
-      // If requestId looks like entry.id format (r_xxx), look up the CDP requestId
-      let cdpRequestId = message.requestId;
-      if (message.requestId.startsWith('r_')) {
-        const entries = cdp.getNetworkEntries(tabId, {});
-        const entry = entries.find(e => e.id === message.requestId);
-        if (entry) {
-          cdpRequestId = entry._requestId;
-        }
+      // Accept either the entry id (r_xxx) or the CDP requestId.
+      const entry = cdp.getNetworkEntry(tabId, message.requestId)
+        || cdp.getNetworkEntries(tabId, { includeStatic: true }).find(e => e.id === message.requestId)
+        || null;
+      if (typeof entry?.responseBody === "string") {
+        return { success: true, body: entry.responseBody, base64Encoded: entry.responseBodyEncoding === "base64" };
       }
 
-      const result = await cdp.getResponseBody(tabId, cdpRequestId);
-      return result;
+      const result = await cdp.getResponseBody(tabId, entry?._requestId || message.requestId);
+      if (result.success && typeof result.body === "string") return result;
+
+      // Chrome evicts bodies (e.g. after navigation); explain why surf has none either.
+      const capture = entry?.bodyCapture;
+      const why: Record<string, string> = {
+        "per-body-cap": `it is ${capture?.sizeBytes} bytes, over the ${capture?.limitBytes}-byte per-body cap`,
+        "session-cap": `the tab's ${capture?.limitBytes}-byte body budget was used up`,
+        "disabled": "body capture was off (--body-mode none)",
+        "content-mode": "--body-mode text skips static and binary responses",
+        "decode-failed": "its base64 body could not be decoded",
+        "unavailable": "Chrome had no body when it finished loading",
+        "pending": "it had not finished loading",
+      };
+      const stored = !entry
+        ? "surf has no captured entry with that id"
+        : `surf did not store it because ${why[capture?.reason || ""] || capture?.reason || "of an unknown reason"}`;
+      return {
+        success: false,
+        error: `Response body for ${message.requestId} is gone: Chrome no longer has it (${result.error || "no body"}) and ${stored}. `
+          + "Raise the cap with `surf network --per-body-bytes <n>` (or --body-mode all) before the request, "
+          + "or use `surf network.wait --match <glob>` to read the body as soon as it arrives.",
+      };
     }
 
     case "GET_NETWORK_ORIGINS": {
