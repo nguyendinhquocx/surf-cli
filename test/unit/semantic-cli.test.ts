@@ -2755,3 +2755,286 @@ describe("semantic CLI vision", () => {
     expect(outside.requests).toEqual(["page.read"]);
   });
 });
+
+describe("semantic.extract CLI", () => {
+  const { handleSemanticCli } = require("../../native/semantic-cli.cjs") as {
+    handleSemanticCli(
+      argv: string[],
+      options: Record<string, unknown>,
+    ): Promise<{ value: Record<string, any> }>;
+  };
+  const cloudflare = {
+    CLOUDFLARE_ACCOUNT_ID: "0123456789abcdef0123456789abcdef",
+    CLOUDFLARE_API_TOKEN: "fake-token",
+  };
+  const orderObservation = {
+    ...observation,
+    page: { ...observation.page, title: "Your order" },
+    chunks: [{ id: "c1", text: "Order A-88412 · Total $701.10", refs: ["e2"] }],
+  };
+
+  it("parses --field grammar, the reference date, and the extract threshold without a goal", () => {
+    expect(
+      semantic.parseSemanticArgs([
+        "semantic.extract",
+        "--field",
+        "eta:datetime:Arrival time, as HH:MM",
+        "--field",
+        "wait:duration.days",
+        "--reference-date",
+        "2026-10-01",
+        "--model",
+        "clairic",
+        "--threshold",
+        "extract=0.9",
+      ]),
+    ).toMatchObject({
+      command: "semantic.extract",
+      fields: [
+        {
+          name: "eta",
+          type: "datetime",
+          spec: { type: "datetime", instructions: "Arrival time, as HH:MM" },
+        },
+        { name: "wait", type: "duration.days", spec: { type: "duration", unit: "days" } },
+      ],
+      referenceDate: "2026-10-01",
+      model: "clairic",
+      thresholds: { extract: 0.9 },
+    });
+  });
+
+  const manyFields = Array.from({ length: 17 }, (_, index) => ["--field", `f${index}:text`]).flat();
+  it.each([
+    [["--field", "items:list.time"], 'unknown type "list.time"'],
+    [["--field", "price:estimate"], 'unknown type "estimate"'],
+    [["--field", "9total:number"], "must match"],
+    [["--field", "__proto__:text"], "field name __proto__ is reserved"],
+    [["--field", "total:number", "--field", "total:text"], "duplicate --field: total"],
+    [manyFields, "at most 16 fields"],
+    [[], "requires at least one --field"],
+    [["order total", "--field", "total:number"], "takes no goal"],
+    [["--field", "total:number", "--vision"], "--vision does not apply to semantic.extract"],
+    [["--field", "total:number", "--allow-write"], "--allow-write does not apply"],
+    [
+      ["--field", "total:number", "--model", "clef"],
+      "unknown extraction model: clef (valid extraction models: clairic)",
+    ],
+    [["--field", "total:number", "--threshold", "find=0.5"], "does not apply to semantic.extract"],
+    [["--field", "total:number", "--reference-date", "2026-02-30"], "YYYY-MM-DD"],
+  ])("rejects semantic.extract %j", (args, message) => {
+    expect(() => semantic.parseSemanticArgs(["semantic.extract", ...args])).toThrow(
+      expect.objectContaining({
+        code: "semantic_invalid_request",
+        message: expect.stringContaining(message),
+      }),
+    );
+  });
+
+  it("parses list types and --fields-json, naming each field's type for the output", () => {
+    expect(
+      semantic.parseSemanticArgs([
+        "semantic.extract",
+        "--field",
+        "items:list",
+        "--field",
+        "prices:list.number",
+        "--field",
+        "dates:list.date",
+      ])?.fields,
+    ).toEqual([
+      { name: "items", type: "list", spec: { type: "list", items: "text" } },
+      { name: "prices", type: "list.number", spec: { type: "list", items: "number" } },
+      { name: "dates", type: "list.date", spec: { type: "list", items: "date" } },
+    ]);
+    const total = { type: "number", unit: "USD", decimals: 2, null_threshold: 0.3 };
+    expect(
+      semantic.parseSemanticArgs([
+        "semantic.extract",
+        "--fields-json",
+        JSON.stringify({
+          total,
+          count: { type: "number", integer: true },
+          wait: { type: "duration", unit: "days" },
+          prices: { type: "list", items: "number", decimals: 2 },
+        }),
+      ])?.fields,
+    ).toEqual([
+      { name: "total", type: "number", spec: total },
+      { name: "count", type: "integer", spec: { type: "number", integer: true } },
+      { name: "wait", type: "duration.days", spec: { type: "duration", unit: "days" } },
+      {
+        name: "prices",
+        type: "list.number",
+        spec: { type: "list", items: "number", decimals: 2 },
+      },
+    ]);
+  });
+
+  it.each([
+    [{ t: { type: "text", unit: "USD" } }, "unit does not apply to text fields"],
+    [{ p: { type: "estimate", min: 0, max: 9 } }, 'unknown type "estimate"'],
+    [{ l: { type: "list" } }, "list fields need items text, number or date"],
+    [
+      { l: { type: "list", items: "text", null_threshold: 0.2 } },
+      "null_threshold does not apply to list fields",
+    ],
+    [{ n: { type: "number", decimals: 7 } }, "decimals must be an integer from 0 to 6"],
+    [JSON.parse('{"__proto__":{"type":"text"}}'), "field name __proto__ is reserved"],
+  ])("rejects --fields-json %j", (fields, message) => {
+    expect(() =>
+      semantic.parseSemanticArgs(["semantic.extract", "--fields-json", JSON.stringify(fields)]),
+    ).toThrow(message);
+  });
+
+  it("rejects malformed --fields-json and mixing it with --field", () => {
+    expect(() =>
+      semantic.parseSemanticArgs(["semantic.extract", "--fields-json", "{total: number}"]),
+    ).toThrow("--fields-json must be a JSON object");
+    expect(() =>
+      semantic.parseSemanticArgs([
+        "semantic.extract",
+        "--field",
+        "total:number",
+        "--fields-json",
+        '{"items":{"type":"list","items":"text"}}',
+      ]),
+    ).toThrow("--fields-json can't be combined with --field");
+  });
+
+  it("keeps extraction options and models out of the decision commands", () => {
+    expect(() =>
+      semantic.parseSemanticArgs(["semantic.find", "goal", "--threshold", "extract=0.5"]),
+    ).toThrow("--threshold extract does not apply to semantic.find");
+    expect(() =>
+      semantic.parseSemanticArgs(["semantic.find", "goal", "--model", "clairic"]),
+    ).toThrow("valid models: jev-1.13.0, clef, clef-flash");
+    expect(() =>
+      semantic.parseSemanticArgs(["semantic.verify", "goal", "--field", "total:number"]),
+    ).toThrow("--field does not apply to semantic.verify");
+    for (const [option, value, command] of [
+      ["--field", "9x:text", "semantic.find"],
+      ["--fields-json", '{"x":1}', "semantic.act"],
+      ["--reference-date", "2026-02-30", "semantic.filter"],
+    ]) {
+      expect(() => semantic.parseSemanticArgs([command, "goal", option, value])).toThrow(
+        `${option} does not apply to ${command}`,
+      );
+    }
+  });
+
+  it("extracts typed values with Clairic, ignoring SURF_SEMANTIC_MODEL, and reports the run summary", async () => {
+    const fetch = vi.fn(async (_url: string, init: { body: string }) => {
+      const { state } = JSON.parse(init.body);
+      const start = [...state.slice(0, state.indexOf("A-88412"))].length;
+      return new Response(
+        JSON.stringify({
+          success: true,
+          result: {
+            model: "clairic",
+            answers: {
+              order_id: {
+                type: "text",
+                value: "A-88412",
+                span: [start, start + 7],
+                confidence: 0.99,
+                p_null: 0.001,
+              },
+              total: { type: "number", value: 701.1, confidence: 0.98, p_null: 0.002 },
+            },
+            truncated: false,
+            usage: { input_tokens: 504, output_tokens: 0 },
+          },
+        }),
+      );
+    });
+    vi.stubGlobal("fetch", fetch);
+    vi.useFakeTimers({ toFake: ["Date"], now: new Date(2026, 9, 23, 12) });
+    try {
+      const { value } = await handleSemanticCli(
+        ["semantic.extract", "--field", "order_id:text:Order number", "--field", "total:number"],
+        {
+          env: { ...cloudflare, SURF_SEMANTIC_MODEL: "clef" },
+          openTransport: vi.fn(async () => ({
+            request: async () => response({ semanticObservation: orderObservation }),
+            close: async () => undefined,
+          })),
+        },
+      );
+
+      expect(fetch.mock.calls[0][0]).toMatch(/\/ai\/run\/@cf\/cloudflare\/clairic$/);
+      expect(JSON.parse(fetch.mock.calls[0][1].body)).toEqual({
+        model: "clairic",
+        state:
+          'Your order\nOrder A-88412 · Total $701.10\ntextbox "Email"\nbutton "Delete account"\nlink "Profile"\nlink "External"',
+        fields: {
+          order_id: { type: "text", instructions: "Order number", null_threshold: 0.5 },
+          total: { type: "number", null_threshold: 0.5 },
+        },
+        reference_date: "2026-10-23",
+      });
+      expect(value).toEqual({
+        status: "extracted",
+        fields: {
+          order_id: {
+            type: "text",
+            status: "extracted",
+            value: "A-88412",
+            confidence: 0.99,
+            pNull: 0.001,
+            source: { chunks: ["c1"], refs: ["e2"] },
+          },
+          total: {
+            type: "number",
+            status: "extracted",
+            value: 701.1,
+            confidence: 0.98,
+            pNull: 0.002,
+            source: null,
+          },
+        },
+        appliedThresholds: { extract: 0.8, null: 0.5 },
+        referenceDate: "2026-10-23",
+        truncated: false,
+        page: { origin: "https://example.test", title: "Your order" },
+        omitted: { candidates: 0, chunks: 0 },
+        usage: { input_tokens: 504, output_tokens: 0 },
+        provider: "cloudflare",
+        model: "clairic",
+        providerCalls: 1,
+        providerLatencyMs: expect.any(Number),
+      });
+    } finally {
+      vi.useRealTimers();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("names Clairic and the Cloudflare setup when credentials are missing, before any I/O", async () => {
+    const fs = require("node:fs");
+    const os = require("node:os");
+    const path = require("node:path");
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "surf-semantic-extract-"));
+    const openTransport = vi.fn();
+    try {
+      await expect(
+        handleSemanticCli(["semantic.extract", "--field", "total:number"], {
+          env: { XDG_CONFIG_HOME: root, APPDATA: root },
+          openTransport,
+        }),
+      ).rejects.toMatchObject({
+        code: "provider_not_configured",
+        message:
+          "Clairic needs Cloudflare credentials: set CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN, or run: surf semantic auth set --provider cloudflare",
+      });
+      expect(openTransport).not.toHaveBeenCalled();
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("lists semantic.extract in the semantic help", async () => {
+    const { value } = await handleSemanticCli(["semantic", "--help"], {});
+    expect(value).toContain("surf semantic.extract (--field <name>:<type>[:<instructions>]");
+  });
+});

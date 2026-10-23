@@ -4,6 +4,13 @@ const { isDeepStrictEqual } = require("node:util");
 
 const SEGMENT = /^([^[\]\s?*]*)((?:\[(?:\d+|\*)\])*)$/;
 const TEMPLATE_NAME = /\{\{([a-zA-Z0-9._-]+)\}\}/g;
+const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+// ISO 8601 date-time with an explicit zone, e.g. 2024-01-01T10:00:00.000Z or 2024-01-01T12:00+02:00.
+const ISO_DATETIME = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d+))?)?(Z|[+-]\d{2}:\d{2})$/;
+// X's created_at, e.g. Mon Jan 01 10:00:00 +0000 2024.
+const X_DATETIME = new RegExp(
+  `^(?:Sun|Mon|Tue|Wed|Thu|Fri|Sat) (${MONTHS.join("|")}) (\\d{2}) (\\d{2}):(\\d{2}):(\\d{2}) ([+-]\\d{4}) (\\d{4})$`,
+);
 
 function isPlainObject(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -114,12 +121,34 @@ function compileTemplate(template, where) {
   };
 }
 
+/** ISO 8601 UTC for the two accepted shapes; undefined for anything else, including impossible dates. */
+function toDatetime(value) {
+  if (typeof value !== "string") return undefined;
+  // X's form becomes ISO: Mon Jan 01 10:00:00 +0000 2024 -> 2024-01-01T10:00:00+00:00.
+  const x = value.match(X_DATETIME);
+  const month = x && String(MONTHS.indexOf(x[1]) + 1).padStart(2, "0");
+  const text = x ? `${x[7]}-${month}-${x[2]}T${x[3]}:${x[4]}:${x[5]}${x[6].slice(0, 3)}:${x[6].slice(3)}` : value;
+  const iso = text.match(ISO_DATETIME);
+  if (!iso) return undefined;
+  // Date.parse rolls Feb 30 over to Mar 1 and reads hour 24 as the next day; V8 rejects the other out-of-range fields.
+  const [, year, mm, day, hour] = iso;
+  if (new Date(Date.UTC(year, mm - 1, day)).getUTCDate() !== Number(day) || Number(hour) > 23) return undefined;
+  const time = Date.parse(text);
+  return Number.isNaN(time) ? undefined : new Date(time).toISOString();
+}
+
 function compileField(spec, where) {
   if (typeof spec === "string") return compilePath(spec);
-  checkKeys(spec, ["path", "match", "fields"], where);
+  checkKeys(spec, ["path", "match", "fields", "as"], where);
   if (typeof spec.path !== "string") throw new Error(`${where} needs a path or a template`);
   if (spec.match !== undefined && spec.fields !== undefined) throw new Error(`${where} cannot combine match and fields`);
+  if (spec.as !== undefined) {
+    if (spec.as !== "datetime") throw new Error(`${where}.as must be "datetime"`);
+    if (spec.fields !== undefined) throw new Error(`${where} cannot combine as and fields`);
+    if (spec.path.includes("[*]")) throw new Error(`${where}.as needs a single value, not a [*] path`);
+  }
   const get = compilePath(spec.path);
+  let read = get;
   if (spec.match !== undefined) {
     if (typeof spec.match !== "string") throw new Error(`${where}.match must be a regex string`);
     let regex;
@@ -128,7 +157,7 @@ function compileField(spec, where) {
     } catch (error) {
       throw new Error(`${where}.match is not a valid regex: ${error.message}`);
     }
-    return (object) => {
+    read = (object) => {
       const value = get(object);
       const found = typeof value === "string" ? value.match(regex) : null;
       if (!found) return undefined;
@@ -143,7 +172,7 @@ function compileField(spec, where) {
       return isPlainObject(value) ? map(value) : undefined;
     };
   }
-  return get;
+  return spec.as === undefined ? read : (object) => toDatetime(read(object));
 }
 
 function compileFields(fields, where) {

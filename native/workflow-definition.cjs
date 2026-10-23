@@ -2,6 +2,7 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const { isSensitiveName, redactSensitiveFields, redactUrlSecrets } = require("./redaction.cjs");
+const { SEMANTIC_POLICY, extractionFieldName, fieldsJsonField } = require("./semantic-core.cjs");
 
 const COMMANDS = {
   ai: { primaryArg: "query", effect: "read", argKinds: { query: "user-input" }, sensitiveArgs: ["query"] },
@@ -286,7 +287,7 @@ function normalizeStep(step) {
   return { cmd: ALIASES[cmd] || cmd, args: step.args || {}, ...(step.id ? { id: step.id } : {}), ...(step.as ? { as: step.as } : {}) };
 }
 
-const SEMANTIC_OPS = new Set(["find", "open", "ensureChecked", "fill", "click", "assert"]);
+const SEMANTIC_OPS = new Set(["find", "open", "ensureChecked", "fill", "click", "assert", "extract"]);
 const SEMANTIC_ID = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$/;
 const SEMANTIC_STEP_FIELDS = new Set(["id", "tool", "args", "as"]);
 const SEMANTIC_ARG_FIELDS = {
@@ -296,7 +297,9 @@ const SEMANTIC_ARG_FIELDS = {
   fill: new Set(["op", "target", "input", "expect"]),
   click: new Set(["op", "target", "expect"]),
   assert: new Set(["op", "mode", "claim", "bindings", "target", "predicate"]),
+  extract: new Set(["op", "fields"]),
 };
+const VALUE_ASSERT_FIELDS = new Set(["op", "mode", "binding", "field", "equals", "input", "min", "max"]);
 
 function assertClosedObject(value, allowed, path) {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${path} must be an object`);
@@ -334,6 +337,32 @@ function validateExpectation(value, path) {
   if (value.target !== undefined) validateTarget(value.target, `${path}.target`);
 }
 
+function validateValueAssert(args, path, priorBindings) {
+  const { VALUE_KINDS, valueKind, valueLiteral } = require("./semantic-workflow.cjs");
+  assertSemanticName(args.binding, `${path}.args.binding`);
+  const binding = priorBindings.get(args.binding);
+  if (binding?.kind !== "extraction") throw new Error(`${path}.args.binding '${args.binding}' must refer to a prior extract step`);
+  if (typeof args.field !== "string" || !Object.hasOwn(binding.fields, args.field)) {
+    throw new Error(`${path}.args.field must name a field of binding '${args.binding}'`);
+  }
+  const kind = valueKind(binding.fields[args.field]);
+  if (!kind) {
+    throw new Error(`${path}.args.field '${args.field}' is a list field; value asserts support text, number, integer, duration, date, time and datetime fields`);
+  }
+  const has = (key) => args[key] !== undefined;
+  if (!["equals", "input", "min", "max"].some(has)) throw new Error(`${path}.args needs equals, input, min or max`);
+  if (has("equals") && has("input")) throw new Error(`${path}.args can't combine equals with input`);
+  if ((has("equals") || has("input")) && (has("min") || has("max"))) throw new Error(`${path}.args can't combine equals or input with min or max`);
+  if (has("input")) assertSemanticName(args.input, `${path}.args.input`);
+  for (const key of ["equals", "min", "max"].filter(has)) {
+    if (key !== "equals" && kind === "text") throw new Error(`${path}.args.${key} does not apply to text fields`);
+    if (valueLiteral(kind, args[key]) === undefined) throw new Error(`${path}.args.${key} must be ${VALUE_KINDS[kind]}`);
+  }
+  if (has("min") && has("max") && valueLiteral(kind, args.min) > valueLiteral(kind, args.max)) {
+    throw new Error(`${path}.args.min must not be greater than ${path}.args.max`);
+  }
+}
+
 function validateSemanticStep(step, index, priorBindings, ids, policy) {
   const path = `steps[${index}]`;
   assertClosedObject(step, SEMANTIC_STEP_FIELDS, path);
@@ -348,7 +377,7 @@ function validateSemanticStep(step, index, priorBindings, ids, policy) {
   if (!step.args || typeof step.args !== "object" || Array.isArray(step.args)) throw new Error(`${path}.args must be an object`);
   const op = step.args.op;
   if (!SEMANTIC_OPS.has(op)) throw new Error(`${path}.args.op is invalid`);
-  assertClosedObject(step.args, SEMANTIC_ARG_FIELDS[op], `${path}.args`);
+  assertClosedObject(step.args, op === "assert" && step.args.mode === "value" ? VALUE_ASSERT_FIELDS : SEMANTIC_ARG_FIELDS[op], `${path}.args`);
 
   if (op === "find") {
     validateTarget(step.args.target, `${path}.args.target`, { queryOnly: true });
@@ -359,14 +388,30 @@ function validateSemanticStep(step, index, priorBindings, ids, policy) {
         throw new Error(`${path}.args.search.maxObservations must be an integer from 1 to ${policy.maxSearchObservations}`);
       }
     }
-  } else if (op !== "assert") validateTarget(step.args.target, `${path}.args.target`);
+  } else if (op !== "assert" && op !== "extract") validateTarget(step.args.target, `${path}.args.target`);
+
+  let extracted;
+  if (op === "extract") {
+    if (step.as === undefined) throw new Error(`${path}.as is required for extract`);
+    const fields = step.args.fields;
+    const count = fields && typeof fields === "object" && !Array.isArray(fields) ? Object.keys(fields).length : 0;
+    if (count < 1 || count > SEMANTIC_POLICY.limits.extractFields) {
+      throw new Error(`${path}.args.fields must be an object with 1 to ${SEMANTIC_POLICY.limits.extractFields} fields`);
+    }
+    extracted = {};
+    for (const [name, spec] of Object.entries(fields)) {
+      extractionFieldName(name, `${path}.args.fields: `);
+      extracted[name] = fieldsJsonField(name, spec, `${path}.args.fields.${name}`).spec;
+    }
+  }
 
   if (op === "ensureChecked" && typeof step.args.checked !== "boolean") throw new Error(`${path}.args.checked must be a boolean`);
   if (op === "fill") assertSemanticName(step.args.input, `${path}.args.input`);
   if (op === "click" && step.args.expect === undefined) throw new Error(`${path}.args.expect is required`);
   if (step.args.expect !== undefined) validateExpectation(step.args.expect, `${path}.args.expect`);
   if (op === "assert") {
-    if (step.args.mode !== "local" && step.args.mode !== "semantic") throw new Error(`${path}.args.mode must be 'local' or 'semantic'`);
+    if (!["local", "semantic", "value"].includes(step.args.mode)) throw new Error(`${path}.args.mode must be 'local', 'semantic' or 'value'`);
+    if (step.args.mode === "value") validateValueAssert(step.args, path, priorBindings);
     if (step.args.mode === "semantic" && (typeof step.args.claim !== "string" || !step.args.claim)) throw new Error(`${path}.args.claim must be a non-empty string`);
     if (step.args.mode === "local") validateExpectation(step.args.predicate, `${path}.args.predicate`);
     if (step.args.target !== undefined) validateTarget(step.args.target, `${path}.args.target`);
@@ -383,9 +428,10 @@ function validateSemanticStep(step, index, priorBindings, ids, policy) {
   for (const binding of references) {
     assertSemanticName(binding, `${path} binding`);
     if (!priorBindings.has(binding)) throw new Error(`${path} binding '${binding}' must refer to a prior step output`);
+    if (priorBindings.get(binding).kind === "extraction") throw new Error(`${path} binding '${binding}' is an extract result; only a value assert can use it`);
   }
   if (step.as !== undefined) {
-    priorBindings.add(step.as);
+    priorBindings.set(step.as, extracted ? { kind: "extraction", fields: extracted } : { kind: "target" });
   }
 }
 
@@ -400,7 +446,7 @@ function validateSemanticWorkflow(workflow) {
   if (workflow.semantic.maxProviderCalls !== undefined && (!Number.isInteger(workflow.semantic.maxProviderCalls) || workflow.semantic.maxProviderCalls < 1 || workflow.semantic.maxProviderCalls > WORKFLOW_POLICY.maxProviderCalls)) {
     throw new Error(`semantic.maxProviderCalls must be an integer from 1 to ${WORKFLOW_POLICY.maxProviderCalls}`);
   }
-  const priorBindings = new Set();
+  const priorBindings = new Map();
   const ids = new Set();
   workflow.steps.forEach((step, index) => validateSemanticStep(step, index, priorBindings, ids, WORKFLOW_POLICY));
 }

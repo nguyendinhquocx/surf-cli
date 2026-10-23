@@ -119,6 +119,13 @@ the provider of the selected model: `jev-1.13.0` (default) goes to TypeSafe
 only way for `surf do`). Every result reports `provider`, `model`,
 `providerCalls`, and `providerLatencyMs`.
 
+To read specific values (a total, a date, an order id) instead of a full
+`read`, use `semantic.extract --field name:type[:instructions]`. Each value
+comes back with a `confidence`; it is `null` when the value isn't on the page,
+and withheld as `guess` when the confidence is below the threshold. It always
+uses `clairic` on Cloudflare Workers AI, with the same Cloudflare credentials as
+`clef`.
+
 For icon-only buttons with no name, add `--vision` to `semantic.find` or
 `semantic.act` with `--model clef` or `clef-flash`. It also sends one image of
 those controls, each drawn from its own icon (SVG, image or icon-font glyph); no
@@ -135,6 +142,7 @@ surf semantic.act "Fill email" --input email="$EMAIL" --allow-write --allow-ref 
 surf semantic.act 'Add the selected item to the cart' --allow-write --threshold write=0.85
 surf semantic.find "the export button" --model clef-flash
 surf semantic.find "the download icon" --model clef --vision
+surf semantic.extract --field total:number:"Order total including tax" --field delivered:date
 printf '%s\n' "$TYPESAFE_KEY" | surf semantic auth set
 printf '%s\n%s\n' "$CLOUDFLARE_ACCOUNT_ID" "$CLOUDFLARE_API_TOKEN" | surf semantic auth set --provider cloudflare
 surf semantic auth status          # both providers unless --provider is given
@@ -153,10 +161,15 @@ printf '%s' '{"quantity":"2"}' | SURF_SESSION=shopping surf do --file flow.json 
 ```
 
 The closed operations are `find`, same-origin direct `open`, `ensureChecked`,
-`fill`, one-shot `click` with an explicit expectation, and `assert`. Search is
-bounded overlapping coverage, not global ranking. Unknown write outcomes stop
+`fill`, one-shot `click` with an explicit expectation, `assert`, and `extract`,
+which reads typed values from the page with Clairic (Cloudflare credentials).
+Search is bounded overlapping coverage, not global ranking. Unknown write outcomes stop
 without replay; a later new run can still repeat an external effect. Input
 values never enter provider state, workflow variables, events, or checkpoints.
+Extracted values appear only in `surf do --json` `vars.<as>`; they are never
+written to the workflow's state files or checkpoints.
+Check one with `assert` mode `value`: a `null` or `uncertain` field always
+fails, `guess` is never compared, and a failure message is only a reason code.
 
 Required argument shapes:
 
@@ -166,11 +179,13 @@ open           target
 ensureChecked  target + checked
 fill           target + input
 click          target + expect
-assert         mode + claim (semantic) or predicate (local)
+assert         mode + claim (semantic), predicate (local), or binding + field +
+               (equals | input | min/max) (value; binding = an extract's "as")
+extract        fields (the --fields-json object) + "as"; only a value assert can read it
 ```
 
-The complete valid six-operation example in the README uses these shapes; start
-from it instead of inventing fields.
+The complete valid example in the README uses these shapes, with separate
+`extract` and value `assert` examples; start from them instead of inventing fields.
 
 Every click/fill requires `--allow-write`; repeat `--allow-ref` to narrow it.
 Broad writes use threshold `0.95`; exactly one allowed ref with one applicable

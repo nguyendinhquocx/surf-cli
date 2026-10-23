@@ -1,5 +1,5 @@
 const crypto = require("node:crypto");
-const { SEMANTIC_POLICY, find, semanticModel, verify } = require("./semantic-core.cjs");
+const { SEMANTIC_POLICY, extract, fieldsJsonField, find, localReferenceDate, semanticModel, verify } = require("./semantic-core.cjs");
 const {
   buildLogicalCandidates,
   canonicalSameOriginDestination,
@@ -23,6 +23,71 @@ const WORKFLOW_POLICY = Object.freeze({
 
 function failure(reason, detail = {}) {
   return { kind: "failure", status: "blocked", reason, ...detail };
+}
+
+const VALUE_KINDS = Object.freeze({
+  text: "a string",
+  number: "a finite number",
+  integer: "an integer",
+  date: "a date as YYYY-MM-DD",
+  time: "a time as HH:MM or HH:MM:SS",
+  datetime: "a datetime as YYYY-MM-DDTHH:MM or YYYY-MM-DDTHH:MM:SS",
+});
+
+// The literal kind a value assert compares an extracted field as; null for list fields, which it can't check.
+function valueKind(spec) {
+  if (spec.type === "number" || spec.type === "duration") return spec.integer ? "integer" : "number";
+  return Object.hasOwn(VALUE_KINDS, spec.type) ? spec.type : null;
+}
+
+function normalTime(value) {
+  const match = /^(\d{2}):(\d{2})(?::(\d{2}))?$/.exec(value);
+  if (!match || match[1] > "23" || match[2] > "59" || (match[3] ?? "00") > "59") return undefined;
+  return `${match[1]}:${match[2]}:${match[3] ?? "00"}`;
+}
+
+function normalDate(value) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return undefined;
+  const parsed = new Date(`${value}T00:00:00Z`);
+  return !Number.isNaN(parsed.getTime()) && parsed.toISOString().slice(0, 10) === value ? value : undefined;
+}
+
+// Returns a value in the comparable form of its kind (times gain :SS), or undefined when it doesn't fit the kind.
+function valueLiteral(kind, value) {
+  if (kind === "text") return typeof value === "string" ? value : undefined;
+  if (kind === "number") return Number.isFinite(value) ? value : undefined;
+  if (kind === "integer") return Number.isInteger(value) ? value : undefined;
+  if (typeof value !== "string") return undefined;
+  if (kind === "date") return normalDate(value);
+  if (kind === "time") return normalTime(value);
+  if (kind === "datetime") {
+    const [date, time, extra] = value.split("T");
+    const normal = extra === undefined && time !== undefined && normalDate(date) && normalTime(time);
+    return normal ? `${date}T${normal}` : undefined;
+  }
+  return undefined;
+}
+
+// Input slots hold strings, numbers or booleans; number-like strings count as numbers.
+function inputLiteral(kind, value) {
+  if (kind === "text") return value === undefined ? undefined : String(value);
+  if ((kind === "number" || kind === "integer") && typeof value === "string" && /^-?\d+(\.\d+)?$/.test(value)) value = Number(value);
+  return valueLiteral(kind, value);
+}
+
+// Checks one extracted field against a value assert. Never reads guess, and never returns a value.
+function compareValue(field, spec, kind, { equals, min, max }) {
+  if (field.status === "null") return "value_null";
+  if (field.status !== "extracted") return "value_uncertain";
+  const scale = (kind === "number" || kind === "integer") && Number.isInteger(spec.decimals) ? 10 ** spec.decimals : null;
+  const comparable = (value) => scale ? Math.round(value * scale) : value;
+  const actual = valueLiteral(kind, field.value);
+  if (actual === undefined) return "assertion_mismatch";
+  const value = comparable(actual);
+  const matches = (equals === undefined || value === comparable(equals)) &&
+    (min === undefined || value >= comparable(min)) &&
+    (max === undefined || value <= comparable(max));
+  return matches ? null : "assertion_mismatch";
 }
 
 function success(status, detail = {}) {
@@ -64,8 +129,8 @@ function scanCoverage(intervals, scrollHeight, truncated, invalidated = false) {
 }
 
 function createSemanticWorkflowRuntime(dependencies) {
-  const { request, evaluate, attemptStore = null, createAttemptStore, model = SEMANTIC_POLICY.model, now = () => Date.now(), sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)) } = dependencies;
-  if (typeof request !== "function" || typeof evaluate !== "function") throw new TypeError("semantic workflow requires request and evaluate boundaries");
+  const { request, evaluate, evaluateExtraction, extractionModelId = SEMANTIC_POLICY.defaultExtractionModel, attemptStore = null, createAttemptStore, model = SEMANTIC_POLICY.model, now = () => Date.now(), sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)) } = dependencies;
+  if (typeof request !== "function" || (!evaluate && !evaluateExtraction)) throw new TypeError("semantic workflow requires request and evaluate or extraction boundaries");
   const writeThreshold = semanticModel(model).thresholds.write;
 
   function createContext(options = {}) {
@@ -86,7 +151,7 @@ function createSemanticWorkflowRuntime(dependencies) {
       limits: { deadlineMs, maxProviderCalls },
       pinned: null, acquired: false, steps: 0, completedSteps: [],
       attemptStore: attemptStore || createAttemptStore?.({ runId, workflowDigest }),
-      usage: { providerCalls: 0, inputTokens: 0, outputTokens: 0, partial: false, browserCommands: 0, semanticDecisions: 0, observations: 0 },
+      usage: { providerCalls: 0, inputTokens: 0, outputTokens: 0, partial: false, browserCommands: 0, semanticDecisions: 0, extractions: 0, observations: 0 },
     };
   }
 
@@ -103,15 +168,17 @@ function createSemanticWorkflowRuntime(dependencies) {
     else if (!samePinnedScope(context.pinned, observation.identity)) throw Object.assign(new Error("pinned browser scope changed"), { code: "stale_identity" });
     return observation;
   }
-  async function evaluator(context, state, questions, options = {}) {
+  // Every provider call, decision or extraction, draws on the run's one call budget and deadline.
+  async function evaluator(context, state, questions, options = {}, extracting = false) {
+    const call = extracting ? evaluateExtraction : evaluate;
     if (++context.usage.providerCalls > context.maxProviderCalls) throw Object.assign(new Error("semantic provider-call budget exhausted"), { code: "budget_exhausted" });
     if (remaining(context) < 1) throw Object.assign(new Error("semantic workflow deadline exhausted"), { code: "budget_exhausted" });
-    context.usage.semanticDecisions++;
+    context.usage[extracting ? "extractions" : "semanticDecisions"]++;
     const timeoutMs = Math.min(SEMANTIC_POLICY.timeoutMs, remaining(context));
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
-      const response = await evaluate(state, questions, { ...options, signal: controller.signal, timeoutMs });
+      const response = await call(state, questions, { ...options, signal: controller.signal, timeoutMs });
       context.usage.inputTokens += response.usage?.input_tokens || 0;
       context.usage.outputTokens += response.usage?.output_tokens || 0;
       return response;
@@ -164,7 +231,7 @@ function createSemanticWorkflowRuntime(dependencies) {
   }
   async function resolve(context, target, write, search = {}) {
     const binding = target?.binding ? context.bindings.get(target.binding) : null;
-    if (target?.binding && !binding) return { error: failure("invalid_binding") };
+    if (target?.binding && binding?.kind !== "target") return { error: failure("invalid_binding") };
     const query = binding?.query || target?.query;
     if (typeof query !== "string" || !query.trim()) return { error: failure("validation_failure") };
     const maximum = search.maxObservations ?? WORKFLOW_POLICY.defaultSearchObservations;
@@ -325,9 +392,25 @@ function createSemanticWorkflowRuntime(dependencies) {
         const resolved = await resolve(context, step.target, false, step.search);
         if (resolved.error) return resolved.error;
         const handle = step.as || step.id;
-        const binding = { handle, query: resolved.query, candidate: resolved.candidate, fullUrl: resolved.observation.identity.fullUrl };
+        const binding = { kind: "target", handle, query: resolved.query, candidate: resolved.candidate, fullUrl: resolved.observation.identity.fullUrl };
         context.bindings.set(handle, binding);
         return success("completed", { binding: publicBinding(binding), coverage: resolved.coverage, probability: resolved.decision.decision.probability });
+      }
+      if (step.op === "extract") {
+        const fields = Object.entries(step.fields).map(([name, spec]) => fieldsJsonField(name, spec, name));
+        const observation = await observe(context);
+        const state = providerState(observation);
+        // Extraction is read-only: it never reserves an attempt, and its values stay in memory.
+        const { usage: _usage, ...result } = await extract({
+          state,
+          fields,
+          referenceDate: localReferenceDate(new Date(now())),
+          model: extractionModelId,
+          evaluate: (text, requested, options) => evaluator(context, text, requested, options, true),
+        });
+        const extraction = { ...result, page: { origin: state.origin, title: state.title }, omitted: observation.omitted };
+        context.bindings.set(step.as, { kind: "extraction", handle: step.as, specs: fields, result: extraction });
+        return success("completed", { extraction });
       }
       if (step.op === "open") {
         const resolved = await resolve(context, step.target, false);
@@ -337,6 +420,24 @@ function createSemanticWorkflowRuntime(dependencies) {
         confirmedActionResponse(await browser(context, "navigate", { url, semanticExpectedIdentity: resolved.observation.identity }));
         const arrived = await observe(context);
         return new URL(arrived.identity.fullUrl).href === url ? success("verified") : failure("assertion_mismatch");
+      }
+      if (step.op === "assert" && step.mode === "value") {
+        // A value assert only reads the in-memory extract result: no browser request and no provider call.
+        const binding = context.bindings.get(step.binding);
+        const spec = binding?.kind === "extraction" ? binding.specs.find((item) => item.name === step.field)?.spec : undefined;
+        if (!spec) return failure("invalid_binding");
+        const kind = valueKind(spec);
+        const expected = {};
+        for (const key of ["equals", "min", "max"]) {
+          if (step[key] !== undefined) expected[key] = valueLiteral(kind, step[key]);
+        }
+        if (step.input !== undefined) {
+          if (!Object.hasOwn(context.inputs, step.input)) return failure("validation_failure");
+          expected.equals = inputLiteral(kind, context.inputs[step.input]);
+          if (expected.equals === undefined) return failure("validation_failure");
+        }
+        const reason = compareValue(binding.result.fields[step.field], spec, kind, expected);
+        return reason ? failure(reason) : success("verified");
       }
       if (step.op === "assert" && step.mode === "semantic") {
         const observation = await observe(context);
@@ -400,4 +501,4 @@ function createSemanticWorkflowRuntime(dependencies) {
   return { closeContext, createContext, executeStep };
 }
 
-module.exports = { WORKFLOW_POLICY, createSemanticWorkflowRuntime };
+module.exports = { VALUE_KINDS, WORKFLOW_POLICY, createSemanticWorkflowRuntime, valueKind, valueLiteral };

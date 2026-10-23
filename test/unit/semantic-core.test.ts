@@ -2,7 +2,9 @@ import { describe, expect, it, vi } from "vitest";
 
 const {
   SEMANTIC_POLICY,
+  EXTRACTION_FIELD_TYPES,
   chooseAction,
+  extract,
   filter,
   find,
   semanticModel,
@@ -586,5 +588,298 @@ describe("semantic decision core", () => {
       }),
     ).rejects.toMatchObject({ code: "semantic_invalid_request" });
     expect(evaluate).not.toHaveBeenCalled();
+  });
+});
+
+describe("semantic extraction core", () => {
+  const state = {
+    origin: "https://shop.example",
+    title: "Your order",
+    readyState: "complete",
+    modals: [],
+    candidates: [
+      { id: "e5", role: "button", name: "Pay $42.10" },
+      { id: "e6", role: "link", name: "" },
+    ],
+    chunks: [
+      { id: "c1", text: "🚚📦 Order A-88412", refs: ["e2"] },
+      { id: "c2", text: "Total $701.10", refs: [] },
+    ],
+  };
+  const sentState = 'Your order\n🚚📦 Order A-88412\nTotal $701.10\nbutton "Pay $42.10"';
+
+  // Clairic reports spans as code-point offsets into the state it received.
+  function spanOf(text: string, value: string) {
+    const start = [...text.slice(0, text.indexOf(value))].length;
+    return [start, start + [...value].length];
+  }
+
+  function run(
+    fields: Array<{
+      name: string;
+      type: string;
+      instructions?: string;
+      spec?: Record<string, unknown>;
+    }>,
+    answers: (text: string) => Record<string, unknown>,
+    options: { thresholds?: Record<string, number>; response?: Record<string, unknown> } = {},
+  ) {
+    const evaluate = vi.fn(async (text: string, _fields: unknown, _options: unknown) => ({
+      model: "clairic",
+      answers: answers(text),
+      truncated: false,
+      usage: { input_tokens: 504, output_tokens: 0 },
+      ...options.response,
+    }));
+    const result = extract({
+      state,
+      fields: fields.map(({ name, type, instructions, spec }) => ({
+        name,
+        type,
+        spec: spec ?? {
+          ...EXTRACTION_FIELD_TYPES[type],
+          ...(instructions ? { instructions } : {}),
+        },
+      })),
+      referenceDate: "2026-10-23",
+      thresholds: options.thresholds,
+      evaluate,
+    });
+    return { result, evaluate };
+  }
+
+  it("sends one line per source and maps code-point spans back to chunks and refs", async () => {
+    const { result, evaluate } = run(
+      [
+        { name: "order_id", type: "text", instructions: "Order number" },
+        { name: "total", type: "number" },
+        { name: "pay", type: "text" },
+        { name: "heading", type: "text" },
+        { name: "tracking", type: "text" },
+      ],
+      (text) => ({
+        order_id: {
+          type: "text",
+          value: "A-88412",
+          span: spanOf(text, "A-88412"),
+          confidence: 0.99,
+          p_null: 0.001,
+        },
+        total: { type: "number", value: 701.1, confidence: 0.99, mean: 701 },
+        pay: { type: "text", value: "$42.10", span: spanOf(text, "$42.10"), confidence: 0.95 },
+        heading: {
+          type: "text",
+          value: "order\n🚚📦",
+          span: spanOf(text, "order\n🚚📦"),
+          confidence: 0.9,
+        },
+        tracking: {
+          type: "text",
+          value: null,
+          guess: "A-88412",
+          span: spanOf(text, "A-88412"),
+          confidence: 0.84,
+          p_null: 0.99,
+        },
+      }),
+      { response: { state_text: "ignored" } },
+    );
+
+    expect(await result).toEqual({
+      status: "partial",
+      fields: {
+        order_id: {
+          type: "text",
+          status: "extracted",
+          value: "A-88412",
+          confidence: 0.99,
+          pNull: 0.001,
+          source: { chunks: ["c1"], refs: ["e2"] },
+        },
+        total: {
+          type: "number",
+          status: "extracted",
+          value: 701.1,
+          confidence: 0.99,
+          source: null,
+        },
+        pay: {
+          type: "text",
+          status: "extracted",
+          value: "$42.10",
+          confidence: 0.95,
+          source: { chunks: [], refs: ["e5"] },
+        },
+        heading: {
+          type: "text",
+          status: "extracted",
+          value: "order\n🚚📦",
+          confidence: 0.9,
+          source: { chunks: ["title", "c1"], refs: ["e2"] },
+        },
+        tracking: {
+          type: "text",
+          status: "null",
+          value: null,
+          guess: "A-88412",
+          confidence: 0.84,
+          pNull: 0.99,
+          source: null,
+        },
+      },
+      appliedThresholds: { extract: 0.8, null: 0.5 },
+      referenceDate: "2026-10-23",
+      truncated: false,
+      usage: { input_tokens: 504, output_tokens: 0 },
+    });
+    expect(evaluate).toHaveBeenCalledWith(
+      sentState,
+      {
+        order_id: { type: "text", instructions: "Order number", null_threshold: 0.5 },
+        total: { type: "number", null_threshold: 0.5 },
+        pay: { type: "text", null_threshold: 0.5 },
+        heading: { type: "text", null_threshold: 0.5 },
+        tracking: { type: "text", null_threshold: 0.5 },
+      },
+      { referenceDate: "2026-10-23" },
+    );
+  });
+
+  it("withholds values below the extract threshold and never invents a source", async () => {
+    const fields = [
+      { name: "order_id", type: "text" },
+      { name: "misplaced", type: "text" },
+    ];
+    const answers = (text: string) => ({
+      order_id: { type: "text", value: "A-88412", span: spanOf(text, "A-88412"), confidence: 0.5 },
+      misplaced: { type: "text", value: "A-88412", span: spanOf(text, "Total"), confidence: 0.4 },
+    });
+
+    expect(await run(fields, answers).result).toMatchObject({
+      status: "uncertain",
+      fields: {
+        order_id: {
+          status: "uncertain",
+          value: null,
+          guess: "A-88412",
+          source: { chunks: ["c1"], refs: ["e2"] },
+        },
+        misplaced: { status: "uncertain", value: null, guess: "A-88412", source: null },
+      },
+    });
+    expect(await run(fields, answers, { thresholds: { extract: 0.45 } }).result).toMatchObject({
+      status: "partial",
+      appliedThresholds: { extract: 0.45, null: 0.5 },
+      fields: { order_id: { status: "extracted", value: "A-88412" } },
+    });
+  });
+
+  it.each([
+    ["a missing answer", "date", {}],
+    ["a different answer type", "date", { field: { type: "text", value: "2026-09-28" } }],
+    ["a malformed date", "date", { field: { type: "date", value: "Sept 28" } }],
+    ["a non-integer integer", "integer", { field: { type: "number", value: 2.5 } }],
+    [
+      "an out-of-range confidence",
+      "date",
+      { field: { type: "date", value: null, confidence: 1.5 } },
+    ],
+    ["a span past the state", "text", { field: { type: "text", value: "x", span: [0, 999] } }],
+    [
+      "a list item of the wrong type",
+      "list.date",
+      { field: { type: "list", value: ["2026-09-28", "Sept 28"] } },
+    ],
+    [
+      "spans that do not align with the items",
+      "list",
+      { field: { type: "list", value: ["a", "b"], spans: [[0, 1]] } },
+    ],
+    [
+      "a response that does not report truncation",
+      "number",
+      { field: { type: "number", value: 1 } },
+      { truncated: undefined },
+    ],
+  ])("rejects %s as provider_invalid_response", async (_label, type, answers, response?) => {
+    const { result } = run([{ name: "field", type }], () => answers, { response });
+    await expect(result).rejects.toMatchObject({ code: "provider_invalid_response" });
+  });
+
+  it("passes field options through and fills the registry null threshold only when absent", async () => {
+    const { result, evaluate } = run(
+      [
+        {
+          name: "total",
+          type: "number",
+          spec: { type: "number", unit: "USD", decimals: 2, null_threshold: 0.3 },
+        },
+        { name: "count", type: "integer", spec: { type: "number", integer: true } },
+        { name: "codes", type: "list", spec: { type: "list", items: "text" } },
+      ],
+      () => ({
+        total: { type: "number", value: null },
+        count: { type: "number", value: null },
+        codes: { type: "list", value: [] },
+      }),
+    );
+    expect((await result).fields.codes).toEqual({
+      type: "list",
+      status: "null",
+      value: null,
+      sources: null,
+    });
+    expect(evaluate.mock.calls[0][1]).toEqual({
+      total: { type: "number", unit: "USD", decimals: 2, null_threshold: 0.3 },
+      count: { type: "number", integer: true, null_threshold: 0.5 },
+      codes: { type: "list", items: "text" },
+    });
+  });
+
+  it("maps each list item to its own source and withholds an uncertain list", async () => {
+    const fields = [
+      { name: "codes", type: "list" },
+      { name: "amounts", type: "list.number" },
+    ];
+    const answers = (confidence: number) => (text: string) => ({
+      codes: {
+        type: "list",
+        value: ["📦", "A-88412"],
+        spans: [spanOf(text, "📦"), spanOf(text, "A-88412")],
+        confidence,
+      },
+      amounts: { type: "list", value: [701.1], spans: [spanOf(text, "701.10")], confidence },
+    });
+
+    expect((await run(fields, answers(0.9)).result).fields).toEqual({
+      codes: {
+        type: "list",
+        status: "extracted",
+        value: ["📦", "A-88412"],
+        confidence: 0.9,
+        sources: [
+          { chunks: ["c1"], refs: ["e2"] },
+          { chunks: ["c1"], refs: ["e2"] },
+        ],
+      },
+      amounts: {
+        type: "list.number",
+        status: "extracted",
+        value: [701.1],
+        confidence: 0.9,
+        sources: [null],
+      },
+    });
+    expect((await run(fields, answers(0.44)).result).fields.codes).toEqual({
+      type: "list",
+      status: "uncertain",
+      value: null,
+      guess: ["📦", "A-88412"],
+      confidence: 0.44,
+      sources: [
+        { chunks: ["c1"], refs: ["e2"] },
+        { chunks: ["c1"], refs: ["e2"] },
+      ],
+    });
   });
 });

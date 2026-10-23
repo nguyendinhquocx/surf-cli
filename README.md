@@ -752,7 +752,7 @@ surf do 'go "url" | click e5 | screenshot' --dry-run
 - `--step-delay <ms>` - Delay between steps (default: 100, use 0 to disable)
 - `--no-auto-wait` - Disable automatic waits between steps
 - `--json` - Output structured JSON result
-- `--allow-semantic` - Opt in to bounded model decisions for a semantic workflow (model from `SURF_SEMANTIC_MODEL`, default `jev-1.13.0`)
+- `--allow-semantic` - Opt in to bounded model decisions for a semantic workflow (model from `SURF_SEMANTIC_MODEL`, default `jev-1.13.0`; `extract` steps always use `clairic` with Cloudflare credentials)
 - `--allow-write` - Additionally authorize declared `fill`, `ensureChecked`, and `click` steps
 - `--inputs-stdin` - Read one bounded JSON object of private local input slots from stdin
 - `--<arg> <value>` - Pass arguments to workflow (e.g., `--url "..."`)
@@ -853,7 +853,7 @@ surf workflow.validate ./my-workflow.json
 
 Semantic workflow files declare `"semantic": { "version": 1 }` and use only
 linear `semantic.step` operations: `find`, `open`, `ensureChecked`, `fill`,
-`click`, and `assert`. Validate or dry-run them offline, then opt in explicitly:
+`click`, `assert`, and `extract`. Validate or dry-run them offline, then opt in explicitly:
 
 ```bash
 surf workflow.validate ./product.json
@@ -895,9 +895,56 @@ printf '%s' '{"quantity":"2"}' | SURF_SESSION=shopping surf do \
 }
 ```
 
-This example includes every supported operation and the required `claim` for a
-semantic `assert`. Use it as a valid starting shape, then remove steps the task
-does not need.
+This example includes every supported operation except `extract` (shown below)
+and the required `claim` for a semantic `assert`. Use it as a valid starting
+shape, then remove steps the task does not need.
+
+`extract` reads typed values off the current page in one step, the same way
+`semantic.extract` does. Its `fields` object uses the `--fields-json` grammar,
+and the step needs an `as` name:
+
+```json
+{ "id": "read-order", "tool": "semantic.step", "as": "order", "args": {
+  "op": "extract", "fields": {
+    "total": { "type": "number", "decimals": 2, "instructions": "Order total including tax" },
+    "delivered": { "type": "date", "instructions": "Estimated delivery date" }
+  }
+} }
+```
+
+It reads one observation of the visible page and makes one call to Cloudflare's
+Clairic model, which counts against `maxProviderCalls`. It needs Cloudflare
+credentials and doesn't need `--allow-write`. A workflow without decision steps,
+such as one that only extracts, needs no TypeSafe key. The step completes for
+any valid answer, including `null` and `uncertain` fields. The result appears
+under `vars.<as>` in `surf do --json` output, with the same shape as
+`semantic.extract`. Extracted values are never written to the workflow's state
+files or checkpoints, and only a value assert can read an extract result.
+
+To check an extracted value, add an `assert` step with `"mode": "value"`. It
+names the extract step's `as` in `binding` and one of its fields in `field`,
+then gives `equals`, an `input` slot to compare with, or an inclusive `min`
+and/or `max`:
+
+```json
+{ "id": "check-total", "tool": "semantic.step", "args": {
+  "op": "assert", "mode": "value", "binding": "order", "field": "total", "input": "expectedTotal"
+} },
+{ "id": "check-delivery", "tool": "semantic.step", "args": {
+  "op": "assert", "mode": "value", "binding": "order", "field": "delivered",
+  "min": "2026-10-01", "max": "2026-10-31"
+} }
+```
+
+Run it with `surf do --file check-order.json --expectedTotal 42.10 --allow-semantic --json`.
+Numbers are compared after rounding both sides to the field's `decimals`,
+durations are in the field's unit, dates are `YYYY-MM-DD`, times `HH:MM[:SS]`,
+datetimes `YYYY-MM-DDTHH:MM[:SS]`, and text must match exactly. List fields
+can't be checked. A `null` or `uncertain` field always fails the check
+(`value_null`, `value_uncertain`), even when its `guess` would match; a value
+that doesn't match fails with `assertion_mismatch`. A value assert makes no
+browser request and no model call, and its failure message is only a reason
+code, never the extracted, expected or input value.
 
 `open` performs freshly validated same-origin HTTP(S) navigation; it never falls
 back to a click. Model-derived writes retain the `0.95` gate, dispatch at most
@@ -908,10 +955,11 @@ sent only to their browser fill/compare operation, not to the model provider, wo
 variables, events, output, or checkpoints. A new run can repeat an external
 effect: Surf does not claim exactly-once server behavior or automatic resume.
 Each semantic step result's `semantic` block reports `provider`, `model`,
-`providerCalls`, and `providerLatencyMs` for the run so far.
+`providerCalls`, and `providerLatencyMs` for the run so far. Workflows with an
+`extract` step also report Clairic's own totals under `semantic.extraction`.
 
 **Supported commands:** Ordinary workflows support all Surf commands. Semantic
-v1 workflows intentionally support only the six closed operations above.
+v1 workflows intentionally support only the seven closed operations above.
 
 ### Playbooks
 
@@ -1076,6 +1124,7 @@ semantic.find     select one control matching a goal
 semantic.filter   rank the page regions relevant to a goal
 semantic.verify   check whether one outcome is visible
 semantic.act      run the bounded observe/choose/act/verify loop
+semantic.extract  read typed values (prices, dates, ids) off the page
 ```
 
 This is most useful when the agent does not yet know a site's structure or happy
@@ -1087,7 +1136,8 @@ reliable for repeated execution.
 
 Semantic commands are an explicit remote-AI boundary: only `surf semantic.*`
 (and semantic `surf do` steps) send a bounded, value-free current-page
-observation, and it goes to the provider of the selected model. Existing Surf
+observation, and it goes to the provider of the selected model
+(`semantic.extract` always sends it to Cloudflare Workers AI). Existing Surf
 commands do not read a provider credential, load the SDK, or make provider calls.
 
 | Model | Provider | Endpoint | Credentials |
@@ -1095,6 +1145,7 @@ commands do not read a provider credential, load the SDK, or make provider calls
 | `jev-1.13.0` (default) | TypeSafe | `api.typesafe.ai` | `TYPESAFE_API_KEY` or `surf semantic auth set` |
 | `clef` | Cloudflare Workers AI | `api.cloudflare.com` | `CLOUDFLARE_ACCOUNT_ID` + `CLOUDFLARE_API_TOKEN`, or `surf semantic auth set --provider cloudflare` |
 | `clef-flash` | Cloudflare Workers AI | `api.cloudflare.com` | same as `clef` |
+| `clairic` (only `semantic.extract`) | Cloudflare Workers AI | `api.cloudflare.com` | same as `clef` |
 
 Pick a model with `--model <id>` on `semantic.find`, `semantic.filter`,
 `semantic.verify`, and `semantic.act`, or with `SURF_SEMANTIC_MODEL` (the only
@@ -1115,6 +1166,8 @@ surf semantic.act "Fill the email field" --input email="$EMAIL" --allow-write
 surf semantic.act 'Add the selected item to the cart' --allow-write --threshold write=0.85
 surf semantic.find "the export button" --model clef-flash
 SURF_SEMANTIC_MODEL=clef surf semantic.verify "Settings were saved"
+surf semantic.extract --field total:number:"Order total including tax" --field delivered:date
+surf semantic.extract --fields-json '{"total":{"type":"number","unit":"USD","decimals":2},"items":{"type":"list","items":"text"}}'
 surf semantic auth set       # TypeSafe key: hidden prompt, or exactly one stdin line
 surf semantic auth set --provider cloudflare   # account id, then hidden token
 surf semantic auth status    # each provider's source and redacted fingerprint only
@@ -1129,6 +1182,27 @@ printf '%s\n' "$TYPESAFE_KEY" | surf semantic auth set
 # Cloudflare: two stdin lines, account id then token
 printf '%s\n%s\n' "$CLOUDFLARE_ACCOUNT_ID" "$CLOUDFLARE_API_TOKEN" | surf semantic auth set --provider cloudflare
 ```
+
+#### Reading values (`semantic.extract`)
+
+`semantic.extract` reads specific values off the page, such as a price, a date
+or an order id, so the agent doesn't have to read the whole page to find them.
+Name each value with `--field name:type[:instructions]`. The types are `text`,
+`number`, `integer`, `date`, `time`, `datetime`, `duration` (or a unit such as
+`duration.minutes`), `list`, `list.number` and `list.date`. `--fields-json`
+takes the same fields as JSON when you need units, decimals or a per-field null
+threshold. Each value comes back with a `confidence` and a status: `extracted`;
+`null` when the value isn't on the page; or `uncertain` when the confidence is
+below the threshold, in which case the value is withheld and reported as
+`guess`. A text value also names the page text chunk or control ref it came
+from, when Surf can match it exactly.
+
+It runs on Cloudflare's Clairic extraction model (a preview), uses the same
+Cloudflare credentials as `clef`, and sends the same value-free page text to
+Cloudflare. `SURF_SEMANTIC_MODEL` doesn't apply to it. On 300 field results (30
+fields, 10 runs each) used to set its threshold, it reported no wrong value as
+extracted; see
+[Extraction (Clairic)](docs/semantic-models.md#extraction-clairic).
 
 #### Icon-only controls (`--vision`)
 
