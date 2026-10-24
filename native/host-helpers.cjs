@@ -516,6 +516,13 @@ function readinessExpectations(a) {
   return expect;
 }
 
+function parsePoint(value, flag) {
+  if (value === undefined) return undefined;
+  const match = /^\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*$/.exec(String(value));
+  if (!match) throw new Error(`${flag} must be x,y (got ${JSON.stringify(value)})`);
+  return [Number(match[1]), Number(match[2])];
+}
+
 /**
  * Map computer action to extension message
  */
@@ -559,7 +566,7 @@ function mapComputerAction(args, tabId) {
       if (typeSelector) {
         return { type: "SMART_TYPE", selector: typeSelector, text, clear: a.clear ?? true, submit: a.submit ?? false, ...baseMsg };
       }
-      return { type: "EXECUTE_TYPE", text, ...baseMsg };
+      return { type: a.submit ? "TYPE_SUBMIT" : "EXECUTE_TYPE", text, ...baseMsg };
     }
     
     case "key": {
@@ -604,16 +611,20 @@ function mapComputerAction(args, tabId) {
       return { type: "EXECUTE_HOVER", x: coordinate?.[0], y: coordinate?.[1], ...baseMsg };
     
     case "left_click_drag":
-    case "drag":
+    case "drag": {
+      const start = start_coordinate || parsePoint(a.from, "--from");
+      const end = a.coordinate || parsePoint(a.to, "--to") || coordinate;
+      if (!start || !end) throw new Error("drag needs --from x,y and --to x,y");
       return { 
         type: "EXECUTE_DRAG", 
-        startX: start_coordinate?.[0], 
-        startY: start_coordinate?.[1],
-        endX: coordinate?.[0],
-        endY: coordinate?.[1],
+        startX: start[0], 
+        startY: start[1],
+        endX: end[0],
+        endY: end[1],
         modifiers,
         ...baseMsg 
       };
+    }
     
     case "wait":
       return { type: "LOCAL_WAIT", seconds: Math.min(30, duration || 1) };
@@ -1148,8 +1159,12 @@ function mapToolToMessage(tool, args, tabId) {
     case "drag":
     case "scroll":
       return mapComputerAction({ ...a, action: tool }, tabId);
-    case "click":
-      return mapComputerAction({ ...a, action: "left_click" }, tabId);
+    case "click": {
+      const clickAction = { left: "left_click", right: "right_click", double: "double_click", triple: "triple_click" }[a.button ?? "left"];
+      if (!clickAction) throw new Error(`--button must be left, right, double, or triple (got ${JSON.stringify(a.button)})`);
+      // --button applies to refs and coordinates; a CSS selector click is always a left click.
+      return mapComputerAction({ ...a, action: a.selector ? "left_click" : clickAction }, tabId);
+    }
     case "cookie.list":
       return { type: "COOKIE_LIST", ...baseMsg };
     case "cookie.get":
