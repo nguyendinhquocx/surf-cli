@@ -2,8 +2,17 @@
 
 ## [Unreleased]
 
+## [2.25.0] - 2026-10-25
+
+### Highlights
+- If you run Surf's AI page checks on Cloudflare, you can now send those calls through your own Cloudflare AI Gateway by setting one environment variable. They then show up in the gateway's logs and analytics and follow its rate limits and caching.
+- Output piped from Surf into another program, such as `grep` or an agent reading `surf --help-full`, is no longer cut off partway through.
+
 ### Added
-- **Cloudflare AI Gateway routing** - Set `CLOUDFLARE_GATEWAY_ID` and Surf sends its Clef and Clairic calls through that AI Gateway, so they show up in the gateway's logs and analytics and follow its rate limits and caching. It uses the Cloudflare token you already set up; no second token is needed.
+- **Cloudflare AI Gateway routing** - Surf's semantic commands, which ask an AI model to judge or extract from a page, can run on Cloudflare's Clef and Clairic models. Set `CLOUDFLARE_GATEWAY_ID` to your gateway's id and those calls go through that Cloudflare AI Gateway, so they show up in its logs and analytics and follow its rate limits and caching. It uses the Cloudflare token you already set up; no second token is needed. The gateway logs what Surf sends, which includes page content. Without the variable, calls go straight to Workers AI as before.
+
+### Fixed
+- **Piped output is no longer cut off** - When you piped Surf's output into another program, such as `surf page.read | grep price` or an agent reading `surf --help-full`, the output could stop partway through if that program read more slowly than Surf wrote. Surf now finishes writing all of its output before it exits.
 
 ## [2.24.1] - 2026-10-24
 
