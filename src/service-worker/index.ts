@@ -45,6 +45,67 @@ function getFrameIdForTab(_tabId: number, message?: { frameId?: unknown }): numb
   return Number.isInteger(frameId) && frameId > 0 ? frameId : 0;
 }
 
+// "Not loaded" only when the frame also ignores a PING. A closed channel means the document
+// went away mid-command; a PING then would race the next document's content script.
+async function contentScriptError(tabId: number, frameId: number, err: unknown): Promise<string> {
+  const reason = err instanceof Error ? err.message : String(err);
+  if (/message (port|channel) (is )?closed|back\/forward cache/i.test(reason)) {
+    return `The page navigated or closed before it answered (${reason.replace(/\.$/, "")}). Run surf read to see the current page.`;
+  }
+  try {
+    const ping = await chrome.tabs.sendMessage(tabId, { type: "PING" }, { frameId });
+    if (ping?.success) return reason;
+  } catch {}
+  return "Content script not loaded. Try refreshing the page.";
+}
+
+// Per tab: the highest ref issued, and where each document started numbering (to name the page
+// an old ref came from). In session storage so a service-worker restart can't reset it.
+type RefTab = { high: number; pages: Array<{ frameId: number; from: number; url: string }> };
+let refTabsLoad: Promise<Record<number, RefTab>> | undefined;
+
+function loadRefTabs(): Promise<Record<number, RefTab>> {
+  refTabsLoad ??= chrome.storage.session.get("refTabs").then((stored) => (stored.refTabs ?? {}) as Record<number, RefTab>);
+  return refTabsLoad;
+}
+
+const CLICK_WAIT_MS = 5000;
+
+// Waits until a user could click the ref (visible, enabled, not covered), then clicks it with
+// trusted input. A missing ref or stale observation fails at once; nothing is clicked on failure.
+async function clickRef(tabId: number, frameId: number, ref: string, button: string, expectedIdentity?: unknown): Promise<any> {
+  const deadline = Date.now() + CLICK_WAIT_MS;
+  let target: any;
+  while (true) {
+    target = await chrome.tabs.sendMessage(tabId, { type: "CLICK_POINT", ref, expectedIdentity }, { frameId });
+    if (target?.error) return { error: target.error, code: target.code };
+    if (!target?.reason || Date.now() >= deadline) break;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  if (target?.reason) return { error: `${ref} ${target.reason}, so it was not clicked (waited ${CLICK_WAIT_MS / 1000}s).` };
+  // Attach even after the user cancelled the debugging bar: a dismissed bar is not a refusal.
+  let attachFailure = "";
+  try {
+    await cdp.attach(tabId);
+  } catch (err) {
+    attachFailure = err instanceof Error ? err.message : String(err);
+  }
+  // CDP points are main-frame viewport coordinates and a hidden tab does not process CDP input,
+  // so those clicks go in the page, and say so.
+  const inPageReason = frameId !== 0 ? "it is inside a frame"
+    : target?.inPage ? `its tab is hidden (a background tab, or a window behind other windows). If nothing happened, switch to the tab (surf tab.switch ${tabId}) or bring its window to the front and retry`
+    : attachFailure ? `Surf could not attach its debugger (${attachFailure.replace(/\.$/, "")})`
+    : "";
+  if (inPageReason) {
+    const result = await chrome.tabs.sendMessage(tabId, { type: "CLICK_ELEMENT", ref, button, expectedIdentity }, { frameId });
+    if (result.error) return { error: result.error, code: result.code };
+    return { success: true, _hint: `Clicked ${ref} inside the page, not with the mouse, because ${inPageReason}.` };
+  }
+  const clicks = button === "double" ? 2 : button === "triple" ? 3 : 1;
+  await cdp.click(tabId, target.x, target.y, button === "right" ? "right" : "left", clicks);
+  return { success: true };
+}
+
 async function validateRequestedFrame(tabId: number, value: unknown): Promise<void> {
   const frameId = Number(value);
   if (!Number.isInteger(frameId) || frameId <= 0) return;
@@ -811,12 +872,8 @@ async function performLocateAction(
 ): Promise<any> {
   switch (action) {
     case "click": {
-      const result = await chrome.tabs.sendMessage(tabId, {
-        type: "CLICK_ELEMENT",
-        ref,
-        button: "left",
-      }, { frameId });
-      return result.error ? result : { success: true, action: "click", ref };
+      const result = await clickRef(tabId, frameId, ref, "left");
+      return result.error ? result : { success: true, action: "click", ref, _hint: result._hint };
     }
     case "fill": {
       if (!value) return { error: "fill action requires --value" };
@@ -873,6 +930,28 @@ export async function handleMessage(
         throw new Error("SEMANTIC_VISION_ICON_FETCH is only for content scripts");
       }
       return fetchSemanticVisionIcon(message.url);
+    }
+
+    case "REF_FLOOR":
+    case "REF_HIGH": {
+      // Only this extension's content scripts number refs; each reports for its own tab.
+      const refTabId = sender.tab?.id;
+      if (sender.id !== chrome.runtime.id || typeof refTabId !== "number") {
+        throw new Error(`${message.type} is only for content scripts`);
+      }
+      const tabs = await loadRefTabs();
+      const tab = (tabs[refTabId] ??= { high: 0, pages: [] });
+      const frameId = sender.frameId ?? 0;
+      let reply: unknown = { success: true };
+      if (message.type === "REF_FLOOR") {
+        reply = { floor: tab.high, pages: tab.pages.filter((page) => page.frameId === frameId) };
+        tab.pages = [...tab.pages, { frameId, from: tab.high, url: sender.url ?? "" }].slice(-50);
+      } else {
+        if (!Number.isInteger(message.high)) throw new Error("REF_HIGH needs an integer high");
+        tab.high = Math.max(tab.high, message.high);
+      }
+      void chrome.storage.session.set({ refTabs: tabs });
+      return reply;
     }
 
     case "TARGET_INSPECT": {
@@ -1456,7 +1535,7 @@ export async function handleMessage(
         }, { frameId: readFrameId });
       } catch (err) {
         return {
-          error: "Content script not loaded. Try refreshing the page.",
+          error: await contentScriptError(tabId, readFrameId, err),
           pageContent: "",
           viewport: { width: 0, height: 0 }
         };
@@ -1511,51 +1590,55 @@ export async function handleMessage(
 
     case "GET_ELEMENT_COORDINATES": {
       if (!tabId) throw new Error("No tabId provided");
+      const frameId = getFrameIdForTab(tabId, message);
       try {
         return await chrome.tabs.sendMessage(tabId, {
           type: "GET_ELEMENT_COORDINATES",
           ref: message.ref,
-        }, { frameId: getFrameIdForTab(tabId, message) });
+        }, { frameId });
       } catch (err) {
-        return { error: "Content script not loaded. Try refreshing the page." };
+        return { error: await contentScriptError(tabId, frameId, err) };
       }
     }
 
     case "FORM_INPUT": {
       if (!tabId) throw new Error("No tabId provided");
+      const frameId = getFrameIdForTab(tabId, message);
       try {
         return await chrome.tabs.sendMessage(tabId, {
           type: "FORM_INPUT",
           ref: message.ref,
           value: message.value,
-        }, { frameId: getFrameIdForTab(tabId, message) });
+        }, { frameId });
       } catch (err) {
-        return { error: "Content script not loaded. Try refreshing the page." };
+        return { error: await contentScriptError(tabId, frameId, err) };
       }
     }
 
     case "EVAL_IN_PAGE": {
       if (!tabId) throw new Error("No tabId provided");
       if (!message.code) throw new Error("No code provided");
+      const frameId = getFrameIdForTab(tabId, message);
       try {
         return await chrome.tabs.sendMessage(tabId, {
           type: "EVAL_IN_PAGE",
           code: message.code,
-        }, { frameId: getFrameIdForTab(tabId, message) });
+        }, { frameId });
       } catch (err) {
-        return { error: "Content script not loaded. Try refreshing the page." };
+        return { error: await contentScriptError(tabId, frameId, err) };
       }
     }
 
     case "SCROLL_TO_ELEMENT": {
       if (!tabId) throw new Error("No tabId provided");
+      const frameId = getFrameIdForTab(tabId, message);
       try {
         return await chrome.tabs.sendMessage(tabId, {
           type: "SCROLL_TO_ELEMENT",
           ref: message.ref,
-        }, { frameId: getFrameIdForTab(tabId, message) });
+        }, { frameId });
       } catch (err) {
-        return { error: "Content script not loaded. Try refreshing the page." };
+        return { error: await contentScriptError(tabId, frameId, err) };
       }
     }
 
@@ -1672,10 +1755,11 @@ export async function handleMessage(
 
     case "GET_PAGE_TEXT": {
       if (!tabId) throw new Error("No tabId provided");
+      const frameId = getFrameIdForTab(tabId, message);
       try {
-        return await chrome.tabs.sendMessage(tabId, { type: "GET_PAGE_TEXT" }, { frameId: getFrameIdForTab(tabId, message) });
+        return await chrome.tabs.sendMessage(tabId, { type: "GET_PAGE_TEXT" }, { frameId });
       } catch (err) {
-        return { error: "Content script not loaded. Try refreshing the page." };
+        return { error: await contentScriptError(tabId, frameId, err) };
       }
     }
 
@@ -1715,6 +1799,7 @@ export async function handleMessage(
           role: message.role,
           name: message.name,
           all: message.all,
+          unique: Boolean(message.action),
         }, { frameId: locateFrameId });
 
         if (result.error) return result;
@@ -1726,7 +1811,7 @@ export async function handleMessage(
 
         return result;
       } catch (err) {
-        return { error: "Content script not loaded. Try refreshing the page." };
+        return { error: await contentScriptError(tabId, locateFrameId, err) };
       }
     }
 
@@ -1740,6 +1825,7 @@ export async function handleMessage(
           type: "LOCATE_TEXT",
           text: message.text,
           exact: message.exact,
+          unique: Boolean(message.action),
         }, { frameId: textFrameId });
 
         if (result.error) return result;
@@ -1751,7 +1837,7 @@ export async function handleMessage(
 
         return result;
       } catch (err) {
-        return { error: "Content script not loaded. Try refreshing the page." };
+        return { error: await contentScriptError(tabId, textFrameId, err) };
       }
     }
 
@@ -1764,6 +1850,7 @@ export async function handleMessage(
         const result = await chrome.tabs.sendMessage(tabId, {
           type: "LOCATE_LABEL",
           label: message.label,
+          unique: Boolean(message.action),
         }, { frameId: labelFrameId });
 
         if (result.error) return result;
@@ -1775,7 +1862,7 @@ export async function handleMessage(
 
         return result;
       } catch (err) {
-        return { error: "Content script not loaded. Try refreshing the page." };
+        return { error: await contentScriptError(tabId, labelFrameId, err) };
       }
     }
 
@@ -1792,7 +1879,7 @@ export async function handleMessage(
 
         return result;
       } catch (err) {
-        return { error: "Content script not loaded. Try refreshing the page." };
+        return { error: await contentScriptError(tabId, stylesFrameId, err) };
       }
     }
 
@@ -1812,7 +1899,7 @@ export async function handleMessage(
 
         return result;
       } catch (err) {
-        return { error: "Content script not loaded. Try refreshing the page." };
+        return { error: await contentScriptError(tabId, selectFrameId, err) };
       }
     }
 
@@ -1824,7 +1911,7 @@ export async function handleMessage(
       try {
         return await chrome.tabs.sendMessage(tabId, { type: message.type }, { frameId: 0 });
       } catch (err) {
-        return { error: "Content script not loaded. Try refreshing the page." };
+        return { error: await contentScriptError(tabId, 0, err) };
       }
     }
 
@@ -1854,32 +1941,27 @@ export async function handleMessage(
 
     case "CLICK_REF": {
       if (!tabId) throw new Error("No tabId provided");
+      const frameId = getFrameIdForTab(tabId, message);
       try {
-        const result = await chrome.tabs.sendMessage(tabId, {
-          type: "CLICK_ELEMENT",
-          ref: message.ref,
-          button: message.button || "left",
-          expectedIdentity: message.expectedIdentity,
-        }, { frameId: getFrameIdForTab(tabId, message) });
-        if (result.error) return { error: result.error, code: result.code };
-        return { success: true };
+        return await clickRef(tabId, frameId, message.ref, message.button || "left", message.expectedIdentity);
       } catch (err) {
-        return { error: "Content script not loaded. Try refreshing the page." };
+        return { error: await contentScriptError(tabId, frameId, err) };
       }
     }
 
     case "HOVER_REF": {
       if (!tabId) throw new Error("No tabId provided");
+      const frameId = getFrameIdForTab(tabId, message);
       try {
         const coords = await chrome.tabs.sendMessage(tabId, {
           type: "GET_ELEMENT_COORDINATES",
           ref: message.ref,
-        }, { frameId: getFrameIdForTab(tabId, message) });
+        }, { frameId });
         if (coords.error) return { error: coords.error };
         await cdp.hover(tabId, coords.x, coords.y);
         return { success: true };
       } catch (err) {
-        return { error: "Content script not loaded. Try refreshing the page." };
+        return { error: await contentScriptError(tabId, frameId, err) };
       }
     }
 
@@ -2045,7 +2127,7 @@ export async function handleMessage(
         return result;
       } catch (err) {
         return {
-          error: "Content script not loaded. Try refreshing the page.",
+          error: await contentScriptError(tabId, waitFrameId, err),
           pageContent: "",
           viewport: { width: 0, height: 0 }
         };
@@ -2074,7 +2156,7 @@ export async function handleMessage(
         return result;
       } catch (err) {
         return {
-          error: "Content script not loaded. Try refreshing the page.",
+          error: await contentScriptError(tabId, 0, err),
           pageContent: "",
           viewport: { width: 0, height: 0 }
         };
@@ -2101,7 +2183,7 @@ export async function handleMessage(
         return result;
       } catch (err) {
         return {
-          error: "Content script not loaded. Try refreshing the page.",
+          error: await contentScriptError(tabId, 0, err),
           pageContent: "",
           viewport: { width: 0, height: 0 }
         };
@@ -2175,7 +2257,7 @@ export async function handleMessage(
         return result;
       } catch (err) {
         return {
-          error: "Content script not loaded. Try refreshing the page.",
+          error: await contentScriptError(tabId, 0, err),
           pageContent: "",
           viewport: { width: 0, height: 0 }
         };
@@ -3399,6 +3481,7 @@ export async function handleMessage(
 
       const screenshot = getScreenshot(message.screenshotId);
       if (!screenshot) throw new Error(`Screenshot not found: ${message.screenshotId}`);
+      const frameId = getFrameIdForTab(tabId, message);
 
       try {
         const result = await chrome.tabs.sendMessage(tabId, {
@@ -3407,11 +3490,11 @@ export async function handleMessage(
           ref: message.ref,
           coordinate: message.coordinate,
           filename: message.filename || "screenshot.png",
-        }, { frameId: getFrameIdForTab(tabId, message) });
+        }, { frameId });
 
         return result;
       } catch (err) {
-        return { error: "Content script not loaded. Try refreshing the page." };
+        return { error: await contentScriptError(tabId, frameId, err) };
       }
     }
 
@@ -3684,16 +3767,17 @@ export async function handleMessage(
     case "SEARCH_PAGE": {
       if (!tabId) throw new Error("No tabId provided");
       if (!message.term) throw new Error("Search term required");
+      const frameId = getFrameIdForTab(tabId, message);
       try {
         const result = await chrome.tabs.sendMessage(tabId, {
           type: "SEARCH_PAGE",
           term: message.term,
           caseSensitive: message.caseSensitive || false,
           limit: message.limit || 10,
-        }, { frameId: getFrameIdForTab(tabId, message) });
+        }, { frameId });
         return result;
-      } catch {
-        return { error: "Content script not loaded. Try refreshing the page." };
+      } catch (err) {
+        return { error: await contentScriptError(tabId, frameId, err) };
       }
     }
 
@@ -4573,7 +4657,7 @@ initNativeMessaging(async (msg) => {
     ? () => returnOnNativeDialog(tabId, msg.watchDialogs === true, handle)
     : handle;
   const result = tabId && msg.pageChanges ? await runWithPageChanges(tabId, msg, runAction) : await runAction();
-  const hints: string[] = [];
+  const hints: string[] = result?._hint ? [result._hint] : [];
   if (autoCreatedTab) {
     hints.push(`Auto-created tab in window ${windowId} (no usable tabs existed). Navigate to your target URL.`);
   }

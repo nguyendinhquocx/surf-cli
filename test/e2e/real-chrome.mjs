@@ -183,6 +183,10 @@ function fixturePages(request, { crossOriginBase }) {
   if (url.pathname === "/changes-target") {
     return `<!doctype html><html><head><title>Changes target</title></head><body><main><h1>Target</h1></main></body></html>`;
   }
+  if (url.pathname === "/navigates-away") {
+    return `<!doctype html><html><head><title>Navigates away</title></head><body><p>Leaving</p>
+<script>setTimeout(() => { location.href = "/changes-target"; }, 1500);</script></body></html>`;
+  }
   if (url.pathname === "/native-dialog") {
     return `<!doctype html><html><head><title>Native dialog fixture</title></head>
 <body><main><button id="alert" onclick="alert('hi')">Alert</button>
@@ -268,9 +272,81 @@ ${stories}</main>
   });
 </script></body></html>`;
   }
+  if (url.pathname === "/locate") {
+    // "Save draft" comes first, so a substring match picks it; role="button" matches two selectors.
+    return `<!doctype html><html><head><title>Surf locate fixture</title></head>
+<body><output id="log"></output>
+<button onclick="log('save draft')">Save draft</button>
+<button role="button" onclick="log('save')">Save</button>
+<ul><li>Invoice 1001 <button onclick="log('delete 1001')">Delete</button></li>
+<li>Invoice 1002 <button onclick="log('delete 1002')">Delete</button></li></ul>
+<label>Email <input id="work-email"></label> <label>Email <input id="home-email"></label>
+<script>
+  function log(entry) { const out = document.querySelector("#log"); out.textContent = out.textContent ? out.textContent + "|" + entry : entry; }
+</script></body></html>`;
+  }
+  if (url.pathname === "/custom-controls") {
+    // Custom controls name themselves from text in a child element, or from text under 3 characters.
+    return `<!doctype html><html><head><title>Surf custom controls fixture</title></head>
+<body><output id="log"></output>
+<div role="button" onclick="log('save draft')"><span>Save draft</span></div>
+<div role="button" onclick="log('save')"><span>Save</span></div>
+<div role="button" onclick="log('ok')">OK</div>
+<div role="button" onclick="log('new item')"><span class="icon" aria-hidden="true">add</span>New item</div>
+<script>
+  function log(entry) { const out = document.querySelector("#log"); out.textContent = out.textContent ? out.textContent + "|" + entry : entry; }
+</script></body></html>`;
+  }
+  if (url.pathname === "/click") {
+    // Each button only reports a click a user could have made.
+    return `<!doctype html><html><head><title>Surf click fixture</title></head>
+<body><output id="log"></output>
+<button id="submit" disabled onclick="log('submit')">Submit order</button>
+<div style="position:relative"><button onclick="log('delete')">Delete order</button>
+<div role="dialog" aria-label="Cookie consent" style="position:absolute;inset:0;background:#0003"></div></div>
+<button id="pay">Pay now</button>
+<div id="clip" style="height:40px;overflow:hidden"><div style="height:200px"></div><button onclick="log('archive')">Archive order</button></div>
+<button id="arm">Arm</button> <button id="confirm" onclick="log('confirm')">Confirm order</button>
+<button oncontextmenu="event.preventDefault(); log('menu')">Options</button>
+<script>
+  function log(entry) { const out = document.querySelector("#log"); out.textContent = out.textContent ? out.textContent + "|" + entry : entry; }
+  document.querySelector("#pay").addEventListener("click", (event) => { if (event.isTrusted) log("pay"); });
+  document.querySelector("#arm").addEventListener("click", () => {
+    const confirm = document.querySelector("#confirm");
+    confirm.disabled = true;
+    setTimeout(() => { confirm.disabled = false; }, 1500);
+  });
+</script></body></html>`;
+  }
   if (url.pathname === "/type") {
     return `<!doctype html><html><head><title>Surf type fixture</title></head>
 <body><input id="plain" type="text"><textarea id="notes"></textarea></body></html>`;
+  }
+  if (url.pathname === "/refs-a") {
+    // The title says when the page came back from the back/forward cache instead of reloading.
+    return `<!doctype html><html><head><title>Surf refs page A</title></head>
+<body><a href="/refs-b">Billing settings</a> <button onclick="document.title = 'kept'">Keep my plan</button>
+<script>addEventListener("pageshow", (event) => { if (event.persisted) document.title = "restored"; });</script>
+</body></html>`;
+  }
+  if (url.pathname === "/refs-b") {
+    return `<!doctype html><html><head><title>Surf refs page B</title></head>
+<body><output id="log"></output> <a href="/refs-a">Back to plan</a>
+<button onclick="document.querySelector('#log').textContent = 'deleted'">Delete account</button></body></html>`;
+  }
+  if (url.pathname === "/type-limits") {
+    return `<!doctype html><html><head><title>Surf type limits fixture</title></head>
+<body><input id="code" aria-label="Code" maxlength="4"><input id="locked" aria-label="Locked" readonly value="orig">
+<input id="reverted" aria-label="Reverted" value="draft"><input id="wiped" aria-label="Wiped" value="draft">
+<fieldset disabled><input id="off" aria-label="Off" value="orig"></fieldset>
+<input id="shout" aria-label="Shout"><input id="name" aria-label="Name">
+<script>
+  const on = (id, edit) => document.getElementById(id).addEventListener("input", (event) => { event.target.value = edit(event.target.value); });
+  on("reverted", () => "draft");
+  on("wiped", () => "");
+  on("shout", (value) => value.toUpperCase());
+</script>
+</body></html>`;
   }
   if (url.pathname === "/harvest") {
     // A feed that loads a cursor-paginated JSON API with a token header set by page JS and
@@ -757,6 +833,137 @@ try {
   if (rerenderLog !== "saved") throw new Error(`suggested ref click did not reach the new button (log=${rerenderLog})`);
   await runSurf("tab.close", "--id", rerenderTabId, "--json");
 
+  // Locators act only on an element the query names uniquely
+  const locateTabId = String(tabIdFromOutput(await runSurf("tab.new", `${baseUrl}/locate`)));
+  await runSurf("wait.element", "#home-email", "--tab-id", locateTabId, "--json");
+  const locatePage = (await browser.pages()).find((page) => page.url() === `${baseUrl}/locate`);
+  const locateLog = () => locatePage.evaluate(() => document.querySelector("#log").textContent);
+  await runSurf("locate.role", "button", "--name", "Save", "--action", "click", "--tab-id", locateTabId, "--no-screenshot");
+  if ((await locateLog()) !== "save") throw new Error(`locate --name Save did not click the exact "Save" (log=${await locateLog()})`);
+  const ambiguousDelete = await runSurfExpectingFailure(
+    "locate.role", "button", "--name", "Delete", "--action", "click", "--tab-id", locateTabId, "--no-screenshot",
+  );
+  const deleteRefs = [...ambiguousDelete.stderr.matchAll(/^ {2}(e\d+) button "Delete"$/gm)].map((match) => match[1]);
+  if (!ambiguousDelete.stderr.includes('2 elements match role "button" and name "Delete", so nothing was done') || deleteRefs.length !== 2) {
+    throw new Error(`ambiguous locate did not list both candidates: ${JSON.stringify(ambiguousDelete)}`);
+  }
+  if ((await locateLog()) !== "save") throw new Error(`ambiguous locate acted anyway (log=${await locateLog()})`);
+  await runSurf("click", deleteRefs[1], "--tab-id", locateTabId, "--no-screenshot");
+  if ((await locateLog()) !== "save|delete 1002") throw new Error(`listed ref did not reach the second row (log=${await locateLog()})`);
+  const ambiguousLabel = await runSurfExpectingFailure(
+    "locate.label", "Email", "--action", "fill", "--value", "x@example.com", "--tab-id", locateTabId, "--no-screenshot",
+  );
+  const emailValues = await locatePage.evaluate(() => [...document.querySelectorAll("input")].map((input) => input.value));
+  if (!ambiguousLabel.stderr.includes('2 elements match label "Email"') || emailValues.some(Boolean)) {
+    throw new Error(`ambiguous locate.label filled a field: ${JSON.stringify({ ambiguousLabel, emailValues })}`);
+  }
+  await runSurf("tab.close", "--id", locateTabId, "--json");
+
+  // Custom controls take their name from their content, so read lists them and locate picks the exact one
+  const controlsTabId = String(tabIdFromOutput(await runSurf("tab.new", `${baseUrl}/custom-controls`)));
+  await runSurf("wait.element", "[role=button]", "--tab-id", controlsTabId, "--json");
+  const controlsRead = await runSurf("read", "--no-text", "--tab-id", controlsTabId);
+  for (const name of ["Save draft", "Save", "OK", "New item"]) {
+    if (!new RegExp(`button "${name}" \\[e\\d+\\]`).test(controlsRead)) {
+      throw new Error(`read did not name the custom button "${name}": ${controlsRead}`);
+    }
+  }
+  await runSurf("locate.role", "button", "--name", "Save", "--action", "click", "--tab-id", controlsTabId, "--no-screenshot");
+  const controlsLog = await runSurf("js", 'return document.querySelector("#log").textContent', "--tab-id", controlsTabId);
+  if (controlsLog.trim().split("\n").at(-1) !== '"save"') {
+    throw new Error(`locate --name Save did not click only the custom "Save" button: ${controlsLog}`);
+  }
+  await runSurf("tab.close", "--id", controlsTabId, "--json");
+
+  // A ref click waits for a click a user could make, then clicks with trusted input
+  const clickTabId = String(tabIdFromOutput(await runSurf("tab.new", `${baseUrl}/click`)));
+  await runSurf("wait.element", "#confirm", "--tab-id", clickTabId, "--json");
+  const clickPage = (await browser.pages()).find((page) => page.url() === `${baseUrl}/click`);
+  const clickLog = () => clickPage.evaluate(() => document.querySelector("#log").textContent);
+  const clickRead = await runSurf("page.read", "--all", "--no-text", "--tab-id", clickTabId);
+  const clickRef = (name) => {
+    const ref = clickRead.match(new RegExp(`button "${name}" \\[(e\\d+)\\]`))?.[1];
+    if (!ref) throw new Error(`page.read did not list button "${name}": ${clickRead}`);
+    return ref;
+  };
+  const clickTab = ["--tab-id", clickTabId, "--no-screenshot"];
+  const disabledClick = await runSurfExpectingFailure("click", clickRef("Submit order"), ...clickTab);
+  if (!disabledClick.stderr.includes(`${clickRef("Submit order")} is disabled, so it was not clicked`)) {
+    throw new Error(`a disabled button was not refused: ${JSON.stringify(disabledClick)}`);
+  }
+  const coveredClick = await runSurfExpectingFailure("click", clickRef("Delete order"), ...clickTab);
+  if (!coveredClick.stderr.includes('is covered by dialog "Cookie consent", so it was not clicked')) {
+    throw new Error(`a covered button was not refused: ${JSON.stringify(coveredClick)}`);
+  }
+  if ((await clickLog()) !== "") throw new Error(`a refused click fired anyway (log=${await clickLog()})`);
+  await runSurf("click", clickRef("Pay now"), ...clickTab);
+  await runSurf("click", clickRef("Archive order"), ...clickTab);
+  await runSurf("click", "--selector", "#arm", ...clickTab);
+  await runSurf("click", clickRef("Confirm order"), ...clickTab);
+  await runSurf("click", clickRef("Options"), "--button", "right", ...clickTab);
+  if ((await clickLog()) !== "pay|archive|confirm|menu") {
+    throw new Error(`ref clicks did not reach trusted, clipped, late-enabled and right-click buttons (log=${await clickLog()})`);
+  }
+  // A click that can't be a real mouse click goes in the page and says why, before its screenshot line.
+  const frontTabId = String(tabIdFromOutput(await runSurf("tab.new", `${baseUrl}/type`)));
+  const hiddenClick = await runSurf("click", clickRef("Archive order"), "--tab-id", clickTabId);
+  const hintAt = hiddenClick.indexOf(`because its tab is hidden`);
+  if (hintAt === -1 || !hiddenClick.includes(`surf tab.switch ${clickTabId}`)
+    || hintAt > hiddenClick.indexOf("Screenshot (pending):") || !(await clickLog()).endsWith("|archive")) {
+    throw new Error(`a click in a background tab did not go in the page with a note: ${hiddenClick} (log=${await clickLog()})`);
+  }
+  await runSurf("tab.close", "--id", frontTabId, "--json");
+  await runSurf("tab.close", "--id", clickTabId, "--json");
+
+  // A ref from an earlier page in the tab never resolves on a later one, even when both pages
+  // number their elements the same way, and a reload counts as a later page.
+  const refsTabId = String(tabIdFromOutput(await runSurf("tab.new", `${baseUrl}/refs-a`)));
+  const refsTab = ["--tab-id", refsTabId, "--no-screenshot"];
+  await runSurf("wait.ready", "--json", "--tab-id", refsTabId, "--selector", "button");
+  const refOf = (read, line) => {
+    const ref = read.match(new RegExp(`${line} \\[(e\\d+)\\]`))?.[1];
+    if (!ref) throw new Error(`read did not list ${line}: ${read}`);
+    return ref;
+  };
+  const refNumbers = (read) => [...read.matchAll(/\[e(\d+)\]/g)].map((match) => Number(match[1]));
+  const readA = await runSurf("read", "--no-text", ...refsTab);
+  const keepRef = refOf(readA, 'button "Keep my plan"');
+  await runSurf("click", refOf(readA, 'link "Billing settings"'), ...refsTab);
+  await runSurf("wait.ready", "--json", "--tab-id", refsTabId, "--selector", "a[href=\"/refs-a\"]");
+  const readB = await runSurf("read", "--no-text", ...refsTab);
+  const deleteRef = refOf(readB, 'button "Delete account"');
+  if (Math.min(...refNumbers(readB)) <= Math.max(...refNumbers(readA))) {
+    throw new Error(`page B reused page A's ref numbers: ${JSON.stringify({ readA, readB })}`);
+  }
+  const pageB = (await browser.pages()).find((page) => page.url() === `${baseUrl}/refs-b`);
+  const staleKeep = await runSurfExpectingFailure("click", keepRef, ...refsTab);
+  if (!staleKeep.stderr.includes(`${keepRef} is from an earlier page in this tab (${baseUrl}/refs-a).`)) {
+    throw new Error(`a ref from page A was not refused on page B: ${JSON.stringify(staleKeep)}`);
+  }
+  if ((await pageB.evaluate(() => document.querySelector("#log").textContent)) !== "") {
+    throw new Error("a ref from page A clicked an element on page B");
+  }
+  await runSurf("tab.reload", ...refsTab);
+  await runSurf("wait.ready", "--json", "--tab-id", refsTabId, "--selector", "a[href=\"/refs-a\"]");
+  const staleDelete = await runSurfExpectingFailure("click", deleteRef, ...refsTab);
+  if (!staleDelete.stderr.includes(`${deleteRef} is from an earlier page in this tab (${baseUrl}/refs-b).`)) {
+    throw new Error(`a ref from before a reload was not refused: ${JSON.stringify(staleDelete)}`);
+  }
+  await runSurf("back", ...refsTab);
+  await runSurf("wait.ready", "--json", "--tab-id", refsTabId, "--selector", "button");
+  const titleOfRefsTab = async () =>
+    JSON.parse(await runSurf("tab.list", "--json")).find((tab) => String(tab.id) === refsTabId)?.title;
+  const backTitle = await titleOfRefsTab();
+  if (backTitle !== "restored") throw new Error(`surf back did not restore page A from the back/forward cache (title=${backTitle})`);
+  const staleOnRestored = await runSurfExpectingFailure("click", deleteRef, ...refsTab);
+  if (!staleOnRestored.stderr.includes(`${deleteRef} is from an earlier page in this tab (${baseUrl}/refs-b).`)) {
+    throw new Error(`a restored page did not name the page visited after it: ${JSON.stringify(staleOnRestored)}`);
+  }
+  // The same document, so its own refs still work.
+  await runSurf("click", keepRef, ...refsTab);
+  if ((await titleOfRefsTab()) !== "kept") throw new Error("a restored page did not accept its own ref");
+  await runSurf("tab.close", "--id", refsTabId, "--json");
+
   // CDP type enters punctuation and non-ASCII exactly
   const typeTabId = String(tabIdFromOutput(await runSurf("tab.new", `${baseUrl}/type`)));
   await runSurf("wait.element", "#notes", "--tab-id", typeTabId, "--json");
@@ -772,6 +979,42 @@ try {
     }
   }
   await runSurf("tab.close", "--id", typeTabId, "--json");
+
+  // type refuses text a field can't take and fails when the page doesn't keep the value
+  const limitsTabId = String(tabIdFromOutput(await runSurf("tab.new", `${baseUrl}/type-limits`)));
+  await runSurf("wait.element", "#name", "--tab-id", limitsTabId, "--json");
+  const limitsRead = await runSurf("read", "--tab-id", limitsTabId);
+  const limitsRef = (name) => {
+    const ref = limitsRead.match(new RegExp(`textbox "${name}" \\[(e\\d+)\\]`))?.[1];
+    if (!ref) throw new Error(`read did not list the ${name} field: ${limitsRead}`);
+    return ref;
+  };
+  for (const [name, text, reason] of [
+    ["Code", "ABCDEFGH", "accepts at most 4 characters, but 8 were given"],
+    ["Locked", "new", "is read-only"],
+    ["Reverted", "hello", "did not keep the typed text"],
+    ["Wiped", "hello", "did not keep the typed text"],
+    ["Off", "new", "is disabled"],
+  ]) {
+    const ref = limitsRef(name);
+    const refused = await runSurfExpectingFailure("type", text, "--ref", ref, "--tab-id", limitsTabId, "--no-screenshot");
+    if (!refused.stderr.includes(`${ref} ${reason}`)) throw new Error(`type into ${name} did not fail with "${reason}": ${JSON.stringify(refused)}`);
+  }
+  const intoRefused = await runSurfExpectingFailure("type", "new", "--into", "#locked", "--tab-id", limitsTabId, "--no-screenshot");
+  if (!intoRefused.stderr.includes("#locked is read-only")) throw new Error(`type --into a read-only field did not fail: ${JSON.stringify(intoRefused)}`);
+  // A field that reformats the text (a mask) still counts as typed.
+  await runSurf("type", "ada", "--ref", limitsRef("Shout"), "--tab-id", limitsTabId, "--no-screenshot", "--json");
+  const fillData = JSON.stringify([{ ref: limitsRef("Name"), value: "Ada" }, { ref: limitsRef("Locked"), value: "new" }]);
+  const partial = await runSurfExpectingFailure("form.fill", "--data", fillData, "--tab-id", limitsTabId, "--no-screenshot");
+  if (!partial.stderr.includes("Filled 1 of 2 fields.") || !partial.stderr.includes(`${limitsRef("Locked")} is read-only`)) {
+    throw new Error(`form.fill did not report its partial fill: ${JSON.stringify(partial)}`);
+  }
+  const limitsPage = (await browser.pages()).find((page) => page.url() === `${baseUrl}/type-limits`);
+  const limitValues = await limitsPage?.evaluate(() => [...document.querySelectorAll("input")].map((input) => `${input.id}=${input.value}`).join(" "));
+  if (limitValues !== "code= locked=orig reverted=draft wiped= off=orig shout=ADA name=Ada") {
+    throw new Error(`type changed fields it refused or missed the ones it may fill: ${limitValues}`);
+  }
+  await runSurf("tab.close", "--id", limitsTabId, "--json");
 
   // js --file with statements and --options
   const optionsScript = join(repo, "test/e2e/fixtures/list-items.js");
@@ -940,6 +1183,15 @@ try {
     }
   }
   await runSurf("tab.close", "--id", refDialogTab, "--json");
+
+  // A command cut short by a navigation names the navigation, not a missing content script.
+  const leavingTab = String(tabIdFromOutput(await runSurf("tab.new", `${baseUrl}/navigates-away`)));
+  await runSurf("wait.ready", "--json", "--tab-id", leavingTab, "--selector", "p");
+  const cutShort = await runSurfExpectingFailure("wait.element", "#never", "--timeout", "15000", "--tab-id", leavingTab);
+  if (cutShort.stderr.includes("Content script not loaded") || !cutShort.stderr.includes("The page navigated or closed")) {
+    throw new Error(`a wait cut short by navigation did not report the navigation: ${JSON.stringify(cutShort)}`);
+  }
+  await runSurf("tab.close", "--id", leavingTab, "--json");
 
   // Upload through the visible button that opens a hidden file input's chooser (#363).
   const uploadTab = String(tabIdFromOutput(await runSurf("tab.new", `${baseUrl}/upload`)));

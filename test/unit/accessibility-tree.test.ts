@@ -85,6 +85,10 @@ class FakeElement extends FakeNode {
     return null;
   }
 
+  matches(): boolean {
+    return false;
+  }
+
   contains(other: FakeElement | null): boolean {
     for (let node = other; node; node = node.parentElement) {
       if (node === this) {
@@ -190,6 +194,7 @@ describe("accessibility tree", () => {
         cursor: "default",
       }),
       __piVisualIndicatorMessageHandler: visualIndicatorHandler,
+      addEventListener: vi.fn(),
     };
 
     (globalThis as any).document = {
@@ -202,6 +207,9 @@ describe("accessibility tree", () => {
 
     (globalThis as any).chrome = {
       runtime: {
+        sendMessage: vi.fn(async (message: { type: string }) =>
+          message.type === "REF_FLOOR" ? { floor: 0, pages: [] } : { success: true },
+        ),
         onMessage: {
           addListener: (handler: typeof messageHandler) => {
             messageHandler = handler;
@@ -211,6 +219,10 @@ describe("accessibility tree", () => {
     };
 
     await import("../../src/content/accessibility-tree");
+    // Surf's first message to a page waits for the page's starting ref number; send a harmless
+    // one and let that reply arrive.
+    sendMessage({ type: "PLAYBOOK_WATCH_STOP" });
+    await new Promise((resolve) => setTimeout(resolve, 0));
   });
 
   afterEach(() => {

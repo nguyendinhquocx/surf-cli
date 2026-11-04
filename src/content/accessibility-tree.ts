@@ -487,6 +487,22 @@ function getResolvedRole(element: Element): string {
   return explicitRole;
 }
 
+// ARIA roles whose accessible name comes from the element's content when nothing else names it.
+const NAME_FROM_CONTENT_ROLES = new Set([
+  "button", "cell", "checkbox", "columnheader", "gridcell", "heading", "link", "menuitem",
+  "menuitemcheckbox", "menuitemradio", "option", "radio", "rowheader", "switch", "tab", "tooltip", "treeitem",
+]);
+
+// Text a name from content uses: like textContent, but without aria-hidden or hidden subtrees (icon glyphs).
+function contentText(node: Node): string {
+  if (node.nodeType === Node.TEXT_NODE) return node.textContent || "";
+  if (node.nodeType !== Node.ELEMENT_NODE) return "";
+  const element = node as Element;
+  if (element.getAttribute("aria-hidden") === "true" || element.hasAttribute("hidden")) return "";
+  if (["script", "style", "template"].includes(element.tagName.toLowerCase())) return "";
+  return Array.from(element.childNodes, contentText).join("");
+}
+
 function getName(element: Element): string {
   const tag = element.tagName.toLowerCase();
 
@@ -534,17 +550,9 @@ function getName(element: Element): string {
     if (input.value && input.value.length < 50 && input.value.trim()) return input.value.trim();
   }
 
-  if (["button", "a", "summary"].includes(tag)) {
-    const textContent = element.textContent || "";
-    if (textContent.trim()) return textContent.trim();
-  }
-
-  if (/^h[1-6]$/.test(tag)) {
-    const text = element.textContent;
-    if (text?.trim()) {
-      const t = text.trim();
-      return t.length > 100 ? t.substring(0, 100) + "..." : t;
-    }
+  if (["button", "a", "summary"].includes(tag) || NAME_FROM_CONTENT_ROLES.has(getResolvedRole(element))) {
+    const text = contentText(element).replace(/\s+/g, " ").trim();
+    if (text) return text.length > 100 ? text.substring(0, 100) + "..." : text;
   }
 
   if (tag === "img") return "";
@@ -575,6 +583,36 @@ const elementRefs = new WeakMap<Element, ElementRef>();
 // Unlike __piElementMap entries, these outlive the element so a stale ref can name its replacement.
 const refIdentities: Record<string, { role: string; name: string }> = {};
 let globalRefCounter = 0;
+// Every ref numbered at or below this was issued by an earlier page in this tab.
+let refFloor = 0;
+// Earlier documents in this frame, oldest first, with the number each started above.
+let earlierPages: Array<{ from: number; url: string }> = [];
+let refHighQueued = false;
+let refFloorReady: Promise<void> | null = null;
+let refFloorKnown = false;
+
+// Ref numbers continue from the tab's high-water mark, so a ref from an earlier page can never
+// name an element here. Surf's first message to a document waits for the starting number, so
+// pages Surf never touches send nothing.
+function requestRefFloor(): Promise<void> {
+  refFloorReady ??= chrome.runtime.sendMessage({ type: "REF_FLOOR" })
+    .then((reply: { floor: number; pages: typeof earlierPages }) => {
+      refFloor = reply.floor;
+      earlierPages = reply.pages;
+      globalRefCounter = Math.max(globalRefCounter, refFloor);
+      refFloorKnown = true;
+    })
+    // An unreachable extension (reloaded) can't send commands here either; the next message retries.
+    .catch(() => {})
+    .finally(() => {
+      refFloorReady = null;
+    });
+  return refFloorReady;
+}
+// A page restored from the back/forward cache numbers new refs above the pages visited meanwhile.
+window.addEventListener("pageshow", (event) => {
+  if (event.persisted) refFloorKnown = false;
+});
 
 function getOrAssignRef(element: Element, role: string, name: string): string {
   const existing = elementRefs.get(element);
@@ -585,6 +623,13 @@ function getOrAssignRef(element: Element, role: string, name: string): string {
   const ref = `e${++globalRefCounter}`;
   elementRefs.set(element, { role, name, ref });
   refIdentities[ref] = { role, name };
+  if (!refHighQueued) {
+    refHighQueued = true;
+    queueMicrotask(() => {
+      refHighQueued = false;
+      chrome.runtime.sendMessage({ type: "REF_HIGH", high: globalRefCounter }).catch(() => {});
+    });
+  }
   return ref;
 }
 
@@ -804,7 +849,15 @@ function resolveRef(ref: string): { element: Element; error?: undefined } | { el
   // A re-rendered node stays reachable through __piRefs; acting on it would silently do nothing.
   if (element?.isConnected) return { element };
   const identity = refIdentities[ref];
-  if (!identity) return { error: `Element ${ref} not found. Run surf read to get current refs.` };
+  if (!identity) {
+    if (Number(ref.slice(1)) <= refFloor) {
+      // Each document numbers above every earlier one, so the ref belongs to the last that started below it.
+      const page = [...earlierPages].reverse().find((p) => p.from < Number(ref.slice(1)));
+      const where = page ? ` (${page.url})` : "";
+      return { error: `${ref} is from an earlier page in this tab${where}. Run surf read to get current refs.` };
+    }
+    return { error: `Element ${ref} not found. Run surf read to get current refs.` };
+  }
 
   const matches: Element[] = [];
   const pending: Element[] = identity.name ? [document.body] : [];
@@ -827,6 +880,107 @@ function resolveRef(ref: string): { element: Element; error?: undefined } | { el
   elementMap[suggested] = { element: new WeakRef(matches[0]), role: identity.role, name: identity.name };
   const label = JSON.stringify(identity.name.replace(/\s+/g, " "));
   return { error: `Element ${ref} no longer exists. Did you mean ${suggested} (${identity.role} ${label})? Otherwise run surf read.` };
+}
+
+function normalizeLocatorText(value: string | null | undefined): string {
+  return (value || "").replace(/\s+/g, " ").trim().toLowerCase();
+}
+
+function isLocatable(el: Element): boolean {
+  const style = window.getComputedStyle(el);
+  return style.display !== "none" && style.visibility !== "hidden" &&
+    (el as HTMLElement).offsetWidth > 0 && (el as HTMLElement).offsetHeight > 0;
+}
+
+function registerLocatedRef(el: Element): string {
+  const role = getResolvedRole(el);
+  const name = getName(el);
+  const ref = getOrAssignRef(el, role, name);
+  window.__piRefs = window.__piRefs || {};
+  window.__piRefs[ref] = el;
+  getElementMap()[ref] = { element: new WeakRef(el), role, name };
+  return ref;
+}
+
+// Exact matches outrank partial ones. When the caller is about to act, two or more remaining
+// matches are refused instead of acting on whichever came first in the document.
+function narrowLocated(
+  matches: Element[],
+  isExact: (el: Element) => boolean,
+  unique: boolean,
+  query: string,
+): Element[] | string {
+  const exact = matches.filter(isExact);
+  const elements = exact.length ? exact : matches;
+  if (!unique || elements.length < 2) return elements;
+  const listed = elements.slice(0, 10).map((el) =>
+    `  ${registerLocatedRef(el)} ${getResolvedRole(el)} ${JSON.stringify(getName(el).replace(/\s+/g, " "))}`);
+  if (elements.length > 10) listed.push(`  ...and ${elements.length - 10} more`);
+  return `${elements.length} elements match ${query}, so nothing was done. ` +
+    `Act on one of them by ref (for example surf click <ref>), or narrow the query:\n${listed.join("\n")}`;
+}
+
+function describeElement(el: Element): string {
+  const name = getName(el).replace(/\s+/g, " ");
+  if (name) return `${getResolvedRole(el)} ${JSON.stringify(name.length > 60 ? `${name.slice(0, 60)}...` : name)}`;
+  const id = el.id ? `#${el.id}` : "";
+  const cls = typeof el.className === "string" && el.className.trim() ? `.${el.className.trim().split(/\s+/).join(".")}` : "";
+  return `${el.tagName.toLowerCase()}${id}${cls}`;
+}
+
+// The topmost element at a point, descending into open shadow roots.
+function deepElementFromPoint(x: number, y: number): Element | null {
+  let hit = document.elementFromPoint(x, y);
+  while (hit?.shadowRoot) {
+    const inner = hit.shadowRoot.elementFromPoint(x, y);
+    if (!inner || inner === hit) break;
+    hit = inner;
+  }
+  return hit;
+}
+
+function isInside(node: Element, target: Element): boolean {
+  for (let at: Node | null = node; at; at = at.parentNode ?? (at as ShadowRoot).host ?? null) {
+    if (at === target) return true;
+  }
+  return false;
+}
+
+// Where a user's click on `target` would land, or why it can't: the point must hit the target,
+// something inside it, or one of its labels (styled checkboxes hide the input behind its label).
+function clickPoint(target: Element): { x: number; y: number } | { reason: string } {
+  if (target.matches(":disabled") || target.closest('[aria-disabled="true"]')) return { reason: "is disabled" };
+  const labels = [...((target as HTMLInputElement).labels ?? [])];
+  const reaches = (hit: Element | null) => !!hit && (isInside(hit, target) || labels.some((label) => isInside(hit, label)));
+  const shown = (el: Element) => el.checkVisibility({ visibilityProperty: true }) &&
+    el.getBoundingClientRect().width > 0 && el.getBoundingClientRect().height > 0;
+  const candidates = [target, ...labels].filter(shown);
+  if (!candidates.length) return { reason: "is not visible" };
+  const find = () => {
+    for (const el of candidates) {
+      const r = el.getBoundingClientRect();
+      for (const [fx, fy] of [[0.5, 0.5], [0.25, 0.25], [0.75, 0.25], [0.25, 0.75], [0.75, 0.75]]) {
+        const x = r.left + r.width * fx;
+        const y = r.top + r.height * fy;
+        if (x >= 0 && y >= 0 && x < window.innerWidth && y < window.innerHeight && reaches(deepElementFromPoint(x, y))) {
+          return { x, y };
+        }
+      }
+    }
+    return null;
+  };
+  let point = find();
+  if (!point) {
+    candidates[0].scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
+    point = find();
+  }
+  if (point) return point;
+  const r = candidates[0].getBoundingClientRect();
+  const x = r.left + r.width / 2;
+  const y = r.top + r.height / 2;
+  if (x < 0 || y < 0 || x >= window.innerWidth || y >= window.innerHeight) return { reason: "is outside the visible page" };
+  const cover = deepElementFromPoint(x, y);
+  return { reason: cover ? `is covered by ${describeElement(cover)}` : "is not visible" };
 }
 
 function generateAccessibilityTree(
@@ -1370,6 +1524,23 @@ function getElementCoordinates(ref: string): { x: number; y: number; error?: str
   return { x, y };
 }
 
+// Writes text into an input or textarea and returns why it failed, or null. Refuses before writing when the
+// field can't take the text, and fails when the page kept the old value or emptied the field. Never echoes values:
+// fields may be secret.
+function writeTextField(field: HTMLInputElement | HTMLTextAreaElement, text: string, label: string): string | null {
+  if (field.matches(":disabled")) return `${label} is disabled`;
+  if (field.readOnly) return `${label} is read-only`;
+  const limited = field instanceof HTMLTextAreaElement || /^(text|search|url|tel|email|password)$/.test(field.type);
+  if (limited && field.maxLength >= 0 && text.length > field.maxLength) {
+    return `${label} accepts at most ${field.maxLength} characters, but ${text.length} were given`;
+  }
+  const before = field.value;
+  setNativeValue(field, text);
+  // A changed value that differs from the text (an input mask) is fine; an unchanged or empty one means the page refused it.
+  if (field.value !== text && (field.value === before || field.value === "")) return `${label} did not keep the typed text`;
+  return null;
+}
+
 function setFormValue(ref: string, value: string | boolean | number): { success: boolean; error?: string } {
   const { element, error } = resolveRef(ref);
   if (!element) {
@@ -1379,18 +1550,12 @@ function setFormValue(ref: string, value: string | boolean | number): { success:
   const tagName = element.tagName.toLowerCase();
 
   try {
-    if (tagName === "input") {
-      const input = element as HTMLInputElement;
-      const type = input.type.toLowerCase();
-
-      if (type === "checkbox" || type === "radio") {
-        input.checked = Boolean(value);
-        input.dispatchEvent(new Event("change", { bubbles: true }));
-      } else {
-        setNativeValue(input, String(value));
-      }
-    } else if (tagName === "textarea") {
-      setNativeValue(element as HTMLTextAreaElement, String(value));
+    if (tagName === "input" && ["checkbox", "radio"].includes((element as HTMLInputElement).type.toLowerCase())) {
+      (element as HTMLInputElement).checked = Boolean(value);
+      element.dispatchEvent(new Event("change", { bubbles: true }));
+    } else if (tagName === "input" || tagName === "textarea") {
+      const failure = writeTextField(element as HTMLInputElement | HTMLTextAreaElement, String(value), ref);
+      if (failure) return { success: false, error: failure };
     } else if (tagName === "select") {
       const select = element as HTMLSelectElement;
       const strValue = String(value);
@@ -1440,7 +1605,8 @@ function smartType(selector: string, text: string, clear = true, submit = false)
     } else {
       // Assigning a value always replaces the previous one, so `clear` only
       // matters for the contenteditable branch above.
-      setNativeValue(target as HTMLInputElement | HTMLTextAreaElement, text);
+      const failure = writeTextField(target as HTMLInputElement, text, selector);
+      if (failure) return { success: false, error: failure };
     }
 
     if (submit) {
@@ -1789,6 +1955,28 @@ function waitForPageSettle(session: PageChangeSession, capMs: number, quietMs: n
 }
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (refFloorKnown) return handleContentMessage(message, sender, sendResponse);
+  requestRefFloor().then(() => {
+    let answered = false;
+    let keptOpen = false;
+    try {
+      keptOpen = handleContentMessage(message, sender, (response) => {
+        answered = true;
+        sendResponse(response);
+      });
+    } finally {
+      // Chrome would have closed the channel for a handler that kept nothing open or threw.
+      if (!keptOpen && !answered) sendResponse(undefined);
+    }
+  });
+  return true;
+});
+
+function handleContentMessage(
+  message: any,
+  sender: chrome.runtime.MessageSender,
+  sendResponse: (response?: any) => void,
+): boolean {
   switch (message.type) {
     case "PLAYBOOK_WATCH_START":
       playbookWatch = { includeInputValues: message.includeInputValues === true };
@@ -1969,6 +2157,21 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       sendResponse(scrollToPosition(message.position, message.selector || null));
       break;
     }
+    case "CLICK_POINT": {
+      const { element, error } = resolveRef(message.ref);
+      const guardError = semanticGuardError(element, message.expectedIdentity);
+      if (guardError) {
+        sendResponse({ error: guardError, code: guardError });
+        break;
+      }
+      if (!element) {
+        sendResponse({ error });
+        break;
+      }
+      // Trusted CDP input lands where it is sent, which is only right for a visible top-level page.
+      sendResponse({ ...clickPoint(element), inPage: document.visibilityState === "hidden" });
+      break;
+    }
     case "CLICK_ELEMENT": {
       const { element, error } = resolveRef(message.ref);
       const guardError = semanticGuardError(element, message.expectedIdentity);
@@ -2062,8 +2265,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     }
     case "LOCATE_ROLE": {
       try {
-        const { role, name, all } = message;
-        const elementMap = getElementMap();
+        const { role, name, all, unique } = message;
         
         // Mapping of role to possible selectors
         const implicitRoles: Record<string, string[]> = {
@@ -2113,49 +2315,39 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           candidates = candidates.filter(el => getResolvedRole(el) === role);
         }
         
-        // Filter by visibility
-        const visible = candidates.filter(el => {
-          const style = window.getComputedStyle(el);
-          return style.display !== 'none' && 
-                 style.visibility !== 'hidden' && 
-                 (el as HTMLElement).offsetWidth > 0 &&
-                 (el as HTMLElement).offsetHeight > 0;
-        });
-        
+        // One element can match several selectors; it is still one candidate.
+        const visible = [...new Set(candidates)].filter(isLocatable);
+
         // Filter by name if provided
         let matches = visible;
-        if (name) {
-          const lowerName = name.toLowerCase();
-          matches = visible.filter(el => {
-            const ariaLabel = el.getAttribute('aria-label')?.toLowerCase();
-            const text = el.textContent?.trim().toLowerCase();
-            const title = el.getAttribute('title')?.toLowerCase();
-            const placeholder = (el as HTMLInputElement).placeholder?.toLowerCase();
-            const value = (el as HTMLInputElement).value?.toLowerCase();
-            
-            return ariaLabel?.includes(lowerName) || 
-                   text?.includes(lowerName) || 
-                   title?.includes(lowerName) ||
-                   placeholder?.includes(lowerName) ||
-                   value?.includes(lowerName);
-          });
+        const query = normalizeLocatorText(name);
+        if (query) {
+          matches = visible.filter(el => [
+            getName(el),
+            el.getAttribute('aria-label'),
+            el.textContent,
+            el.getAttribute('title'),
+            (el as HTMLInputElement).placeholder,
+            (el as HTMLInputElement).value,
+          ].some(field => normalizeLocatorText(field).includes(query)));
         }
-        
-        if (matches.length === 0) {
+
+        const narrowed = narrowLocated(
+          matches,
+          el => query !== "" && normalizeLocatorText(getName(el)) === query,
+          unique,
+          `role "${role}"${name ? ` and name "${name}"` : ''}`,
+        );
+        if (typeof narrowed === "string") {
+          sendResponse({ error: narrowed });
+          break;
+        }
+        if (narrowed.length === 0) {
           sendResponse({ error: `No element found with role "${role}"${name ? ` and name "${name}"` : ''}` });
           break;
         }
-        
-        // Generate refs for matches
-        const results = matches.map(el => {
-          const elRole = getResolvedRole(el);
-          const elName = getName(el);
-          const ref = getOrAssignRef(el, elRole, elName);
-          window.__piRefs = window.__piRefs || {};
-          window.__piRefs[ref] = el;
-          elementMap[ref] = { element: new WeakRef(el), role: elRole, name: elName };
-          return { ref, text: el.textContent?.trim().slice(0, 50) };
-        });
+
+        const results = narrowed.map(el => ({ ref: registerLocatedRef(el), text: el.textContent?.trim().slice(0, 50) }));
         
         if (all) {
           sendResponse({ matches: results });
@@ -2169,49 +2361,33 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     }
     case "LOCATE_TEXT": {
       try {
-        const { text, exact } = message;
-        const elementMap = getElementMap();
+        const { text, exact, unique } = message;
+        const query = normalizeLocatorText(text);
         
         // Find elements containing the text
         const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
-        const matches: Element[] = [];
-        
+        const matches = new Set<Element>();
         while (walker.nextNode()) {
           const nodeText = walker.currentNode.textContent || '';
-          const hasMatch = exact 
-            ? nodeText.trim() === text 
-            : nodeText.toLowerCase().includes(text.toLowerCase());
-          
-          if (hasMatch) {
-            const parent = walker.currentNode.parentElement;
-            if (parent && !matches.includes(parent)) {
-              // Check visibility
-              const style = window.getComputedStyle(parent);
-              if (style.display !== 'none' && style.visibility !== 'hidden') {
-                matches.push(parent);
-              }
-            }
-          }
+          const hasMatch = exact ? nodeText.trim() === text : normalizeLocatorText(nodeText).includes(query);
+          const parent = walker.currentNode.parentElement;
+          if (hasMatch && parent && isLocatable(parent)) matches.add(parent);
         }
         
-        if (matches.length === 0) {
+        // Most specific (smallest) element first
+        const sorted = [...matches].sort((a, b) => (a.textContent?.length || 0) - (b.textContent?.length || 0));
+        const narrowed = narrowLocated(sorted, el => normalizeLocatorText(el.textContent) === query, unique, `text "${text}"`);
+        if (typeof narrowed === "string") {
+          sendResponse({ error: narrowed });
+          break;
+        }
+        if (narrowed.length === 0) {
           sendResponse({ error: `No element found with text "${text}"` });
           break;
         }
         
-        // Pick the most specific (smallest) element
-        const el = matches.sort((a, b) => 
-          (a.textContent?.length || 0) - (b.textContent?.length || 0)
-        )[0];
-        
-        const role = getResolvedRole(el);
-        const name = getName(el);
-        const ref = getOrAssignRef(el, role, name);
-        window.__piRefs = window.__piRefs || {};
-        window.__piRefs[ref] = el;
-        elementMap[ref] = { element: new WeakRef(el), role, name };
-        
-        sendResponse({ ref, text: el.textContent?.trim().slice(0, 50) });
+        const el = narrowed[0];
+        sendResponse({ ref: registerLocatedRef(el), text: el.textContent?.trim().slice(0, 50) });
       } catch (err) {
         sendResponse({ error: err instanceof Error ? err.message : String(err) });
       }
@@ -2219,52 +2395,42 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     }
     case "LOCATE_LABEL": {
       try {
-        const { label } = message;
-        const elementMap = getElementMap();
+        const { label, unique } = message;
+        const query = normalizeLocatorText(label);
+        const fields: Element[] = [];
+        const exactFields = new Set<Element>();
+        const addField = (field: Element | null, exactMatch: boolean) => {
+          if (!field) return;
+          if (!fields.includes(field)) fields.push(field);
+          if (exactMatch) exactFields.add(field);
+        };
         
-        // Find label element
-        const labels = document.querySelectorAll('label');
-        let input: Element | null = null;
+        for (const lbl of document.querySelectorAll('label')) {
+          const lblText = normalizeLocatorText(lbl.textContent);
+          if (!lblText.includes(query)) continue;
+          const forId = lbl.getAttribute('for');
+          addField((forId && document.getElementById(forId)) || lbl.querySelector('input, select, textarea'), lblText === query);
+        }
         
-        for (const lbl of labels) {
-          const lblText = lbl.textContent?.trim().toLowerCase();
-          if (lblText?.includes(label.toLowerCase())) {
-            // Check for 'for' attribute
-            const forId = lbl.getAttribute('for');
-            if (forId) {
-              input = document.getElementById(forId);
-            }
-            // Check for nested input
-            if (!input) {
-              input = lbl.querySelector('input, select, textarea');
-            }
-            if (input) break;
+        // Fields named only by aria-label or placeholder
+        if (fields.length === 0) {
+          for (const field of document.querySelectorAll('input, textarea, select')) {
+            const names = [field.getAttribute('aria-label'), field.getAttribute('placeholder')].map(normalizeLocatorText);
+            if (names.some(fieldName => fieldName.includes(query))) addField(field, names.includes(query));
           }
         }
         
-        // Also check aria-label and placeholder
-        if (!input) {
-          const lowerLabel = label.toLowerCase();
-          input = document.querySelector(
-            `input[aria-label*="${label}" i], input[placeholder*="${label}" i], ` +
-            `textarea[aria-label*="${label}" i], textarea[placeholder*="${label}" i], ` +
-            `select[aria-label*="${label}" i]`
-          );
+        const narrowed = narrowLocated(fields, field => exactFields.has(field), unique, `label "${label}"`);
+        if (typeof narrowed === "string") {
+          sendResponse({ error: narrowed });
+          break;
         }
-        
-        if (!input) {
+        if (narrowed.length === 0) {
           sendResponse({ error: `No form field found with label "${label}"` });
           break;
         }
         
-        const role = getResolvedRole(input);
-        const name = getName(input);
-        const ref = getOrAssignRef(input, role, name);
-        window.__piRefs = window.__piRefs || {};
-        window.__piRefs[ref] = input;
-        elementMap[ref] = { element: new WeakRef(input), role, name };
-        
-        sendResponse({ ref, label });
+        sendResponse({ ref: registerLocatedRef(narrowed[0]), label });
       } catch (err) {
         sendResponse({ error: err instanceof Error ? err.message : String(err) });
       }
@@ -2676,21 +2842,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           continue;
         }
         try {
-          if (el instanceof HTMLInputElement) {
-            const inputType = el.type.toLowerCase();
-            if (inputType === "checkbox" || inputType === "radio") {
-              const shouldCheck = value === true || value === "true" || value === "1" || value === "checked";
-              el.checked = shouldCheck;
-              el.dispatchEvent(new Event("change", { bubbles: true }));
-            } else {
-              el.focus();
-              setNativeValue(el, String(value));
-            }
+          if (el instanceof HTMLInputElement && ["checkbox", "radio"].includes(el.type.toLowerCase())) {
+            const shouldCheck = value === true || value === "true" || value === "1" || value === "checked";
+            el.checked = shouldCheck;
+            el.dispatchEvent(new Event("change", { bubbles: true }));
             results.push({ ref, success: true });
-          } else if (el instanceof HTMLTextAreaElement) {
+          } else if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) {
             el.focus();
-            setNativeValue(el, String(value));
-            results.push({ ref, success: true });
+            const failure = writeTextField(el, String(value), ref);
+            results.push(failure ? { ref, success: false, error: failure } : { ref, success: true });
           } else if (el instanceof HTMLSelectElement) {
             el.value = String(value);
             el.dispatchEvent(new Event("change", { bubbles: true }));
@@ -2708,9 +2868,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         }
       }
       const failed = results.filter(r => !r.success);
+      const filled = results.length - failed.length;
+      // A top-level error makes the CLI exit non-zero instead of printing a failed result as output.
+      const error = [...(filled ? [`Filled ${filled} of ${results.length} fields.`] : []), ...failed.map((r) => r.error)].join("\n");
       sendResponse({
         success: failed.length === 0,
-        filled: results.filter(r => r.success).length,
+        ...(failed.length ? { error } : {}),
+        filled,
         failed: failed.length,
         results,
       });
@@ -2894,7 +3058,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return false;
   }
   return false;
-});
+}
 
 function searchPageText(term: string, caseSensitive: boolean, limit: number) {
   const matches: Array<{
