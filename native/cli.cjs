@@ -39,6 +39,7 @@ const IS_WIN = process.platform === "win32";
 const { SURF_TMP, formatSocketError } = require("./socket-path.cjs");
 const { acquireBrowserLock } = require("./browser-lock.cjs");
 const { selectEndpoint, connectEndpoint, formatEndpointError } = require("./endpoint.cjs");
+const { launchArgv, launchBrowser } = require("./browser-launch.cjs");
 const { createFrameParser, createSocketWriter, writeFrame } = require("./remote-transport.cjs");
 const { resolveRequestDeadlineMs } = require("./host-sessions.cjs");
 const toolScope = require("./tool-scope.cjs");
@@ -724,7 +725,7 @@ const TOOLS = {
         args: [],
         opts: {
           ref: "Get specific element",
-          all: "All visible elements, including offscreen",
+          all: "All visible elements, including offscreen (without it, read ends with \"+N elements off-screen: surf read --all\" when it left any out)",
           "include-hidden": "Also include hidden elements (implies --all)",
           "no-text": "Exclude visible text content",
           depth: "Maximum tree depth (default: unlimited)",
@@ -744,7 +745,15 @@ const TOOLS = {
         ]
       },
       "read": { desc: "Alias for page.read", args: [], alias: "page.read" },
-      "page.text": { desc: "Extract all text from page", args: [] },
+      "page.text": {
+        desc: "Extract visible text from page",
+        args: [],
+        opts: { ref: "One element's whole text, or a field's whole value (never a secret field's)" },
+        examples: [
+          { cmd: "page.text", desc: "Visible text of the page" },
+          { cmd: "page.text --ref e5", desc: "Full value of field e5, newlines kept" },
+        ],
+      },
       "page.html": {
         desc: "Print rendered document HTML",
         args: [],
@@ -844,6 +853,16 @@ const TOOLS = {
           { cmd: 'select e5 --by index 0', desc: "Select first option" },
         ]
       },
+      "check": {
+        desc: "Check a checkbox, switch or radio; does nothing if it is already checked",
+        args: ["ref"],
+        examples: [{ cmd: "check e6", desc: "Check e6 (clicks it only if it is unchecked)" }]
+      },
+      "uncheck": {
+        desc: "Uncheck a checkbox or switch; does nothing if it is already unchecked",
+        args: ["ref"],
+        examples: [{ cmd: "uncheck e6", desc: "Uncheck e6 (clicks it only if it is checked)" }]
+      },
     }
   },
   wait: {
@@ -921,12 +940,14 @@ const TOOLS = {
           ref: "Element ref (uses JS DOM method, more reliable for modals)",
           submit: "Press Enter after (at the cursor or with --into; not with --ref)",
           clear: "Clear the field first (with --into)",
+          escapes: "Turn \\n, \\t, \\r and \\\\ in the text into newline, tab, carriage return and backslash",
           method: "cdp|js (cursor typing uses CDP; selector/ref targets use JS)"
         },
         examples: [
           { cmd: 'type "hello world"', desc: "Type at cursor (CDP events)" },
           { cmd: 'type "user@example.com" --ref e5', desc: "Type into element by ref (JS DOM)" },
           { cmd: 'type "search query" --submit', desc: "Type and press Enter" },
+          { cmd: 'type "line 1\\nline 2" --ref e7 --escapes', desc: "Type two lines into a textarea" },
         ]
       },
       "smart_type": {
@@ -1701,8 +1722,14 @@ const TOOLS = {
   setup: {
     desc: "Install, configure and serve",
     commands: {
-      install: { desc: "Install the native messaging host for a browser extension id", args: ["extension-id"] },
+      install: { desc: "Install the native messaging host for Surf's extension (or a given extension id)", args: [] },
       uninstall: { desc: "Remove the native messaging host configuration", args: [] },
+      update: {
+        desc: "Update surf with the npm that installed it (or rebuild a linked repo checkout), refresh the native host and reload the extension",
+        args: [],
+        opts: { json: "Print {before, after, steps} as JSON" },
+        examples: [{ cmd: "update", desc: "Update and print the versions before and after" }],
+      },
       config: {
         desc: "Print the surf.json config in use",
         args: [],
@@ -2456,20 +2483,28 @@ if (args[0] === "doctor") {
   return;
 }
 
+if (args[0] === "update" && !helpRequested()) {
+  const { runUpdateCli } = require("./update.cjs");
+  runUpdateCli(args.slice(1)).then((code) => process.exit(code));
+  return;
+}
+
 if (args[0] === "install") {
   const { spawnSync } = require("child_process");
   const scriptPath = require("path").resolve(__dirname, "../scripts/install-native-host.cjs");
   const installArgs = args.slice(1);
 
-  if (installArgs.length === 0 || installArgs[0] === "--help" || installArgs[0] === "-h") {
+  if (installArgs[0] === "--help" || installArgs[0] === "-h") {
     console.log(`
-Usage: surf install <extension-id> [options]
+Usage: surf install [extension-id] [options]
 
-Install native messaging host for browser communication.
+Install native messaging host for browser communication, link the agent skill,
+and print the extension folder to load with "Load unpacked" in chrome://extensions.
 
 Arguments:
-  extension-id    Chrome extension ID (32 lowercase letters a-p)
-                  Find at chrome://extensions with Developer Mode enabled
+  extension-id    Optional. Defaults to Surf's own extension ID, which every
+                  Surf build has. Give one only for a fork or a build with a
+                  different ID (32 lowercase letters a-p, see chrome://extensions).
 
 Options:
   -b, --browser   Browser(s) to install for (default: chrome)
@@ -2485,11 +2520,12 @@ Options:
                   Persist the local POSIX socket group for mode 660.
 
 Examples:
+  surf install
+  surf install --browser brave
+  surf install --browser all
+  surf install --target linux
+  surf install --socket-mode 660 --socket-group surf
   surf install hnfbepgmaoklhekckbpjnleifhahkcpl
-  surf install hnfbepgmaoklhekckbpjnleifhahkcpl --browser brave
-  surf install hnfbepgmaoklhekckbpjnleifhahkcpl --browser all
-  surf install hnfbepgmaoklhekckbpjnleifhahkcpl --target linux
-  surf install hnfbepgmaoklhekckbpjnleifhahkcpl --socket-mode 660 --socket-group surf
 `);
     process.exit(0);
   }
@@ -3307,7 +3343,7 @@ if (args[0] === "workflow.validate") {
   }
 }
 
-const BOOLEAN_FLAGS = ["auto-capture", "json", "stream", "dry-run", "stop-on-error", "fail-fast", "clear", "submit", "all", "include-hidden", "case-sensitive", "hard", "annotate", "fullpage", "full-page", "reset", "no-screenshot", "no-diff", "full", "soft-fail", "has-body", "exclude-static", "v", "vv", "request", "by-tab", "har", "jsonl", "no-save", "no-auto-wait", "no-lock", "no-wait", "window", "tab", "focused", "unfocused", "keep-target", "close-target", "replace", "refresh", "allow-post"];
+const BOOLEAN_FLAGS = ["auto-capture", "json", "stream", "dry-run", "stop-on-error", "fail-fast", "clear", "submit", "escapes", "all", "include-hidden", "case-sensitive", "hard", "annotate", "fullpage", "full-page", "reset", "no-screenshot", "no-diff", "full", "soft-fail", "has-body", "exclude-static", "v", "vv", "request", "by-tab", "har", "jsonl", "no-save", "no-auto-wait", "no-lock", "no-wait", "window", "tab", "focused", "unfocused", "keep-target", "close-target", "replace", "refresh", "allow-post"];
 
 const parseArgs = (rawArgs) => {
   const result = { positional: [], options: {} };
@@ -3527,6 +3563,8 @@ const PRIMARY_ARG_MAP = {
   "frame.js": "code",
   "element.styles": "selector",
   "select": "selector",
+  "check": "ref",
+  "uncheck": "ref",
 };
 
 let toolArgs = { ...options };
@@ -3675,6 +3713,14 @@ if (tool === "select" && positional.length > 2) {
 if (toolArgs.into && !toolArgs.selector) {
   toolArgs.selector = toolArgs.into;
   delete toolArgs.into;
+}
+
+if (tool === "type" && toolArgs.escapes) {
+  if (typeof toolArgs.text === "string") {
+    const escapes = { n: "\n", t: "\t", r: "\r", "\\": "\\" };
+    toolArgs.text = toolArgs.text.replace(/\\([ntr\\])/g, (_, c) => escapes[c]);
+  }
+  delete toolArgs.escapes;
 }
 
 const globalOpts = {};
@@ -4218,50 +4264,88 @@ if (endpoint.kind === "remote") {
   return;
 }
 
-socket = connectEndpoint(endpoint, () => {
-  writeFrame(socket, request).catch((error) => socket.destroy(error));
-});
-
-const requestTimeout = resolveRequestDeadlineMs(finalTool, toolArgs);
-timeout = setTimeout(() => {
-  console.error(`Error: Request timed out (${requestTimeout / 1000}s)`);
-  socket.destroy();
+// surf.json `browser.autostart`: when no Surf host is listening, start the browser (with the URL
+// for `go`, so there is no stray blank tab) and wait for its host before sending the request.
+async function startBrowserIfNeeded(settings) {
+  const probe = () => new Promise((resolve) => {
+    const sock = connectEndpoint(endpoint, () => { sock.destroy(); resolve(null); });
+    sock.on("error", resolve);
+  });
+  let error = await probe();
+  if (!error || !["ENOENT", "ECONNREFUSED"].includes(error.code)) return;
+  const timeoutMs = settings.timeoutMs ?? 30_000;
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new Error("surf.json browser.timeoutMs must be a positive number");
+  const argv = launchArgv({ app: settings.app, command: settings.command, url: finalTool === "navigate" ? toolArgs.url : undefined });
+  const launch = launchBrowser(argv);
+  const deadline = Date.now() + timeoutMs;
+  while (error && !launch.error && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    error = await probe();
+  }
+  if (!error) return;
+  console.error("Error:", formatEndpointError(error, endpoint, formatSocketError));
+  console.error(launch.error
+    ? `Autostart could not run ${argv[0]}: ${launch.error.message}`
+    : `Autostart launched ${settings.command ? argv[0] : settings.app || "chrome"} but Surf did not connect within ${timeoutMs / 1000}s.`);
   process.exit(1);
-}, requestTimeout);
+}
 
-const responseParser = createFrameParser({
-  onFrame(msg) {
-    if (msg.type === "extension_disconnected") {
-      clearTimeout(timeout);
-      console.error(msg.message);
-      socket.end();
-      process.exit(1);
-    }
-    if (msg.id !== request.id) return;
-    handleResponse(msg).catch((err) => {
-      console.error("Handler error:", err.message);
-      process.exit(1);
-    });
-  },
-  onError(error) {
-    clearTimeout(timeout);
-    console.error("Invalid response frame:", error.message);
+function sendLocalRequest() {
+  socket = connectEndpoint(endpoint, () => {
+    writeFrame(socket, request).catch((error) => socket.destroy(error));
+  });
+
+  const requestTimeout = resolveRequestDeadlineMs(finalTool, toolArgs);
+  timeout = setTimeout(() => {
+    console.error(`Error: Request timed out (${requestTimeout / 1000}s)`);
     socket.destroy();
     process.exit(1);
-  },
-});
+  }, requestTimeout);
 
-socket.on("data", (data) => responseParser.push(data));
+  const responseParser = createFrameParser({
+    onFrame(msg) {
+      if (msg.type === "extension_disconnected") {
+        clearTimeout(timeout);
+        console.error(msg.message);
+        socket.end();
+        process.exit(1);
+      }
+      if (msg.id !== request.id) return;
+      handleResponse(msg).catch((err) => {
+        console.error("Handler error:", err.message);
+        process.exit(1);
+      });
+    },
+    onError(error) {
+      clearTimeout(timeout);
+      console.error("Invalid response frame:", error.message);
+      socket.destroy();
+      process.exit(1);
+    },
+  });
 
-socket.on("error", (err) => {
-  clearTimeout(timeout);
-  console.error("Error:", formatEndpointError(err, endpoint, formatSocketError));
-  process.exit(1);
-});
+  socket.on("data", (data) => responseParser.push(data));
 
-socket.on("close", () => {
-  clearTimeout(timeout);
-});
+  socket.on("error", (err) => {
+    clearTimeout(timeout);
+    console.error("Error:", formatEndpointError(err, endpoint, formatSocketError));
+    process.exit(1);
+  });
+
+  socket.on("close", () => {
+    clearTimeout(timeout);
+  });
+}
+
+const autostart = config.browser?.autostart === true ? config.browser : null;
+if (autostart) {
+  startBrowserIfNeeded(autostart).then(sendLocalRequest, (error) => {
+    console.error(`Error: ${error.message}`);
+    process.exit(1);
+  });
+} else {
+  sendLocalRequest();
+}
 
 function formatTargetContext(target) {
   if (!target) return null;
@@ -4278,6 +4362,11 @@ function printResponseContext(response) {
   if (context) console.error(context);
   if (response.notice && finalClassification.scope !== "provider") {
     console.error(`[surf] ${response.notice}`);
+  }
+  // A host older than this check sends no versions, and an unknown version is not a mismatch.
+  const { host = null, extension = null } = response.versions || {};
+  if ((host && host !== VERSION) || (extension && extension !== VERSION)) {
+    console.error(`surf: version mismatch (cli ${VERSION}, host ${host ?? "unknown"}, extension ${extension ?? "unknown"}). Run \`surf update\`.`);
   }
 }
 

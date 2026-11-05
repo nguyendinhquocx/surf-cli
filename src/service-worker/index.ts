@@ -1700,7 +1700,7 @@ export async function handleMessage(
           const results = await chrome.scripting.executeScript({
             target: { tabId },
             func: scrollScript,
-            args: [position, selector],
+            args: [position, selector ?? null],
           });
           return results[0]?.result || { error: "Script failed" };
         } catch {
@@ -1744,7 +1744,7 @@ export async function handleMessage(
           const results = await chrome.scripting.executeScript({
             target: { tabId },
             func: scrollInfoScript,
-            args: [selector],
+            args: [selector ?? null],
           });
           return results[0]?.result || { error: "Script failed" };
         } catch {
@@ -1757,7 +1757,7 @@ export async function handleMessage(
       if (!tabId) throw new Error("No tabId provided");
       const frameId = getFrameIdForTab(tabId, message);
       try {
-        return await chrome.tabs.sendMessage(tabId, { type: "GET_PAGE_TEXT" }, { frameId });
+        return await chrome.tabs.sendMessage(tabId, { type: "GET_PAGE_TEXT", ref: message.ref }, { frameId });
       } catch (err) {
         return { error: await contentScriptError(tabId, frameId, err) };
       }
@@ -1767,21 +1767,22 @@ export async function handleMessage(
       if (!tabId) throw new Error("No tabId provided");
       const results = await chrome.scripting.executeScript({
         target: { tabId, frameIds: [getFrameIdForTab(tabId, message)] },
-        func: (selector?: unknown, stripScripts?: boolean) => {
-          if (selector !== undefined && (typeof selector !== "string" || selector.length === 0)) {
+        // Chrome rejects `undefined` in ScriptInjection.args, so "no selector" travels as null.
+        func: (selector: unknown, stripScripts: boolean) => {
+          if (selector !== null && (typeof selector !== "string" || selector.length === 0)) {
             throw new Error("selector must be a non-empty string");
           }
-          const root = selector === undefined ? document.documentElement : document.querySelector(selector);
+          const root = selector === null ? document.documentElement : document.querySelector(selector);
           if (!root) throw new Error(`No element matches selector "${selector}"`);
           const exportRoot = stripScripts ? root.cloneNode(true) as Element : root;
           if (stripScripts) {
             if (exportRoot.matches("script")) return "";
             exportRoot.querySelectorAll("script").forEach((script) => script.remove());
           }
-          const doctype = selector === undefined && document.doctype ? `<!doctype ${document.doctype.name}>\n` : "";
+          const doctype = selector === null && document.doctype ? `<!doctype ${document.doctype.name}>\n` : "";
           return doctype + exportRoot.outerHTML;
         },
-        args: [message.selector, message.stripScripts],
+        args: [message.selector ?? null, message.stripScripts === true],
       });
       const html = results[0]?.result;
       if (typeof html !== "string") throw new Error("Page HTML extraction returned an invalid result");
@@ -1944,6 +1945,43 @@ export async function handleMessage(
       const frameId = getFrameIdForTab(tabId, message);
       try {
         return await clickRef(tabId, frameId, message.ref, message.button || "left", message.expectedIdentity);
+      } catch (err) {
+        return { error: await contentScriptError(tabId, frameId, err) };
+      }
+    }
+
+    case "SET_CHECKED": {
+      if (!tabId) throw new Error("No tabId provided");
+      const frameId = getFrameIdForTab(tabId, message);
+      const { ref, checked } = message;
+      const stateOf = (state: any) => state.checked === "mixed" ? "partly checked" : state.checked ? "checked" : "unchecked";
+      try {
+        const before = await chrome.tabs.sendMessage(tabId, { type: "CHECKED_STATE", ref, expectedIdentity: message.expectedIdentity }, { frameId });
+        if (before?.error) return { error: before.error, code: before.code };
+        if (before.checked === checked) return { success: true, _hint: `${ref} was already ${stateOf(before)}; nothing clicked.` };
+        if (!checked && before.radio) {
+          return { error: `${ref} is a radio button, and clicking a checked radio doesn't uncheck it. Check another option in its group instead.` };
+        }
+        let state = before;
+        let clicked: any;
+        // A partly checked box usually turns checked first, so `uncheck` may need a second click.
+        for (let clicks = 0; clicks < (before.checked === "mixed" ? 2 : 1) && state.checked !== checked; clicks++) {
+          clicked = await clickRef(tabId, frameId, ref, "left", message.expectedIdentity);
+          if (clicked.error) return clicked;
+          // Pages may commit the new state a frame or a save request later, so wait up to 1s for it to change.
+          const from = state.checked;
+          const until = Date.now() + 1000;
+          while (true) {
+            state = await chrome.tabs.sendMessage(tabId, { type: "CHECKED_STATE", ref }, { frameId });
+            if (state?.error) return { error: state.error, code: state.code };
+            if (state.checked !== from || Date.now() >= until) break;
+            await sleep(50);
+          }
+        }
+        if (state.checked !== checked) {
+          return { error: `${ref} was ${stateOf(before)} and is ${stateOf(state)} after clicking it (waited 1s for the page).` };
+        }
+        return clicked;
       } catch (err) {
         return { error: await contentScriptError(tabId, frameId, err) };
       }
@@ -4504,6 +4542,13 @@ export async function handleMessage(
       };
     }
 
+    case "RELOAD_EXTENSION": {
+      // From `surf update`: load the updated dist/ from disk, which also restarts the native
+      // host. The delay lets this reply reach the host first.
+      setTimeout(() => chrome.runtime.reload(), 100);
+      return { success: true };
+    }
+
     default:
       throw new Error(`Unknown message type: ${message.type}`);
   }
@@ -4528,7 +4573,7 @@ const COMMANDS_WITHOUT_TAB = new Set([
   "DOWNLOADS_SEARCH",
   "WINDOW_NEW", "WINDOW_LIST", "WINDOW_FOCUS", "WINDOW_CLOSE", "WINDOW_RESIZE",
   "TARGET_INSPECT", "TARGET_RESOLVE", "SESSION_CREATE_TARGET", "SESSION_CLOSE_TARGET",
-  "EMULATE_DEVICE_LIST"
+  "EMULATE_DEVICE_LIST", "RELOAD_EXTENSION"
 ]);
 
 const PAGE_CHANGES_BEGIN_TIMEOUT_MS = 2000;

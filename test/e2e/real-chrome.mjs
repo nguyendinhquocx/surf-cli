@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
 import {
   chmodSync,
@@ -20,9 +19,8 @@ import { promisify } from "node:util";
 const execFileAsync = promisify(execFile);
 const require = createRequire(import.meta.url);
 const repo = process.cwd();
-const extensionKey =
-  "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEArWZVsRzpoyzuyQFqRzGOnkxv9FNaX/SR/VMw2f9ld+DKmUMxJhi/14olehkLWRJQumFPYTzWr1oqb1LwwI2KhBtn9mbaqzPSrrRGQ1VobTx7ZmxU+ooppXNdb2KGh/WXVqahS0D1nsQplAE6hCqQWPjsPCnXnWjUIH/B0EsInIUDwA8PKfuMG8p2HDlLj8hEpmLwOA48W4aHbl2S6bZHu9O50Lbd0L94aSwJLBNLKuXpBt/kFwlnpHd3zoJme9DIbqnDU/nMNh9SlA+EXRT6FhyiKdo6ZBMdtJeUPLQI2uHeoF8wikkNhIXX/E2EXlBqtZJJaFEi895x2s40+j/iZQIDAQAB"; // gitleaks:allow -- public test manifest key
-const extensionId = "nionemkjcnknfdhdolfloigkhpjnifmf";
+// The shipped extension pins its ID; `surf install` with no ID must register the same one.
+const extensionId = require("../../scripts/install-native-host.cjs").SURF_EXTENSION_ID;
 const pinnedChromeVersion = "156.0.8078.47";
 const scratch = mkdtempSync(join(tmpdir(), "surf-real-chrome-"));
 const home = join(scratch, "home");
@@ -39,13 +37,6 @@ let chromeExecutablePath;
 let puppeteer;
 let server;
 let failure;
-
-function extensionIdForKey(key) {
-  const digest = createHash("sha256").update(Buffer.from(key, "base64")).digest().subarray(0, 16);
-  return Array.from(digest, (byte) =>
-    `${String.fromCharCode(97 + (byte >> 4))}${String.fromCharCode(97 + (byte & 15))}`,
-  ).join("");
-}
 
 function processIsAlive(pid) {
   try {
@@ -106,6 +97,9 @@ async function runSurf(...args) {
     timeout: 20_000,
     maxBuffer: 10 * 1024 * 1024,
   });
+  if (result.stderr.includes("surf: version mismatch")) {
+    throw new Error(`surf ${args.join(" ")} warned about versions that match: ${result.stderr}`);
+  }
   return result.stdout;
 }
 
@@ -285,6 +279,21 @@ ${stories}</main>
   function log(entry) { const out = document.querySelector("#log"); out.textContent = out.textContent ? out.textContent + "|" + entry : entry; }
 </script></body></html>`;
   }
+  if (url.pathname === "/page-text") {
+    // Tilda-style page: CSS, scripts and hidden form config sit in body next to the visible copy.
+    return `<!doctype html><html><head><title>Surf page text fixture</title></head><body>
+<style>.leak{color:red}</style><h1>Visible heading</h1><p>Visible copy</p>
+<script>var scriptLeak = 1;</script><noscript>noscriptLeak</noscript>
+<div style="display:none"><textarea>[{"lid":"hiddenJsonLeak"}]</textarea></div>
+</body></html>`;
+  }
+  if (url.pathname === "/offscreen") {
+    // One control on screen, three below the fold.
+    return `<!doctype html><html><head><title>Surf offscreen fixture</title></head><body>
+<button>Top</button><div style="height:5000px"></div>
+<button>Below 1</button><a href="#below">Below 2</a><input aria-label="Below 3">
+</body></html>`;
+  }
   if (url.pathname === "/custom-controls") {
     // Custom controls name themselves from text in a child element, or from text under 3 characters.
     return `<!doctype html><html><head><title>Surf custom controls fixture</title></head>
@@ -296,6 +305,46 @@ ${stories}</main>
 <script>
   function log(entry) { const out = document.querySelector("#log"); out.textContent = out.textContent ? out.textContent + "|" + entry : entry; }
 </script></body></html>`;
+  }
+  if (url.pathname === "/shadow-form") {
+    // Form fields live inside open shadow roots of custom elements, like SmartRecruiters' spl-* components.
+    // The host carries the same id as its inner input, and a light-DOM wrapper listens for input bubbling out.
+    return `<!doctype html><html><head><title>Surf shadow form fixture</title></head>
+<body><output id="log"></output>
+<x-title>Personal information</x-title>
+<spl-input id="first-name" label="First name"></spl-input>
+<spl-button>Submit application</spl-button>
+<input type="checkbox" id="agree"><label for="agree">I have read and agree to the Terms of Service, the Privacy Policy, and the Acceptable Use Policy of this example website</label>
+<script>
+  function log(entry) { const out = document.querySelector("#log"); out.textContent = out.textContent ? out.textContent + "|" + entry : entry; }
+  class SplInput extends HTMLElement {
+    connectedCallback() {
+      const id = this.id;
+      const root = this.attachShadow({ mode: "open", delegatesFocus: true });
+      root.innerHTML = '<label for="' + id + '">' + this.getAttribute("label") + '<span aria-hidden="true">*</span></label><input id="' + id + '" type="text" autocomplete="given-name">';
+      this.addEventListener("input", () => log("input:" + root.querySelector("input").value));
+    }
+  }
+  class SplButton extends HTMLElement {
+    connectedCallback() { this.attachShadow({ mode: "open" }).innerHTML = '<button><slot></slot></button>'; }
+  }
+  class XTitle extends HTMLElement {
+    connectedCallback() { this.attachShadow({ mode: "open" }).innerHTML = '<h3><slot></slot></h3>'; }
+  }
+  customElements.define("spl-input", SplInput);
+  customElements.define("spl-button", SplButton);
+  customElements.define("x-title", XTitle);
+</script></body></html>`;
+  }
+  if (url.pathname === "/field-values") {
+    // read shows what a field holds, except a secret: the password sits in a wrapping label with no other name.
+    return `<!doctype html><html><head><title>Surf field values fixture</title></head>
+<body><input type="email" placeholder="hello@example.com">
+<label>Password <input type="password"></label>
+<textarea placeholder="Notes"></textarea>
+<input type="text" aria-label="SSN" style="-webkit-text-security:disc">
+<input type="text" aria-label="Quote">
+<p>Check the letter before sending.</p></body></html>`;
   }
   if (url.pathname === "/click") {
     // Each button only reports a click a user could have made.
@@ -317,6 +366,42 @@ ${stories}</main>
     setTimeout(() => { confirm.disabled = false; }, 1500);
   });
 </script></body></html>`;
+  }
+  if (url.pathname === "/check") {
+    // "Terms" keeps its app state in click events, the way React does, and shows it in #terms-state.
+    return `<!doctype html><html><head><title>Surf check fixture</title></head>
+<body><output id="log"></output>
+<input type="checkbox" id="news" checked><label for="news">Newsletter</label>
+<input type="checkbox" id="terms"><label for="terms">Terms</label> <span id="terms-state">not accepted</span>
+<input type="radio" name="size" id="small" checked><label for="small">Small</label>
+<input type="radio" name="size" id="large"><label for="large">Large</label>
+<select id="country"><option value="us">United States</option><option value="fr">France</option></select>
+<button role="switch" id="frame-switch" aria-checked="false">Animated</button>
+<button role="switch" id="saved-switch" aria-checked="false">Saved</button>
+<select id="qty" aria-label="Qty"><option value="0">1</option><option value="1">2</option></select>
+<label><input type="checkbox" id="styled" style="position:absolute;opacity:0;width:16px;height:16px"><span style="display:inline-block;width:16px;height:16px;border:1px solid"></span>Remember me</label>
+<input type="checkbox" id="all"><label for="all">Select all</label>
+<script>
+  function log(entry) { const out = document.querySelector("#log"); out.textContent = out.textContent ? out.textContent + "|" + entry : entry; }
+  // These switches commit their state a frame later and after a 400ms save, like animated or server-backed toggles.
+  const flip = (el) => el.setAttribute("aria-checked", String(el.getAttribute("aria-checked") !== "true"));
+  const frameSwitch = document.querySelector("#frame-switch");
+  frameSwitch.addEventListener("click", () => requestAnimationFrame(() => flip(frameSwitch)));
+  const savedSwitch = document.querySelector("#saved-switch");
+  savedSwitch.addEventListener("click", () => setTimeout(() => flip(savedSwitch), 400));
+  document.querySelector("#all").indeterminate = true;
+  document.querySelector("#news").addEventListener("click", () => log("news"));
+  document.querySelector("#terms").addEventListener("click", (event) => {
+    document.querySelector("#terms-state").textContent = event.target.checked ? "accepted" : "not accepted";
+    log("terms:" + event.isTrusted);
+  });
+</script></body></html>`;
+  }
+  if (url.pathname === "/transparent-field") {
+    // Tilda-style consent box: the page draws the indicator and leaves the real checkbox transparent on top of it.
+    return `<!doctype html><html><head><title>Surf transparent field fixture</title></head>
+<body><label style="position:relative;display:inline-flex;gap:8px"><input type="checkbox" style="opacity:0;position:absolute;margin:0;width:16px;height:16px"> <div class="indicator" style="width:16px;height:16px;border:1px solid"></div> I agree</label>
+<div role="button" style="opacity:0">Faded action</div></body></html>`;
   }
   if (url.pathname === "/type") {
     return `<!doctype html><html><head><title>Surf type fixture</title></head>
@@ -488,23 +573,18 @@ try {
     );
   }
 
-  if (extensionIdForKey(extensionKey) !== extensionId) {
-    throw new Error("Stable extension key does not match the expected test extension ID");
-  }
-
   mkdirSync(home, { recursive: true });
   mkdirSync(surfTmp, { recursive: true });
   cpSync(join(repo, "dist"), extensionDir, { recursive: true });
-  const extensionManifestPath = join(extensionDir, "manifest.json");
-  const extensionManifest = JSON.parse(readFileSync(extensionManifestPath, "utf8"));
-  extensionManifest.key = extensionKey;
-  writeFileSync(extensionManifestPath, `${JSON.stringify(extensionManifest, null, 2)}\n`);
 
-  await execFileAsync(
+  const installed = await execFileAsync(
     process.execPath,
-    [join(repo, "scripts/install-native-host.cjs"), extensionId],
+    [join(repo, "native/cli.cjs"), "install"],
     { cwd: repo, env, timeout: 20_000 },
   );
+  if (!installed.stdout.includes(`"Load unpacked" and choose:\n  ${join(repo, "dist")}\n`)) {
+    throw new Error(`surf install did not print the extension folder to load: ${installed.stdout}`);
+  }
 
   const standardManifest = join(
     home,
@@ -513,10 +593,9 @@ try {
       : ".config/google-chrome/NativeMessagingHosts/surf.browser.host.json",
   );
   const nativeManifest = JSON.parse(readFileSync(standardManifest, "utf8"));
-  writeFileSync(
-    nativeManifest.path,
-    `#!/usr/bin/env bash\necho $$ > ${JSON.stringify(hostPidPath)}\nexport SURF_SOCKET=${JSON.stringify(socketPath)}\nexport SURF_TMP=${JSON.stringify(surfTmp)}\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(join(repo, "native/host.cjs"))} "$@"\n`,
-  );
+  const hostWrapper = (extraExports = "") =>
+    `#!/usr/bin/env bash\necho $$ > ${JSON.stringify(hostPidPath)}\nexport SURF_SOCKET=${JSON.stringify(socketPath)}\nexport SURF_TMP=${JSON.stringify(surfTmp)}\n${extraExports}exec ${JSON.stringify(process.execPath)} ${JSON.stringify(join(repo, "native/host.cjs"))} "$@"\n`;
+  writeFileSync(nativeManifest.path, hostWrapper());
   chmodSync(nativeManifest.path, 0o755);
 
   const testingManifest = join(profileDir, "NativeMessagingHosts/surf.browser.host.json");
@@ -572,6 +651,50 @@ try {
   const fixtureUrl = `http://127.0.0.1:${address.port}/fixture`;
   const navigationUrl = `${fixtureUrl}?navigated`;
   const baseUrl = `http://127.0.0.1:${address.port}`;
+
+  // Opt-in autostart (#424): with no Surf host running, `surf go <url>` starts the browser from
+  // surf.json browser.command (here Chrome for Testing through Puppeteer), opening <url>, then runs.
+  const autostartProfileDir = join(scratch, "profile-autostart");
+  const autostartPidPath = join(scratch, "autostart-launcher.pid");
+  const autostartLauncher = join(scratch, "autostart-launcher.mjs");
+  mkdirSync(join(autostartProfileDir, "NativeMessagingHosts"), { recursive: true });
+  cpSync(standardManifest, join(autostartProfileDir, "NativeMessagingHosts/surf.browser.host.json"));
+  writeFileSync(autostartLauncher, `import { writeFileSync } from "node:fs";
+import puppeteer from ${JSON.stringify(import.meta.resolve("puppeteer"))};
+writeFileSync(${JSON.stringify(autostartPidPath)}, String(process.pid));
+const launched = await puppeteer.launch({
+  headless: true,
+  handleSIGTERM: false,
+  executablePath: ${JSON.stringify(chromeExecutablePath)},
+  enableExtensions: [${JSON.stringify(extensionDir)}],
+  userDataDir: ${JSON.stringify(autostartProfileDir)},
+  args: [...${JSON.stringify(process.platform === "linux" ? ["--no-sandbox"] : [])}, ...process.argv.slice(2)],
+});
+process.on("SIGTERM", () => launched.close().finally(() => process.exit(0)));
+setInterval(() => {}, 60_000);
+`);
+  writeFileSync(
+    join(home, "surf.json"),
+    JSON.stringify({ browser: { autostart: true, command: [process.execPath, autostartLauncher], timeoutMs: 45_000 } }),
+  );
+  const autostartUrl = `${fixtureUrl}?autostart`;
+  await execFileAsync(process.execPath, [join(repo, "native/cli.cjs"), "go", autostartUrl, "--no-screenshot"], {
+    cwd: repo,
+    env,
+    timeout: 60_000,
+  });
+  const autostartTabs = JSON.parse(await runSurf("tab.list", "--json"));
+  if (!autostartTabs.some((tab) => tab.url === autostartUrl && tab.active)) {
+    throw new Error(`autostart did not open the go URL as the active tab: ${JSON.stringify(autostartTabs)}`);
+  }
+  rmSync(join(home, "surf.json"));
+  await terminateProcess(Number.parseInt(readFileSync(autostartPidPath, "utf8"), 10), "autostart launcher");
+  await terminateProcessesUsingProfile();
+  if (existsSync(hostPidPath)) {
+    await terminateProcess(Number.parseInt(readFileSync(hostPidPath, "utf8"), 10), "autostarted native host");
+  }
+  rmSync(hostPidPath, { force: true });
+  rmSync(socketPath, { force: true });
 
   browser = await puppeteer.launch({
     headless: true,
@@ -642,6 +765,21 @@ try {
   const initialText = await runSurf("page.text");
   if (!initialText.includes("Surf real Chrome fixture") || !initialText.includes("Waiting for Surf")) {
     throw new Error(`page.text did not contain fixture text: ${initialText}`);
+  }
+
+  const packageVersion = JSON.parse(readFileSync(join(repo, "package.json"), "utf8")).version;
+  const doctorReport = JSON.parse(await runSurf("doctor", "--json"));
+  if (
+    doctorReport.versions?.cli !== packageVersion ||
+    doctorReport.versions?.host !== packageVersion ||
+    doctorReport.versions?.extension !== packageVersion
+  ) {
+    throw new Error(`doctor did not report matching versions: ${JSON.stringify(doctorReport.versions)}`);
+  }
+
+  const pageHtml = await runSurf("page.html");
+  if (!pageHtml.startsWith("<!doctype html>") || !pageHtml.includes("<h1>Surf real Chrome fixture</h1>")) {
+    throw new Error(`page.html without --selector did not return the document: ${pageHtml.slice(0, 300)}`);
   }
 
   const playbookRead = JSON.parse(
@@ -875,6 +1013,158 @@ try {
   }
   await runSurf("tab.close", "--id", controlsTabId, "--json");
 
+  // Form fields inside open shadow roots are listed, named from their shadow label, and typable by ref.
+  const shadowTabId = String(tabIdFromOutput(await runSurf("tab.new", `${baseUrl}/shadow-form`)));
+  await runSurf("wait.element", "spl-input", "--tab-id", shadowTabId, "--json");
+  const shadowRead = await runSurf("read", "--no-text", "--tab-id", shadowTabId);
+  const shadowFieldRef = shadowRead.match(/textbox "First name" \[(e\d+)\]/)?.[1];
+  if (!shadowFieldRef) throw new Error(`read did not list the shadow-root field "First name": ${shadowRead}`);
+  if (!/button "Submit application" \[e\d+\]/.test(shadowRead)) {
+    throw new Error(`read did not name the shadow-root slotted button "Submit application": ${shadowRead}`);
+  }
+  // Text drawn through a slot names the element holding the slot, not the shadow host as well.
+  const shadowReadAll = await runSurf("read", "--all", "--no-text", "--tab-id", shadowTabId);
+  for (const text of ["Personal information", "Submit application"]) {
+    if (shadowReadAll.split(`"${text}"`).length !== 2) throw new Error(`read --all did not list "${text}" exactly once: ${shadowReadAll}`);
+  }
+  if (!/heading "Personal information" \[e\d+\]/.test(shadowReadAll)) {
+    throw new Error(`read --all did not list the slotted title as the heading: ${shadowReadAll}`);
+  }
+  await runSurf("type", "Ada", "--ref", shadowFieldRef, "--tab-id", shadowTabId, "--no-screenshot");
+  const shadowValue = await runSurf("js", 'return document.querySelector("spl-input").shadowRoot.querySelector("input").value', "--tab-id", shadowTabId);
+  if (shadowValue.trim() !== '"Ada"') throw new Error(`type --ref did not reach the inner shadow input: ${shadowValue}`);
+  const shadowLog = await runSurf("js", 'return document.querySelector("#log").textContent', "--tab-id", shadowTabId);
+  if (shadowLog.trim() !== '"input:Ada"') throw new Error(`a light-DOM wrapper did not see the composed input event: ${shadowLog}`);
+  await runSurf("tab.close", "--id", shadowTabId, "--json");
+
+  // Locators reach fields inside open shadow roots and act on the inner input, not the host that shares its id.
+  const shadowLocateTabId = String(tabIdFromOutput(await runSurf("tab.new", `${baseUrl}/shadow-form`)));
+  await runSurf("wait.element", "spl-input", "--tab-id", shadowLocateTabId, "--json");
+  const innerRef = (await runSurf("read", "--no-text", "--tab-id", shadowLocateTabId)).match(/textbox "First name" \[(e\d+)\]/)?.[1];
+  const locatedLabel = JSON.parse(await runSurf("locate.label", "First name", "--tab-id", shadowLocateTabId, "--json")).result;
+  if (!innerRef || locatedLabel.ref !== innerRef) {
+    throw new Error(`locate.label did not find the shadow-root input ${innerRef}: ${JSON.stringify(locatedLabel)}`);
+  }
+  const innerFocused = async () => (await runSurf(
+    "js",
+    'const host = document.querySelector("spl-input"); return document.activeElement === host && host.shadowRoot.activeElement === host.shadowRoot.querySelector("input")',
+    "--tab-id", shadowLocateTabId,
+  )).trim() === "true";
+  const blurInner = () => runSurf(
+    "js", 'document.querySelector("spl-input").shadowRoot.querySelector("input").blur(); return true', "--tab-id", shadowLocateTabId,
+  );
+  for (const locator of [["locate.role", "textbox", "--name", "First name"], ["locate.text", "First name"]]) {
+    await blurInner();
+    if (await innerFocused()) throw new Error("the shadow input stayed focused after blur");
+    await runSurf(...locator, "--action", "click", "--tab-id", shadowLocateTabId, "--no-screenshot");
+    if (!(await innerFocused())) throw new Error(`${locator.join(" ")} --action click did not focus the shadow-root input`);
+  }
+  // "First name" names its label exactly (the aria-hidden "*" is not part of it), so a longer label does not make it ambiguous.
+  await runSurf(
+    "js",
+    'const spouse = document.createElement("spl-input"); spouse.id = "spouse-name"; spouse.setAttribute("label", "First name of spouse"); document.body.append(spouse); return true',
+    "--tab-id", shadowLocateTabId,
+  );
+  await runSurf(
+    "locate.label", "First name", "--action", "fill", "--value", "Ada", "--tab-id", shadowLocateTabId, "--no-screenshot",
+  );
+  const filled = await runSurf(
+    "js",
+    'return [document.querySelector("spl-input").shadowRoot.querySelector("input").value, document.querySelector("#log").textContent]',
+    "--tab-id", shadowLocateTabId,
+  );
+  if (JSON.stringify(JSON.parse(filled)) !== '["Ada","input:Ada"]') {
+    throw new Error(`locate.label fill did not reach the inner shadow input and its light-DOM listener: ${filled}`);
+  }
+  // A label over 100 characters names its field in full, so locate --name with the whole label finds it.
+  const agreeLabel = "I have read and agree to the Terms of Service, the Privacy Policy, and the Acceptable Use Policy of this example website";
+  await runSurf("locate.role", "checkbox", "--name", agreeLabel, "--action", "click", "--tab-id", shadowLocateTabId, "--no-screenshot");
+  const agreed = await runSurf("js", 'return document.querySelector("#agree").checked', "--tab-id", shadowLocateTabId);
+  if (agreed.trim() !== "true") throw new Error(`locate.role checkbox --name <full 120-character label> did not check it: ${agreed}`);
+  await runSurf("tab.close", "--id", shadowLocateTabId, "--json");
+  // read shows a field's current value, and never a password's
+  const valuesTabId = String(tabIdFromOutput(await runSurf("tab.new", `${baseUrl}/field-values`)));
+  await runSurf("wait.element", "textarea", "--tab-id", valuesTabId, "--json");
+  const emptyFields = await runSurf("read", "--no-text", "--tab-id", valuesTabId);
+  const fieldRef = (pattern) => {
+    const ref = emptyFields.match(pattern)?.[1];
+    if (!ref) throw new Error(`read did not list ${pattern}: ${emptyFields}`);
+    return ref;
+  };
+  for (const [pattern, text] of [
+    [/textbox "hello@example\.com" \[(e\d+)\]/, "hello22"],
+    [/textbox \[(e\d+)\] type="password"/, "s3cret-434"],
+    [/textbox "Notes" \[(e\d+)\]/, "call back tomorrow"],
+    [/textbox "SSN" \[(e\d+)\]/, "masked-434"],
+    [/textbox "Quote" \[(e\d+)\]/, 'say "hi" \\'],
+  ]) {
+    await runSurf("type", text, "--ref", fieldRef(pattern), "--tab-id", valuesTabId, "--no-screenshot", "--json");
+  }
+  const filledFields = await runSurf("read", "--no-text", "--tab-id", valuesTabId);
+  if (!/textbox "hello@example\.com" \[e\d+\] type="email" placeholder="hello@example\.com" value="hello22"/.test(filledFields) ||
+      !filledFields.includes('value="call back tomorrow"') || filledFields.includes("s3cret") || !filledFields.includes("[value hidden]") ||
+      !filledFields.includes('value="say \\"hi\\" \\\\"')) {
+    throw new Error(`read did not show field values without the password: ${filledFields}`);
+  }
+  if (filledFields.includes("masked-434") || !/textbox "SSN" \[e\d+\] type="text" \[value hidden\]/.test(filledFields)) {
+    throw new Error(`read showed a field the page masks on screen: ${filledFields}`);
+  }
+  // type --escapes turns \n, \t and \\ into a newline, a tab and one backslash; without it the text is typed literally.
+  const notesRef = fieldRef(/textbox "Notes" \[(e\d+)\]/);
+  const notesValue = async () => JSON.parse(await runSurf("js", 'return [document.querySelector("textarea").value]', "--tab-id", valuesTabId))[0];
+  await runSurf("type", "a\\nb\\tc\\\\d", "--escapes", "--ref", notesRef, "--tab-id", valuesTabId, "--no-screenshot", "--json");
+  const escaped = await notesValue();
+  if (escaped !== "a\nb\tc\\d") throw new Error(`type --escapes did not type a newline, a tab and one backslash: ${JSON.stringify(escaped)}`);
+  await runSurf("type", "a\\nb\\tc\\\\d", "--ref", notesRef, "--tab-id", valuesTabId, "--no-screenshot", "--json");
+  const literal = await notesValue();
+  if (literal !== "a\\nb\\tc\\\\d") throw new Error(`type without --escapes did not type the text literally: ${JSON.stringify(literal)}`);
+  // page.text --ref prints a field's whole value with its newlines, an element's text, and never a secret field's value.
+  const letter = `${"A".repeat(998)}\n\n${"B".repeat(996)}END!`;
+  await runSurf("type", letter, "--ref", notesRef, "--tab-id", valuesTabId, "--no-screenshot", "--json");
+  const letterText = await runSurf("page.text", "--ref", notesRef, "--tab-id", valuesTabId);
+  if (letterText !== `${letter}\n`) {
+    throw new Error(`page.text --ref did not print the whole 2,000-character value (got ${letterText.length} chars): ${JSON.stringify(letterText.slice(0, 200))}`);
+  }
+  const passwordRef = fieldRef(/textbox \[(e\d+)\] type="password"/);
+  const secretText = await runSurfExpectingFailure("page.text", "--ref", passwordRef, "--tab-id", valuesTabId);
+  if (!secretText.stderr.includes(`${passwordRef} is a secret field, so its value is not shown`) ||
+      `${secretText.stdout}${secretText.stderr}`.includes("s3cret")) {
+    throw new Error(`page.text --ref on a password field did not refuse without the value: ${JSON.stringify(secretText)}`);
+  }
+  const allFields = await runSurf("read", "--all", "--no-text", "--tab-id", valuesTabId);
+  const paragraphRef = allFields.match(/paragraph "Check the letter before sending\." \[(e\d+)\]/)?.[1];
+  if (!paragraphRef) throw new Error(`read --all did not list the paragraph: ${allFields}`);
+  const paragraphText = await runSurf("page.text", "--ref", paragraphRef, "--tab-id", valuesTabId);
+  if (paragraphText !== "Check the letter before sending.\n") {
+    throw new Error(`page.text --ref on a paragraph did not print its text: ${JSON.stringify(paragraphText)}`);
+  }
+  await runSurf("tab.close", "--id", valuesTabId, "--json");
+  // Page text is the rendered text: no CSS rules, script bodies, noscript text or hidden content
+  const textTabId = String(tabIdFromOutput(await runSurf("tab.new", `${baseUrl}/page-text`)));
+  await runSurf("wait.element", "h1", "--tab-id", textTabId, "--json");
+  const pageText = await runSurf("page.text", "--tab-id", textTabId);
+  const readText = (await runSurf("read", "--tab-id", textTabId)).split("--- Page Text ---")[1] ?? "";
+  for (const [command, output] of [["page.text", pageText], ["read", readText]]) {
+    const leak = ["color:red", "scriptLeak", "noscriptLeak", "hiddenJsonLeak"].find((marker) => output.includes(marker));
+    if (!output.includes("Visible copy") || leak) {
+      throw new Error(`${command} page text was not the rendered text (leak: ${leak}): ${output}`);
+    }
+  }
+  await runSurf("tab.close", "--id", textTabId, "--json");
+
+  // read ends with how many controls it left off-screen and how to see them; --all lists them instead
+  const offscreenTabId = String(tabIdFromOutput(await runSurf("tab.new", `${baseUrl}/offscreen`)));
+  await runSurf("wait.element", "input", "--tab-id", offscreenTabId, "--json");
+  const onScreenRead = await runSurf("read", "--tab-id", offscreenTabId);
+  if (onScreenRead.trimEnd().split("\n").at(-1) !== "+3 elements off-screen: surf read --all" || onScreenRead.includes('"Below 1" [e')) {
+    throw new Error(`read did not end with the off-screen count: ${onScreenRead}`);
+  }
+  const allRead = await runSurf("read", "--all", "--tab-id", offscreenTabId);
+  if (allRead.includes("off-screen") || !["Below 1", "Below 2", "Below 3"].every((name) => allRead.includes(`"${name}" [e`))) {
+    throw new Error(`read --all did not list the off-screen controls without a count: ${allRead}`);
+  }
+  await runSurf("tab.close", "--id", offscreenTabId, "--json");
+
   // A ref click waits for a click a user could make, then clicks with trusted input
   const clickTabId = String(tabIdFromOutput(await runSurf("tab.new", `${baseUrl}/click`)));
   await runSurf("wait.element", "#confirm", "--tab-id", clickTabId, "--json");
@@ -914,6 +1204,67 @@ try {
   }
   await runSurf("tab.close", "--id", frontTabId, "--json");
   await runSurf("tab.close", "--id", clickTabId, "--json");
+
+  // check/uncheck set a state: clicking only when it differs, with a trusted click the page's app state follows
+  const checkTabId = String(tabIdFromOutput(await runSurf("tab.new", `${baseUrl}/check`)));
+  await runSurf("wait.element", "#country", "--tab-id", checkTabId, "--json");
+  const checkPage = (await browser.pages()).find((page) => page.url() === `${baseUrl}/check`);
+  const checkRead = await runSurf("page.read", "--all", "--no-text", "--tab-id", checkTabId);
+  const checkRef = (role, name) => {
+    const ref = checkRead.match(new RegExp(`${role} "${name}" \\[(e\\d+)\\]`))?.[1];
+    if (!ref) throw new Error(`page.read did not list ${role} "${name}": ${checkRead}`);
+    return ref;
+  };
+  const checkTab = ["--tab-id", checkTabId, "--no-screenshot"];
+  const missingOption = await runSurfExpectingFailure("select", checkRef("combobox", "United States"), "nowhere", ...checkTab);
+  const alreadyChecked = await runSurf("check", checkRef("checkbox", "Newsletter"), ...checkTab);
+  await runSurf("check", checkRef("checkbox", "Terms"), ...checkTab);
+  const termsAccepted = await checkPage.evaluate(() => document.querySelector("#terms").checked && document.querySelector("#terms-state").textContent);
+  await runSurf("uncheck", checkRef("checkbox", "Terms"), ...checkTab);
+  const alreadyUnchecked = await runSurf("uncheck", checkRef("checkbox", "Terms"), ...checkTab);
+  const radioUncheck = await runSurfExpectingFailure("uncheck", checkRef("radio", "Small"), ...checkTab);
+  // Late state updates, a label standing for its hidden input, a partly checked box, and an option value that
+  // is another option's text. Each runs even if an earlier one fails, so one failure lists every broken case.
+  const lateRuns = [];
+  for (const args of [
+    ["check", checkRef("switch", "Animated")], ["check", checkRef("switch", "Saved")],
+    ["check", checkRef("generic", "Remember me")], ["uncheck", checkRef("checkbox", "Select all")],
+    ["form.fill", "--data", JSON.stringify([{ ref: checkRef("combobox", "1"), value: "1" }])],
+  ]) lateRuns.push(await runSurf(...args, ...checkTab).then(() => "ok", (error) => `${args[0]}: ${error.stderr?.trim().split("\n").at(-1)}`));
+  const lateState = await checkPage.evaluate(() => [
+    document.querySelector("#frame-switch").getAttribute("aria-checked"), document.querySelector("#saved-switch").getAttribute("aria-checked"),
+    document.querySelector("#styled").checked, document.querySelector("#all").checked, document.querySelector("#all").indeterminate,
+    document.querySelector("#qty").value,
+  ].join(","));
+  if (lateRuns.some((run) => run !== "ok") || lateState !== "true,true,true,false,false,1") {
+    throw new Error(`late, label, partly checked or option-value cases failed: ${JSON.stringify({ lateRuns, lateState })}`);
+  }
+  const checkState = await checkPage.evaluate(() => ({
+    news: document.querySelector("#news").checked,
+    terms: document.querySelector("#terms").checked,
+    small: document.querySelector("#small").checked,
+    country: document.querySelector("#country").value,
+    log: document.querySelector("#log").textContent,
+    termsState: document.querySelector("#terms-state").textContent,
+  }));
+  if (termsAccepted !== "accepted" || !alreadyChecked.includes("was already checked; nothing clicked") || !alreadyUnchecked.includes("was already unchecked; nothing clicked")
+    || !radioUncheck.stderr.includes("is a radio button") || !missingOption.stderr.includes('no option matching "nowhere"')
+    || JSON.stringify(checkState) !== JSON.stringify({ news: true, terms: false, small: true, country: "us", log: "terms:true|terms:true", termsState: "not accepted" })) {
+    throw new Error(`check/uncheck/select did not set the requested state: ${JSON.stringify({ termsAccepted, alreadyChecked, alreadyUnchecked, radioUncheck, missingOption, checkState })}`);
+  }
+  await runSurf("tab.close", "--id", checkTabId, "--json");
+
+  // A form field the page leaves transparent over its own drawing is still listed and its changes reported
+  const transparentTab = ["--tab-id", String(tabIdFromOutput(await runSurf("tab.new", `${baseUrl}/transparent-field`)))];
+  await runSurf("wait.element", ".indicator", ...transparentTab, "--json");
+  const transparentRead = await runSurf("read", "--no-text", ...transparentTab);
+  const transparentRef = transparentRead.match(/checkbox(?: "[^"]*")? \[(e\d+)\]/)?.[1];
+  const transparentCheck = transparentRef ? await runSurf("check", transparentRef, ...transparentTab, "--no-screenshot") : "";
+  if (!transparentRef || transparentRead.includes("Faded action")
+    || !new RegExp(`${transparentRef} checkbox[^\\n]* now checked`).test(transparentCheck)) {
+    throw new Error(`a transparent form field was not listed or its change not reported: ${JSON.stringify({ transparentRead, transparentCheck })}`);
+  }
+  await runSurf("tab.close", "--id", transparentTab[1], "--json");
 
   // A ref from an earlier page in the tab never resolves on a later one, even when both pages
   // number their elements the same way, and a reload counts as a later page.
@@ -1348,6 +1699,54 @@ try {
   );
   if (firstFeedPage.json?.data?.items?.[0]?.id !== "item-1" || secondPage.status !== 200 || secondPage.json?.data?.items?.[0]?.id !== "item-5") {
     throw new Error(`network.wait/network.replay failed: ${JSON.stringify({ firstFeedPage, secondPage })}`);
+  }
+
+  // Last, because it restarts the native host: a host reporting another version makes
+  // each command print one stderr line, while its stdout stays the same.
+  const tabListBeforeSkew = await runSurf("tab.list");
+  writeFileSync(nativeManifest.path, hostWrapper("export SURF_TEST_HOST_VERSION=0.0.1\n"));
+  const matchingHostPid = Number.parseInt(readFileSync(hostPidPath, "utf8"), 10);
+  rmSync(hostPidPath);
+  await terminateProcess(matchingHostPid, "Surf native host");
+  await waitFor(() => existsSync(hostPidPath), "restarted Surf native-host PID", 30_000);
+  let skewed;
+  await waitFor(async () => {
+    skewed = await execFileAsync(process.execPath, [join(repo, "native/cli.cjs"), "tab.list"], {
+      cwd: repo,
+      env,
+      timeout: 20_000,
+    }).catch(() => null);
+    return skewed !== null;
+  }, "restarted Surf native host to answer", 30_000);
+  const expectedSkewLine = `surf: version mismatch (cli ${packageVersion}, host 0.0.1, extension ${packageVersion}). Run \`surf update\`.\n`;
+  if (skewed.stderr !== expectedSkewLine || skewed.stdout !== tabListBeforeSkew) {
+    throw new Error(`version mismatch was not reported as one stderr line: ${JSON.stringify(skewed)}`);
+  }
+
+  // surf update's reload, through the live host: the extension reloads itself from disk and
+  // starts a fresh native host, now from the restored wrapper, that the extension greets again.
+  // Chrome reloads an unpacked extension only with Developer mode on, as it is for anyone who
+  // clicked "Load unpacked"; this test profile loaded it without, so turn it on first.
+  const extensionsPage = await browser.newPage();
+  await extensionsPage.goto("chrome://extensions");
+  await extensionsPage.evaluate(
+    () => new Promise((resolve) => chrome.developerPrivate.updateProfileConfiguration({ inDeveloperMode: true }, resolve)),
+  );
+  await extensionsPage.close();
+  writeFileSync(nativeManifest.path, hostWrapper());
+  const skewedHostPid = Number.parseInt(readFileSync(hostPidPath, "utf8"), 10);
+  rmSync(hostPidPath);
+  const { reloadExtension } = require(join(repo, "native/update.cjs"));
+  const reload = await reloadExtension({ socketPath });
+  const reloadedHostPid = existsSync(hostPidPath) ? Number.parseInt(readFileSync(hostPidPath, "utf8"), 10) : null;
+  if (
+    !reload.ok ||
+    reload.versions.host !== packageVersion ||
+    reload.versions.extension !== packageVersion ||
+    !reloadedHostPid ||
+    reloadedHostPid === skewedHostPid
+  ) {
+    throw new Error(`the extension did not reload and reconnect: ${JSON.stringify({ reload, skewedHostPid, reloadedHostPid })}`);
   }
 
   console.log(

@@ -136,6 +136,11 @@ function isSemanticControl(element: Element): boolean {
   return ["input", "textarea", "select", "option", "button"].includes(tag) || element.getAttribute("contenteditable") === "true";
 }
 
+// Styled checkboxes and radios draw their own box over a transparent real input, which still takes clicks.
+function hiddenByOpacity(element: Element, style: CSSStyleDeclaration): boolean {
+  return style.opacity === "0" && !["input", "select", "textarea"].includes(element.tagName.toLowerCase());
+}
+
 function isVisibleSemanticElement(element: Element): boolean {
   const style = window.getComputedStyle(element);
   const rect = element.getBoundingClientRect();
@@ -500,16 +505,36 @@ function contentText(node: Node): string {
   const element = node as Element;
   if (element.getAttribute("aria-hidden") === "true" || element.hasAttribute("hidden")) return "";
   if (["script", "style", "template"].includes(element.tagName.toLowerCase())) return "";
+  if (element.tagName === "SLOT" && typeof (element as HTMLSlotElement).assignedNodes === "function") {
+    const assigned = (element as HTMLSlotElement).assignedNodes({ flatten: true });
+    if (assigned.length) return assigned.map(contentText).join("");
+  }
   return Array.from(element.childNodes, contentText).join("");
 }
 
+// Children as the browser renders them: an open shadow root replaces the host's light children,
+// and a <slot> stands in for the light-DOM elements assigned to it (or its own fallback children).
+// Closed shadow roots expose no shadowRoot here, so their contents stay unreachable, as before.
+function renderedChildren(element: Element): Element[] {
+  const source = element.shadowRoot ? element.shadowRoot.children : element.children;
+  const result: Element[] = [];
+  for (const child of source) {
+    if (child.tagName === "SLOT" && typeof (child as HTMLSlotElement).assignedElements === "function") {
+      const assigned = (child as HTMLSlotElement).assignedElements({ flatten: true });
+      result.push(...(assigned.length ? assigned : Array.from(child.children)));
+    } else {
+      result.push(child);
+    }
+  }
+  return result;
+}
 function getName(element: Element): string {
   const tag = element.tagName.toLowerCase();
 
   const labelledBy = element.getAttribute('aria-labelledby');
   if (labelledBy) {
     const names = labelledBy.split(/\s+/).map(id => {
-      const el = document.getElementById(id);
+      const el = (element.getRootNode() as Document | ShadowRoot).getElementById(id);
       return el?.textContent?.trim() || '';
     }).filter(Boolean);
     if (names.length) {
@@ -538,8 +563,10 @@ function getName(element: Element): string {
   if (alt?.trim()) return alt.trim();
 
   if (element.id) {
-    const label = document.querySelector(`label[for="${element.id}"]`);
-    if (label?.textContent?.trim()) return label.textContent.trim();
+    const root = element.getRootNode() as Document | ShadowRoot;
+    const label = root.querySelector(`label[for="${CSS.escape(element.id)}"]`);
+    const text = label ? contentText(label).replace(/\s+/g, " ").trim() : "";
+    if (text) return text;
   }
 
   if (tag === "input") {
@@ -547,7 +574,7 @@ function getName(element: Element): string {
     const type = element.getAttribute("type") || "";
     const value = element.getAttribute("value");
     if (type === "submit" && value?.trim()) return value.trim();
-    if (input.value && input.value.length < 50 && input.value.trim()) return input.value.trim();
+    if (input.value && input.value.length < 50 && input.value.trim() && !isSensitiveField(element)) return input.value.trim();
   }
 
   if (["button", "a", "summary"].includes(tag) || NAME_FROM_CONTENT_ROLES.has(getResolvedRole(element))) {
@@ -558,9 +585,16 @@ function getName(element: Element): string {
   if (tag === "img") return "";
 
   let directText = "";
-  for (const node of element.childNodes) {
+  // Direct text as rendered: a shadow host's light text is drawn through a slot, and the element
+  // holding that slot is named by it, so the host is not named by it again.
+  const source = element.shadowRoot ? element.shadowRoot.childNodes : element.childNodes;
+  for (const node of source) {
     if (node.nodeType === Node.TEXT_NODE) {
       directText += node.textContent;
+    } else if ((node as Element).tagName === "SLOT" && typeof (node as HTMLSlotElement).assignedNodes === "function") {
+      for (const assigned of (node as HTMLSlotElement).assignedNodes({ flatten: true })) {
+        if (assigned.nodeType === Node.TEXT_NODE) directText += assigned.textContent;
+      }
     }
   }
   if (directText?.trim() && directText.trim().length >= 3) {
@@ -868,7 +902,7 @@ function resolveRef(ref: string): { element: Element; error?: undefined } | { el
     if (getResolvedRole(candidate) !== identity.role || getName(candidate) !== identity.name) continue;
     const style = window.getComputedStyle(candidate);
     if (
-      style.display !== "none" && style.visibility !== "hidden" && style.opacity !== "0" &&
+      style.display !== "none" && style.visibility !== "hidden" && !hiddenByOpacity(candidate, style) &&
       (candidate as HTMLElement).offsetWidth > 0 && (candidate as HTMLElement).offsetHeight > 0
     ) matches.push(candidate);
   }
@@ -890,6 +924,18 @@ function isLocatable(el: Element): boolean {
   const style = window.getComputedStyle(el);
   return style.display !== "none" && style.visibility !== "hidden" &&
     (el as HTMLElement).offsetWidth > 0 && (el as HTMLElement).offsetHeight > 0;
+}
+
+// The document and every open shadow root inside it, outermost first, so locators can query each.
+// Closed shadow roots expose no shadowRoot, so their contents stay unreachable.
+function openRoots(): (Document | ShadowRoot)[] {
+  const roots: (Document | ShadowRoot)[] = [document];
+  for (let i = 0; i < roots.length; i++) {
+    for (const el of roots[i].querySelectorAll("*")) {
+      if (el.shadowRoot) roots.push(el.shadowRoot);
+    }
+  }
+  return roots;
 }
 
 function registerLocatedRef(el: Element): string {
@@ -946,6 +992,22 @@ function isInside(node: Element, target: Element): boolean {
   return false;
 }
 
+// The checked state of a checkbox, switch or radio (native or ARIA), or why `check`/`uncheck` can't set it.
+// A label stands for its control: styled checkboxes hide the input inside or behind the label `read` lists.
+function checkedState(target: Element, ref: string): { checked: boolean | "mixed"; radio: boolean } | { error: string } {
+  const element = target instanceof HTMLLabelElement && target.control ? target.control : target;
+  if (element instanceof HTMLInputElement && (element.type === "checkbox" || element.type === "radio")) {
+    return { checked: element.indeterminate ? "mixed" : element.checked, radio: element.type === "radio" };
+  }
+  const role = getResolvedRole(element);
+  if (["checkbox", "radio", "switch", "menuitemcheckbox", "menuitemradio"].includes(role)) {
+    const state = element.getAttribute("aria-checked");
+    return { checked: state === "mixed" ? "mixed" : state === "true", radio: role === "radio" || role === "menuitemradio" };
+  }
+  const dropdown = element.tagName === "SELECT" || role === "combobox" || role === "listbox";
+  return { error: `${ref} is a ${role || element.tagName.toLowerCase()}, not a checkbox, switch or radio.${dropdown ? ` Use surf select ${ref} <value> for a dropdown.` : ""}` };
+}
+
 // Where a user's click on `target` would land, or why it can't: the point must hit the target,
 // something inside it, or one of its labels (styled checkboxes hide the input behind its label).
 function clickPoint(target: Element): { x: number; y: number } | { reason: string } {
@@ -995,9 +1057,12 @@ function generateAccessibilityTree(
   error?: string;
   modalStates?: ModalState[];
   modalLimitations?: string;
+  offscreenCount?: number;
 } {
   try {
     window.__piRefs = {};
+    // Controls left out only for being off-screen: what --all would add to the list.
+    let offscreen = 0;
 
     function getRole(element: Element): string {
       return getResolvedRole(element);
@@ -1096,7 +1161,7 @@ function generateAccessibilityTree(
       return (
         style.display !== "none" &&
         style.visibility !== "hidden" &&
-        style.opacity !== "0" &&
+        !hiddenByOpacity(element, style) &&
         (element as HTMLElement).offsetWidth > 0 &&
         (element as HTMLElement).offsetHeight > 0
       );
@@ -1135,6 +1200,7 @@ function generateAccessibilityTree(
       if (options.filter !== "all" && !options.refId) {
         const rect = element.getBoundingClientRect();
         if (!(rect.top < window.innerHeight && rect.bottom > 0 && rect.left < window.innerWidth && rect.right > 0)) {
+          if (isInteractive(element)) offscreen++;
           return false;
         }
       }
@@ -1201,11 +1267,14 @@ function generateAccessibilityTree(
         const placeholder = element.getAttribute("placeholder");
         if (placeholder) line += ` placeholder="${placeholder}"`;
 
+        const field = readFieldValue(element);
+        if (field) line += "hidden" in field ? " [value hidden]" : ` value="${field.value.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+
         lines.push(line);
       }
 
       if (depth < maxDepth) {
-        for (const child of element.children) {
+        for (const child of renderedChildren(element)) {
           lines.push(...traverse(child, include ? depth + 1 : depth));
         }
       }
@@ -1247,6 +1316,7 @@ function generateAccessibilityTree(
       viewport: { width: window.innerWidth, height: window.innerHeight },
       modalStates: modalStates.length > 0 ? modalStates : undefined,
       modalLimitations: 'Only custom modals ([role=dialog]) detected. Native alert/confirm/prompt dialogs and system file choosers cannot be detected from content scripts.',
+      offscreenCount: offscreen,
     };
   } catch (err) {
     return {
@@ -1372,7 +1442,7 @@ function generateYamlTree(
       return (
         style.display !== "none" &&
         style.visibility !== "hidden" &&
-        style.opacity !== "0" &&
+        !hiddenByOpacity(element, style) &&
         (element as HTMLElement).offsetWidth > 0 &&
         (element as HTMLElement).offsetHeight > 0
       );
@@ -1419,7 +1489,9 @@ function generateYamlTree(
       if (hasCursorPointer(element)) {
         key += ' [cursor=pointer]';
       }
-      
+      const field = readFieldValue(element);
+      if (field && "hidden" in field) key += " [value hidden]";
+
       return key;
     }
 
@@ -1429,6 +1501,8 @@ function generateYamlTree(
       if (href) props.url = href;
       const placeholder = element.getAttribute("placeholder");
       if (placeholder) props.placeholder = placeholder;
+      const field = readFieldValue(element);
+      if (field && "value" in field) props.value = field.value;
       return props;
     }
 
@@ -1469,7 +1543,7 @@ function generateYamlTree(
         const props = getElementProps(element);
         
         const children: Element[] = [];
-        for (const child of element.children) {
+        for (const child of renderedChildren(element)) {
           children.push(child);
         }
         
@@ -1488,7 +1562,7 @@ function generateYamlTree(
           }
         }
       } else {
-        for (const child of element.children) {
+        for (const child of renderedChildren(element)) {
           traverse(child, depth, parentIncluded);
         }
       }
@@ -1624,6 +1698,7 @@ function smartType(selector: string, text: string, clear = true, submit = false)
   }
 }
 
+// Rendered text only (innerText), so <style>/<script> bodies and display:none content stay out.
 // The native host caps the text so it can mark the cut and keep the full copy.
 function getPageText(): { text: string; title: string; url: string; error?: string } {
   try {
@@ -1631,9 +1706,8 @@ function getPageText(): { text: string; title: string; url: string; error?: stri
     const main = document.querySelector("main");
     const content = article || main || document.body;
 
-    const text = content.textContent
-      ?.replace(/\s+/g, " ")
-      .trim() || "";
+    const raw = (content as HTMLElement).innerText ?? content.textContent ?? "";
+    const text = raw.replace(/\s+/g, " ").trim();
 
     return {
       text,
@@ -1648,6 +1722,16 @@ function getPageText(): { text: string; title: string; url: string; error?: stri
       error: `Failed to extract text: ${err instanceof Error ? err.message : "Unknown error"}`,
     };
   }
+}
+
+// One element by ref, whitespace kept: a field's whole current value, or the element's rendered
+// text. A secret field's value is never returned. No title or URL, so the output is the text alone.
+function getRefText(ref: string): { text: string } | { error: string } {
+  const { element, error } = resolveRef(ref);
+  if (!element) return { error };
+  const value = pageFieldValue(element);
+  if (value !== undefined && isSensitiveField(element)) return { error: `${ref} is a secret field, so its value is not shown` };
+  return { text: value ?? (element as HTMLElement).innerText ?? element.textContent ?? "" };
 }
 
 function scrollToElement(ref: string): { success: boolean; error?: string } {
@@ -1792,8 +1876,11 @@ function pageFingerprint(value: string): string {
 
 function isSensitiveField(element: Element): boolean {
   if (element.tagName.toLowerCase() === "input" && semanticElementType(element) === "password") return true;
-  return (element.getAttribute("autocomplete") || "").toLowerCase().split(/\s+/).some((token) =>
-    ["current-password", "new-password", "one-time-code"].includes(token) || token.startsWith("cc-"));
+  if ((element.getAttribute("autocomplete") || "").toLowerCase().split(/\s+/).some((token) =>
+    ["current-password", "new-password", "one-time-code"].includes(token) || token.startsWith("cc-"))) return true;
+  // A page that masks a text field on screen (bullets instead of characters) treats it as a secret.
+  const masking = window.getComputedStyle(element).getPropertyValue("-webkit-text-security");
+  return !!masking && masking !== "none";
 }
 
 function pageFieldValue(element: Element): string | undefined {
@@ -1811,6 +1898,15 @@ function pageFieldValue(element: Element): string | undefined {
   }
   if (element.getAttribute("contenteditable") === "true") return element.textContent || "";
   return undefined;
+}
+
+// The current value `read` shows for a text field. A select already shows its selection as its
+// name, and a secret is only reported as hidden.
+function readFieldValue(element: Element): { value: string } | { hidden: true } | undefined {
+  if (element.tagName.toLowerCase() === "select") return undefined;
+  const value = boundedText(pageFieldValue(element), 81);
+  if (!value) return undefined;
+  return isSensitiveField(element) ? { hidden: true } : { value: value.length > 80 ? `${value.slice(0, 80)}...` : value };
 }
 
 function pageNodeName(element: Element, role: string): string {
@@ -1867,7 +1963,7 @@ function capturePageSnapshot(): { snapshot: PageSnapshot; elements: Element[] } 
     const tag = element.tagName.toLowerCase();
     if (["script", "style", "noscript", "template"].includes(tag) || element.id.startsWith("pi-agent-")) return;
     const style = window.getComputedStyle(element);
-    if (element.getAttribute("aria-hidden") === "true" || style.display === "none" || style.opacity === "0") return;
+    if (element.getAttribute("aria-hidden") === "true" || style.display === "none" || hiddenByOpacity(element, style)) return;
     const shown = style.visibility !== "hidden";
     const role = getResolvedRole(element);
     let childContainer = container;
@@ -2066,7 +2162,8 @@ function handleContentMessage(
           });
         }
       } else {
-        const result = generateAccessibilityTree(
+        // Only read reports the controls left off-screen; the wait.* trees stay as they are.
+        const { offscreenCount, ...result } = generateAccessibilityTree(
           options.filter || "interactive",
           options.depth ?? 15,
           options.refId,
@@ -2080,7 +2177,7 @@ function handleContentMessage(
             (result as typeof result & { semanticVisionTargets: string[] }).semanticVisionTargets = semanticVisionTargets(observation);
           }
         }
-        sendResponse(result);
+        sendResponse(offscreenCount ? { ...result, offscreen: offscreenCount } : result);
       }
       break;
     }
@@ -2172,6 +2269,16 @@ function handleContentMessage(
       sendResponse({ ...clickPoint(element), inPage: document.visibilityState === "hidden" });
       break;
     }
+    case "CHECKED_STATE": {
+      const { element, error } = resolveRef(message.ref);
+      const guardError = semanticGuardError(element, message.expectedIdentity);
+      if (guardError) {
+        sendResponse({ error: guardError, code: guardError });
+        break;
+      }
+      sendResponse(element ? checkedState(element, message.ref) : { error });
+      break;
+    }
     case "CLICK_ELEMENT": {
       const { element, error } = resolveRef(message.ref);
       const guardError = semanticGuardError(element, message.expectedIdentity);
@@ -2229,8 +2336,7 @@ function handleContentMessage(
       break;
     }
     case "GET_PAGE_TEXT": {
-      const result = getPageText();
-      sendResponse(result);
+      sendResponse(message.ref ? getRefText(message.ref) : getPageText());
       break;
     }
     case "SMART_TYPE": {
@@ -2305,10 +2411,11 @@ function handleContentMessage(
         const markup = markupRoles[role];
         const selectors = implicitRoles[role] || [markup ? `[role="${role}"], ${markup}` : `[role="${role}"]`];
         let candidates: Element[] = [];
+        const roots = openRoots();
         
         for (const sel of selectors) {
           try {
-            candidates.push(...document.querySelectorAll(sel));
+            for (const root of roots) candidates.push(...root.querySelectorAll(sel));
           } catch {}
         }
         if (markup) {
@@ -2365,13 +2472,15 @@ function handleContentMessage(
         const query = normalizeLocatorText(text);
         
         // Find elements containing the text
-        const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
         const matches = new Set<Element>();
-        while (walker.nextNode()) {
-          const nodeText = walker.currentNode.textContent || '';
-          const hasMatch = exact ? nodeText.trim() === text : normalizeLocatorText(nodeText).includes(query);
-          const parent = walker.currentNode.parentElement;
-          if (hasMatch && parent && isLocatable(parent)) matches.add(parent);
+        for (const root of openRoots()) {
+          const walker = document.createTreeWalker(root === document ? document.body : root, NodeFilter.SHOW_TEXT);
+          while (walker.nextNode()) {
+            const nodeText = walker.currentNode.textContent || '';
+            const hasMatch = exact ? nodeText.trim() === text : normalizeLocatorText(nodeText).includes(query);
+            const parent = walker.currentNode.parentElement;
+            if (hasMatch && parent && isLocatable(parent)) matches.add(parent);
+          }
         }
         
         // Most specific (smallest) element first
@@ -2405,16 +2514,19 @@ function handleContentMessage(
           if (exactMatch) exactFields.add(field);
         };
         
-        for (const lbl of document.querySelectorAll('label')) {
-          const lblText = normalizeLocatorText(lbl.textContent);
+        const roots = openRoots();
+        for (const lbl of roots.flatMap(root => Array.from(root.querySelectorAll('label')))) {
+          const lblText = normalizeLocatorText(contentText(lbl));
           if (!lblText.includes(query)) continue;
           const forId = lbl.getAttribute('for');
-          addField((forId && document.getElementById(forId)) || lbl.querySelector('input, select, textarea'), lblText === query);
+          // Resolve `for` in the label's own root: a shadow host may carry the same id as its inner field.
+          const target = forId && (lbl.getRootNode() as Document | ShadowRoot).getElementById(forId);
+          addField(target || lbl.querySelector('input, select, textarea'), lblText === query);
         }
         
         // Fields named only by aria-label or placeholder
         if (fields.length === 0) {
-          for (const field of document.querySelectorAll('input, textarea, select')) {
+          for (const field of roots.flatMap(root => Array.from(root.querySelectorAll('input, textarea, select')))) {
             const names = [field.getAttribute('aria-label'), field.getAttribute('placeholder')].map(normalizeLocatorText);
             if (names.some(fieldName => fieldName.includes(query))) addField(field, names.includes(query));
           }
@@ -2520,14 +2632,7 @@ function handleContentMessage(
           }
         }
         
-        // Clear current selection for multi-select
-        if (selectEl.multiple) {
-          for (const opt of selectEl.options) {
-            opt.selected = false;
-          }
-        }
-        
-        const selected: string[] = [];
+        const matched: HTMLOptionElement[] = [];
         const notFound: string[] = [];
         
         // For single-select, only use the first value
@@ -2549,8 +2654,7 @@ function handleContentMessage(
             }
             
             if (matches) {
-              opt.selected = true;
-              selected.push(opt.value);
+              matched.push(opt);
               found = true;
               break;  // Found match for this value, move to next
             }
@@ -2558,18 +2662,18 @@ function handleContentMessage(
           
           if (!found) notFound.push(val);
         }
-        
-        // Dispatch change event
-        selectEl.dispatchEvent(new Event('change', { bubbles: true }));
-        
+
+        // Select nothing unless every value matched, so a typo can't leave a half-changed dropdown.
         if (notFound.length > 0) {
-          sendResponse({ 
-            selected, 
-            warning: `Values not found: ${notFound.join(', ')}` 
-          });
-        } else {
-          sendResponse({ selected });
+          sendResponse({ error: `${selector} has no option matching ${notFound.map((v: string) => JSON.stringify(v)).join(", ")} (by ${by || "value"}), so nothing was selected.` });
+          break;
         }
+        if (selectEl.multiple) {
+          for (const opt of selectEl.options) opt.selected = false;
+        }
+        for (const opt of matched) opt.selected = true;
+        selectEl.dispatchEvent(new Event('change', { bubbles: true }));
+        sendResponse({ selected: matched.map((opt) => opt.value) });
       } catch (err) {
         sendResponse({ error: err instanceof Error ? err.message : String(err) });
       }
@@ -2852,9 +2956,13 @@ function handleContentMessage(
             const failure = writeTextField(el, String(value), ref);
             results.push(failure ? { ref, success: false, error: failure } : { ref, success: true });
           } else if (el instanceof HTMLSelectElement) {
-            el.value = String(value);
-            el.dispatchEvent(new Event("change", { bubbles: true }));
-            results.push({ ref, success: true });
+            const options = [...el.options];
+            const option = options.find((opt) => opt.value === String(value)) ?? options.find((opt) => opt.textContent?.trim() === String(value));
+            if (option) {
+              el.value = option.value;
+              el.dispatchEvent(new Event("change", { bubbles: true }));
+            }
+            results.push(option ? { ref, success: true } : { ref, success: false, error: `${ref} has no option with value or text ${JSON.stringify(String(value))}, so nothing was selected.` });
           } else if (el.isContentEditable) {
             el.focus();
             el.textContent = String(value);

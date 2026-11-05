@@ -68,6 +68,8 @@ const { commandMetadata, redactCommandArgs } = require("./workflow-definition.cj
 const { BrowserScheduler } = require("./browser-scheduler.cjs");
 const { BrowserSessionStore, parseDurationMs, validateSessionName } = require("./browser-session-store.cjs");
 const { applySocketPermissions, resolveSocketPermissions } = require("./socket-permissions.cjs");
+// SURF_TEST_HOST_VERSION is for tests only: it makes this host report another version.
+const HOST_VERSION = process.env.SURF_TEST_HOST_VERSION || require("../package.json").version;
 const { classifyTool } = require("./tool-scope.cjs");
 const { fromExtensionError, surfError } = require("./surf-error.cjs");
 const {
@@ -808,7 +810,7 @@ const FRAME_CONTEXT_MESSAGE_TYPES = new Set([
   "READ_PAGE", "GET_PAGE_TEXT", "PAGE_STATE", "EXECUTE_JAVASCRIPT",
   "GET_ELEMENT_COORDINATES", "FORM_INPUT", "EVAL_IN_PAGE",
   "SCROLL_TO_ELEMENT", "LOCATE_ROLE", "LOCATE_TEXT", "LOCATE_LABEL",
-  "GET_ELEMENT_STYLES", "SELECT_OPTION", "CLICK_REF", "HOVER_REF",
+  "GET_ELEMENT_STYLES", "SELECT_OPTION", "CLICK_REF", "SET_CHECKED", "HOVER_REF",
   "CLICK_SELECTOR", "WAIT_FOR_ELEMENT", "FORM_FILL", "UPLOAD_FILE", "SEARCH_PAGE",
 ]);
 
@@ -1832,7 +1834,12 @@ function sendToolResponse(socket, id, result, error) {
       ? (request.tombstoned ? "cleanup-settled" : "cancelled")
       : finalError ? "error" : "completed";
     await completeOwnedRequest(context, id, outcome);
-    const response = { type: "tool_response", id };
+    // The CLI compares these versions with its own and warns on stderr when they differ.
+    const response = {
+      type: "tool_response",
+      id,
+      versions: { host: HOST_VERSION, extension: browserIdentity?.extensionVersion ?? null },
+    };
     if (request?.target) {
       response.target = {
         source: request.target.source,
@@ -3297,6 +3304,22 @@ const handleClient = (socket) => {
     if (isRemote && msg.type && msg.type.startsWith("transfer_")) {
       transferState ||= await ensureTransferState();
       await transferState.handle(msg);
+      return;
+    }
+
+    // Answered here, without the extension, so `surf doctor` can compare versions.
+    if (msg.type === "versions_request") {
+      await sendSocket(socket, { type: "versions_response", host: HOST_VERSION, extension: browserIdentity?.extensionVersion ?? null });
+      return;
+    }
+
+    // `surf update` asks the extension to reload itself from disk, which also restarts this host.
+    // strictTarget makes an extension too old to know RELOAD_EXTENSION fail at once, without
+    // opening a tab to run it in.
+    if (msg.type === "reload_extension_request") {
+      const reply = await requestCallExtension(null, "reload_extension", { type: "RELOAD_EXTENSION", strictTarget: true }, 5000, true)
+        .catch((error) => ({ error: error.message }));
+      await sendSocket(socket, { type: "reload_extension_response", ok: !reply.error, ...(reply.error ? { error: reply.error } : {}) });
       return;
     }
 

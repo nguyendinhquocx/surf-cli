@@ -46,11 +46,13 @@ It is one tab in its own background window, and its commands run in order. Sessi
 ```text commands
 session.ensure <name> <url> [--window|--tab] [--focused]
 navigate <url>                    # alias go
-page.read [--ref e5] [--all] [--no-text] [--depth <n>] [--compact] [--summary]   # alias read
+page.read [--ref e5] [--all] [--no-text] [--depth <n>] [--compact] [--summary]   # alias read; "+N elements off-screen" = rerun with --all
+page.text [--ref e5]              # page text; --ref: one element's text or a field's whole value, newlines kept (never a secret field)
 click <ref> | --selector <css> [--index <n>] | --x <n> --y <n>   [--button left|right|double|triple]
-type <text> [--ref e5|--into <css>] [--submit] [--clear] [--method cdp|js]
+type <text> [--ref e5|--into <css>] [--submit] [--clear] [--escapes] [--method cdp|js]   # need newlines or tabs? write \n \t with --escapes
 key <key> [--repeat <n>]          # Enter, Escape, cmd+a
 select <ref|css> <value>… [--by value|label|index]
+check <ref> | uncheck <ref>       # sets the state; already set = nothing clicked
 locate.role <role> [--name <text>] [--action click|fill|hover|text] [--value <v>]
 wait.ready [--selector <css>] [--text <t>] [--url-prefix <u>] [--accept login,challenge,…] [--timeout <ms>=20000]
 screenshot [--output <f>] [--full-page] [--annotate] [--no-save]   # auto-saves to /tmp
@@ -89,7 +91,7 @@ session: session.new session.list session.info session.close session.rebind sess
 nav: back forward
 tab: tab.move tab.name tab.unname tab.named tab.group tab.ungroup tab.groups
 window: window.new window.list window.focus window.close window.resize resize zoom
-read: page.text page.html page.save page.state page.readiness search locate.text locate.label element.styles frame.list frame.diagnose frame.js
+read: page.html page.save page.state page.readiness search locate.text locate.label element.styles frame.list frame.diagnose frame.js
 act: hover smart_type dialog.info dialog.accept dialog.dismiss scroll.to scroll.info
 wait: wait wait.element wait.network wait.url wait.dom wait.load
 capture: snap record video.start video.stop video.status video.restart animate-audit perf-audit perf.start perf.stop perf.metrics
@@ -101,7 +103,7 @@ semantic: semantic.find semantic.filter semantic.verify | semantic auth set | se
 oracle: oracle follow | oracle status | oracle list
 playbook: playbook list | playbook show | playbook ops | playbook run | playbook suggest | playbook save | playbook record start | playbook record mark | playbook record stop | playbook record status | playbook trace export | playbook export | playbook import | playbook client derive | playbook client export | playbook client verify
 workflow: batch workflow.list workflow.info workflow.validate
-setup: install uninstall config server extension-path health smoke remote authorize | remote list | remote revoke
+setup: install uninstall update config server extension-path health smoke remote authorize | remote list | remote revoke
 ```
 
 ## Read when the case applies

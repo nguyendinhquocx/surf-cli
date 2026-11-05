@@ -291,6 +291,10 @@ function formatToolContent(result, log = () => {}) {
     if (result.text) {
       output += `\n\n--- Page Text ---\n${result.text}`;
     }
+
+    if (result.offscreen > 0) {
+      output += `\n\n+${result.offscreen} element${result.offscreen === 1 ? "" : "s"} off-screen: surf read --all`;
+    }
     
     if (result.screenshot && result.screenshot.base64) {
       const dims = result.screenshot.width && result.screenshot.height 
@@ -1066,7 +1070,7 @@ function mapToolToMessage(tool, args, tabId) {
         ...baseMsg,
       };
     case "page.text":
-      return { type: "GET_PAGE_TEXT", ...baseMsg };
+      return { type: "GET_PAGE_TEXT", ref: a.ref, ...baseMsg };
     case "page.html":
     case "page.save": {
       if (a.selector !== undefined && (typeof a.selector !== "string" || a.selector.length === 0)) {
@@ -1166,6 +1170,10 @@ function mapToolToMessage(tool, args, tabId) {
       // --button applies to refs and coordinates; a CSS selector click is always a left click.
       return mapComputerAction({ ...a, action: a.selector ? "left_click" : clickAction }, tabId);
     }
+    case "check":
+    case "uncheck":
+      if (!a.ref) throw new Error("ref argument required (e.g. surf check e5)");
+      return { type: "SET_CHECKED", ref: a.ref, checked: tool === "check", ...baseMsg };
     case "cookie.list":
       return { type: "COOKIE_LIST", ...baseMsg };
     case "cookie.get":

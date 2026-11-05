@@ -19,6 +19,8 @@ const {
 } = require("../native/native-host-launch-probe.cjs");
 
 const HOST_NAME = "surf.browser.host";
+// Chrome derives this from the public `key` in manifest.json, so every unpacked Surf build has this ID.
+const SURF_EXTENSION_ID = "oaclimdkkglbnpekeignmjenkodkaaka";
 
 const BROWSERS = {
   chrome: {
@@ -110,14 +112,6 @@ function findNode() {
   return null;
 }
 
-function findNpmGlobalRoot() {
-  try {
-    return execSync("npm root -g", { encoding: "utf8" }).trim();
-  } catch {
-    return null;
-  }
-}
-
 function getWrapperDir(target = process.platform) {
   const home = os.homedir();
   if (target === "wsl-windows") {
@@ -140,11 +134,8 @@ function getHostPath() {
   if (process.env.SURF_HOST_PATH && fs.existsSync(process.env.SURF_HOST_PATH)) {
     return process.env.SURF_HOST_PATH;
   }
-  const npmRoot = findNpmGlobalRoot();
-  if (npmRoot) {
-    const globalPath = path.join(npmRoot, "surf-cli/native/host.cjs");
-    if (fs.existsSync(globalPath)) return globalPath;
-  }
+  // The host shipped with this installer, not whichever surf-cli `npm root -g` names:
+  // with two installs on PATH, that one may be a different version.
   const localPath = path.resolve(__dirname, "../native/host.cjs");
   if (fs.existsSync(localPath)) return localPath;
   return null;
@@ -306,6 +297,95 @@ function installWindowsRegistry(browser, extensionId, wrapperPath) {
   return manifestPath;
 }
 
+// Where this browser's manifest is when Surf is installed for it on this target.
+function installedManifestPath(browser, target) {
+  const config = BROWSERS[browser];
+  if (target === "wsl-windows") {
+    const dir = getWslWindowsManifestDir(config);
+    return dir ? path.join(dir, `${HOST_NAME}.json`) : null;
+  }
+  if (!config[process.platform]) return null;
+  if (process.platform === "win32") {
+    // Windows browsers share one manifest; a browser has Surf when its registry key exists.
+    try {
+      runWindowsExecutable("reg.exe", ["query", nativeMessagingRegistryPath(config.win32, HOST_NAME), "/ve"], {
+        execFileSync,
+        execOptions: { stdio: "pipe", encoding: "utf8" },
+      });
+    } catch {
+      return null;
+    }
+    return path.join(getWrapperDir(), `${HOST_NAME}.json`);
+  }
+  return path.join(os.homedir(), config[process.platform], `${HOST_NAME}.json`);
+}
+
+// For `--refresh` (run by `surf update`): the browsers Surf is installed for, each with an
+// extension id from its manifest, and the settings persisted in their wrapper, so none is lost.
+function findInstalled(target) {
+  const ids = {};
+  let wrapper = "";
+  for (const browser of Object.keys(BROWSERS)) {
+    const manifestPath = installedManifestPath(browser, target);
+    if (!manifestPath || !fs.existsSync(manifestPath)) continue;
+    const manifest = readExistingManifest(manifestPath);
+    const origins = Array.isArray(manifest.allowed_origins) ? manifest.allowed_origins : [];
+    const id = origins.map((origin) => /^chrome-extension:\/\/([a-p]{32})\/$/.exec(origin)?.[1]).filter(Boolean).pop();
+    if (!id) continue;
+    ids[browser] = id;
+    try { wrapper ||= fs.readFileSync(manifest.path, "utf8"); } catch {}
+  }
+  const persisted = (name) => new RegExp(`\\$\\{${name}:=([^}]*)\\}`).exec(wrapper)?.[1];
+  return { ids, listen: persisted("SURF_LISTEN"), socketMode: persisted("SURF_SOCKET_MODE"), socketGroup: persisted("SURF_SOCKET_GROUP") };
+}
+
+// pi already loads skills/ from the surf-cli package (package.json "pi.skills"),
+// so a second copy under ~/.pi/agent/skills would be a duplicate.
+function piLoadsSurfPackage(home) {
+  try {
+    const settings = JSON.parse(fs.readFileSync(path.join(home, ".pi/agent/settings.json"), "utf8"));
+    const packages = Array.isArray(settings.packages) ? settings.packages : [];
+    return packages.some((entry) => {
+      const source = typeof entry === "string" ? entry : entry?.source;
+      return typeof source === "string" && /(^|[/\\:])surf-cli(@[^/\\]*)?(\.git)?[/\\]?$/.test(source);
+    });
+  } catch {
+    return false;
+  }
+}
+
+function linkAgentSkills(home = os.homedir(), skillDir = path.resolve(__dirname, "../skills/surf")) {
+  const lines = [];
+  const agents = [
+    { parent: path.join(home, ".claude/skills") },
+    { parent: path.join(home, ".pi/agent/skills"), pi: true },
+  ];
+  for (const { parent, pi } of agents) {
+    if (!fs.existsSync(parent)) continue;
+    const linkPath = path.join(parent, "surf");
+    if (pi && piLoadsSurfPackage(home)) {
+      lines.push(`Skipped ${linkPath}: pi already loads surf's skill from the surf-cli package`);
+      continue;
+    }
+    try {
+      let stat = null;
+      try { stat = fs.lstatSync(linkPath); } catch {}
+      if (stat && !stat.isSymbolicLink()) {
+        lines.push(`Kept your own ${linkPath}; to use the skill that ships with surf, remove it and rerun \`surf install\``);
+        continue;
+      }
+      if (!stat || path.resolve(parent, fs.readlinkSync(linkPath)) !== skillDir) {
+        if (stat) fs.unlinkSync(linkPath);
+        fs.symlinkSync(skillDir, linkPath, process.platform === "win32" ? "junction" : "dir");
+      }
+      lines.push(`Linked ${linkPath} -> ${skillDir}`);
+    } catch (error) {
+      lines.push(`Could not link ${linkPath}: ${error.message}`);
+    }
+  }
+  return lines;
+}
+
 function parseArgs() {
   const args = process.argv.slice(2);
   const result = {
@@ -315,6 +395,7 @@ function parseArgs() {
     listen: undefined,
     socketMode: undefined,
     socketGroup: undefined,
+    refresh: false,
   };
 
   for (let i = 0; i < args.length; i++) {
@@ -328,6 +409,8 @@ function parseArgs() {
       }
     } else if (arg === "--target") {
       result.target = args[++i];
+    } else if (arg === "--refresh") {
+      result.refresh = true;
     } else if (arg === "--listen") {
       result.listen = args[++i];
       if (!result.listen || result.listen.startsWith("--")) throw new Error("--listen requires a Tailnet IP and port");
@@ -351,11 +434,12 @@ function printHelp() {
   console.log(`
 Surf CLI Native Host Installer
 
-Usage: install-native-host.cjs <extension-id> [options]
+Usage: install-native-host.cjs [extension-id] [options]
 
 Arguments:
-  extension-id    Chrome extension ID (32 lowercase letters a-p)
-                  Find at chrome://extensions with Developer Mode enabled
+  extension-id    Chrome extension ID (32 lowercase letters a-p). Optional:
+                  defaults to Surf's own ID, ${SURF_EXTENSION_ID}.
+                  Give one only for a fork or a build with a different ID.
 
 Options:
   -b, --browser   Browser(s) to install for (default: chrome)
@@ -373,27 +457,37 @@ Options:
   --socket-group <group-or-gid>
                   Persist the local Unix socket group for mode 660.
                   Use a dedicated group; this grants full Surf authority.
+  --refresh       Rewrite the wrapper and the manifests that already exist, keeping their
+                  extension ids and settings and adding Surf's own ID, and relink the agent
+                  skill (run by surf update).
 
 Examples:
+  node install-native-host.cjs
+  node install-native-host.cjs --browser brave
   node install-native-host.cjs abcdefghijklmnopabcdefghijklmnop
-  node install-native-host.cjs abcdefghijklmnop --browser brave
-  node install-native-host.cjs abcdefghijklmnop --browser all
-  node install-native-host.cjs abcdefghijklmnop --target linux
-  node install-native-host.cjs abcdefghijklmnop --listen 100.64.1.2:4321
-  node install-native-host.cjs abcdefghijklmnop --socket-mode 660 --socket-group surf
+  node install-native-host.cjs --browser all
+  node install-native-host.cjs --target linux
+  node install-native-host.cjs --listen 100.64.1.2:4321
+  node install-native-host.cjs --socket-mode 660 --socket-group surf
 `);
 }
 
 function main() {
   let parsed;
   try { parsed = parseArgs(); } catch (error) { console.error(`Error: ${error.message}`); process.exit(1); }
-  const { extensionId, browsers, target, listen, socketMode, socketGroup } = parsed;
-
-  if (!extensionId) {
-    console.error("Error: Extension ID required");
-    console.error("Usage: install-native-host.cjs <extension-id> [--browser chrome|chromium|brave|edge|arc|helium|all] [--target auto|linux|windows]");
-    console.error("\nFind your extension ID at chrome://extensions (enable Developer Mode)");
-    process.exit(1);
+  let { browsers, target, listen, socketMode, socketGroup, refresh } = parsed;
+  const pinnedId = !refresh && !parsed.extensionId;
+  // A refresh adds Surf's pinned ID to each install; writeManifest keeps the IDs already there.
+  const extensionId = (!refresh && parsed.extensionId) || SURF_EXTENSION_ID;
+  if (refresh) {
+    let ids;
+    ({ ids, listen, socketMode, socketGroup } = findInstalled(isWsl() && target !== "linux" ? "wsl-windows" : process.platform));
+    browsers = Object.keys(ids);
+    if (browsers.length === 0) {
+      console.log("No browser has the Surf native host installed; run `surf install` to install it.");
+      for (const line of linkAgentSkills()) console.log(`  ${line}`);
+      return;
+    }
   }
 
   if (!/^[a-p]{32}$/.test(extensionId)) {
@@ -523,7 +617,21 @@ function main() {
     console.log(`\nSkipped (not supported for ${effectiveTarget}): ${skipped.join(", ")}`);
   }
 
-  console.log("\nDone! Restart your browser for changes to take effect.");
+  const skillLines = linkAgentSkills();
+  if (skillLines.length > 0) {
+    console.log("\nAgent skill:");
+    for (const line of skillLines) console.log(`  ${line}`);
+  }
+
+  if (pinnedId) {
+    const extensionPath = process.env.SURF_EXTENSION_PATH || path.resolve(__dirname, "../dist");
+    console.log("\nExtension:");
+    console.log("  In chrome://extensions, turn on Developer mode, click \"Load unpacked\" and choose:");
+    console.log(`  ${extensionPath}`);
+    console.log(`  If Surf is already loaded, reload it there instead. chrome://extensions should then show its ID as ${SURF_EXTENSION_ID}.`);
+  }
+
+  if (!refresh) console.log("\nDone! Restart your browser for changes to take effect.");
 }
 
 if (require.main === module) {
@@ -531,6 +639,7 @@ if (require.main === module) {
 }
 
 module.exports = {
+  SURF_EXTENSION_ID,
   createWrapper,
   findNode,
   getHostPath,
