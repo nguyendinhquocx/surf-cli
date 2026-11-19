@@ -33,6 +33,7 @@ const { createOracleHost } = require("./oracle-host.cjs");
 
 const IS_WIN = process.platform === "win32";
 const { SOCKET_PATH, SURF_TMP } = require("./socket-path.cjs");
+const { createHostLog } = require("./host-log.cjs");
 const { takeFrames } = require("./stdin-frames.cjs");
 const { parseListenEndpoint } = require("./listener.cjs");
 const { getStateDir } = require("./remote-auth.cjs");
@@ -48,18 +49,23 @@ const { redactUrlSecrets } = require("./redaction.cjs");
 const { appendActivity, journalCommand } = require("./activity-journal.cjs");
 const { reserveReceipt, updateReceipt } = require("./playbook-receipts.cjs");
 const {
-  activeRecord,
+  activeRecords,
   appendRecordEvent,
   attachNetworkTrace,
   discardRecord,
   markRecord,
   pauseRecord,
+  recordStatus,
+  requireRecordFor,
   resumeRecord,
   startRecord,
   stopRecord,
+  traceEntriesForRecord,
   updateRecordContext,
 } = require("./playbook-records.cjs");
 const { resolveArgs, runPlaybookOp } = require("./playbook-runtime.cjs");
+const { dryRunOp, runOp } = require("./op-run.cjs");
+const { captureHook, makeOp, readPage } = require("./op-pipeline.cjs");
 const { resolveOp } = require("./playbooks.cjs");
 const { replay, waitForResponse } = require("./api-harvest.cjs");
 const { runCollect } = require("./dom-collect.cjs");
@@ -76,6 +82,7 @@ const {
   DEFAULT_VIDEO_FPS,
   VideoRecorder,
   VideoRecorderError,
+  findFfmpeg,
   parseVideoFps,
   validateVideoOutputPath,
 } = require("./video-recorder.cjs");
@@ -193,7 +200,7 @@ let aiQueue;
 function queueAiRequest(handler, request = requestStorage.getStore()) {
   return aiQueue.enqueue(handler, request);
 }
-const LOG_FILE = path.join(SURF_TMP, "surf-host.log");
+const appendLog = createHostLog({ file: path.join(SURF_TMP, "surf-host.log") });
 const AUTH_FILE = path.join(os.homedir(), ".pi", "agent", "auth.json");
 
 const DEFAULT_RETRY_OPTIONS = {
@@ -405,7 +412,7 @@ async function handleApiRequest(msg, sendResponse) {
 }
 
 const log = (msg) => {
-  fs.appendFileSync(LOG_FILE, `${new Date().toISOString()} ${msg}\n`);
+  appendLog(`${new Date().toISOString()} ${msg}\n`);
 };
 
 if (require.main === module) {
@@ -1100,6 +1107,7 @@ async function prepareToolRequest(msg, request) {
   const { identity, target } = await resolveRequestTarget(msg, request, classification);
   request.browserIdentity = identity;
   request.target = target;
+  request.callerSession = msg.target?.session || msg.session || msg.recordSession;
   request.laneKey = target?.tabId ? targetLaneKey(identity, target.tabId) : undefined;
   if (classification.scope === "provider") {
     request.notice = `${request.tool} uses exclusive browser access; other Surf sessions will queue until it finishes.`;
@@ -1549,13 +1557,31 @@ async function executeNativePlaybook(request, handler, args, options = {}) {
   return { response: result.response, model: result.model, tookMs: result.tookMs };
 }
 
+// With --url, an input that only fills the op's URL (a hook-made detail op's id) isn't needed.
+function urlInputsOptional(op) {
+  const inUrl = `${op.request?.url || ""} ${op.open || ""}`;
+  const elsewhere = JSON.stringify([op.request && { ...op.request, url: "" }, op.steps]);
+  const optional = (name) => inUrl.includes(`{{${name}}}`) && !elsewhere.includes(`{{${name}}}`);
+  return Object.fromEntries(Object.entries(op.args || {}).map(([name, spec]) => [name, optional(name) ? { ...spec, required: false } : spec]));
+}
+
 async function runHostPlaybook(msg, request) {
   const params = msg.params?.args || {};
   const { playbook, op } = resolveOp(params.playbook, params.op, {
     cwd: request.context?.isRemote ? process.cwd() : params.projectDir || process.cwd(),
     pinBuiltIn: params.pinBuiltIn === true,
   });
-  const runArgs = resolveArgs(op, params.args || {});
+  // --url and --pages are surf's unless the op names an input so.
+  const flag = (name) => (Object.hasOwn(op.args || {}, name) ? undefined : params.args?.[name]);
+  const url = flag("url");
+  const pages = flag("pages") ?? 1;
+  if (op.run && (url !== undefined || pages !== 1 || params.dryRun)) {
+    throw new Error(`--url, --pages and --dry-run need an op with request or open; ${playbook.id} ${op.id} has a run list`);
+  }
+  if (url !== undefined && typeof url !== "string") throw new Error("--url needs a URL");
+  if (!Number.isInteger(pages) || pages < 1 || pages > 100) throw new Error("--pages must be a whole number from 1 to 100");
+  const runArgs = resolveArgs(url === undefined ? op : { ...op, args: urlInputsOptional(op) }, params.args || {}, { playbookId: playbook.id });
+  if (params.dryRun) return dryRunOp({ playbook, op, args: runArgs, url });
   if (op.effect === "write" && op.safety.authorization === "explicit" && params.write !== true) {
     throw new Error(`write op ${playbook.id} ${op.id} requires --write`);
   }
@@ -1569,12 +1595,15 @@ async function runHostPlaybook(msg, request) {
   });
   const report = (event) => {
     appendActivity(event);
-    appendRecordEvent(event);
+    appendRecordEvent(event, { target: recordEventTarget(request) });
   };
-  const result = await runPlaybookOp({
+  const result = await (op.run ? runPlaybookOp : runOp)({
     playbook,
     op,
     args: runArgs,
+    url,
+    pages,
+    env: { ...process.env, ...params.env },
     attemptId: receipt?.attemptId,
     signal: request.signal,
     executeTool: (tool, args) => executeMappedHostTool(request, tool, args, msg.tabId),
@@ -1608,58 +1637,120 @@ async function runHarvestTool(tool, args, msg, request) {
   return formatRecords(records, args.format ?? "json");
 }
 
+const RECORD_TRACE_LIMIT = 500;
+// What each active record's tab was given to type or pick, kept in memory until its stop, where
+// the values become the op's inputs. Records on disk keep them redacted.
+const recordTyped = new Map();
+
+// What the op pipeline uses to drive the tab and the extension.
+function pipelineContext(request, tabId) {
+  return {
+    executeTool: (tool, args) => executeMappedHostTool(request, tool, args, tabId),
+    callExtension: (message) => requestExtensionOrThrow(request, request.tool, message),
+    signal: request.signal,
+    sleep: (ms) => abortableDelay(ms, request.signal),
+    onEvent: appendActivity,
+  };
+}
+
+// surf hook: opens the URL with capture on, runs the --do steps, and makes the op from what it sent.
+async function runHook(msg, request) {
+  const params = msg.params?.args || {};
+  const tabId = request.target?.tabId ?? msg.tabId;
+  if (activeRecords().some((record) => record.tabId === tabId)) {
+    throw new Error("a playbook record is open on this tab; stop it (surf pb record stop) before running surf hook");
+  }
+  const context = pipelineContext(request, tabId);
+  const capture = await captureHook({ url: params.url, steps: params.steps || [], tabId, ...context });
+  return makeOp({ capture, goal: params.goal, samples: params.samples, typed: params.typed, template: params.template, match: params.match, site: params.site, op: params.op, ...context });
+}
+
+// Who a command's events belong to. Tab and window commands resolve no tab target, so they go by
+// the caller's session.
+function recordEventTarget(request) {
+  if (request.target) return { session: request.target.session, tabId: request.target.tabId };
+  return { browser: true, session: request.callerSession };
+}
+
+// Each record belongs to the session (or, without one, the tab) that started it.
 async function handleRecordRequest(tool, args, msg, request) {
+  const target = { session: request.target?.session, tabId: request.target?.tabId ?? msg.tabId };
+  const stopCapture = (record) => Promise.all([
+    record.capture.network && requestCallExtension(request, tool, { type: "STOP_NETWORK_CAPTURE", tabId: record.tabId }, 30000, true).catch(() => {}),
+    record.capture.watch && requestCallExtension(request, tool, { type: "STOP_PLAYBOOK_WATCH", tabId: record.tabId }, 30000, true).catch(() => {}),
+  ]);
   if (tool === "playbook.record.start") {
-    let record = startRecord({ ...args, tabId: msg.tabId });
+    let record = startRecord({ ...args, tabId: target.tabId, session: target.session });
     try {
       const context = await requestCallExtension(request, tool, {
         type: "GET_PLAYBOOK_RECORD_CONTEXT",
-        tabId: msg.tabId,
+        tabId: record.tabId,
       });
-      record = updateRecordContext({
-        tabId: context._resolvedTabId || msg.tabId,
+      record = updateRecordContext(record.id, {
+        tabId: context._resolvedTabId || record.tabId,
         origin: context.origin,
       });
       if (record.capture.network) {
         const result = await requestCallExtension(request, tool, { type: "START_NETWORK_CAPTURE", tabId: record.tabId, bodyMode: "text" });
-        record = updateRecordContext({ tabId: result._resolvedTabId || record.tabId });
+        record = updateRecordContext(record.id, { tabId: result._resolvedTabId || record.tabId });
       }
       if (record.capture.watch) {
-        const result = await requestCallExtension(request, tool, { type: "START_PLAYBOOK_WATCH", tabId: record.tabId || msg.tabId, includeInputValues: record.redaction.includeInputValues });
-        record = updateRecordContext({ tabId: result._resolvedTabId || record.tabId || msg.tabId });
+        const result = await requestCallExtension(request, tool, { type: "START_PLAYBOOK_WATCH", tabId: record.tabId, includeInputValues: record.redaction.includeInputValues });
+        record = updateRecordContext(record.id, { tabId: result._resolvedTabId || record.tabId });
       }
       return record;
     } catch (error) {
-      if (record?.capture.network) await requestCallExtension(request, tool, { type: "STOP_NETWORK_CAPTURE", tabId: record.tabId }, 30000, true).catch(() => {});
-      if (record?.capture.watch) await requestCallExtension(request, tool, { type: "STOP_PLAYBOOK_WATCH", tabId: record.tabId }, 30000, true).catch(() => {});
-      discardRecord();
+      await stopCapture(record);
+      discardRecord({ target: { session: record.session, tabId: record.tabId } });
       throw error;
     }
   }
-  if (tool === "playbook.record.status") return activeRecord() || { status: "idle" };
-  if (tool === "playbook.record.mark") return markRecord(args.label);
-  if (tool === "playbook.record.pause") return pauseRecord();
-  if (tool === "playbook.record.resume") return resumeRecord();
+  if (tool === "playbook.record.status") return recordStatus({ target });
+  if (tool === "playbook.record.mark") return markRecord(args.label, { target });
+  if (tool === "playbook.record.pause") return pauseRecord({ target });
+  if (tool === "playbook.record.resume") return resumeRecord({ target });
   if (tool === "playbook.record.discard") {
-    const record = activeRecord();
-    if (record?.capture.network) await requestCallExtension(request, tool, { type: "STOP_NETWORK_CAPTURE", tabId: record.tabId }, 30000, true).catch(() => {});
-    if (record?.capture.watch) await requestCallExtension(request, tool, { type: "STOP_PLAYBOOK_WATCH", tabId: record.tabId }, 30000, true).catch(() => {});
-    return discardRecord();
+    await stopCapture(requireRecordFor(target));
+    return discardRecord({ target });
   }
   if (tool === "playbook.record.stop") {
-    const record = activeRecord();
-    if (!record) throw new Error("no active playbook record");
+    const record = requireRecordFor(target);
+    let result;
+    let hook;
     if (record.capture.network) {
       try {
-        const result = await requestCallExtension(request, tool, { type: "READ_NETWORK_REQUESTS", tabId: record.tabId, full: true, limit: 500 });
-        const cutoff = Date.parse(record.startedAt);
-        attachNetworkTrace(record.id, (result.entries || []).filter((entry) => entry.ts >= cutoff));
-      } finally {
-        await requestCallExtension(request, tool, { type: "STOP_NETWORK_CAPTURE", tabId: record.tabId }, 30000, true).catch(() => {});
+        result = await requestExtensionOrThrow(request, tool, { type: "READ_NETWORK_REQUESTS", tabId: record.tabId, full: true, limit: RECORD_TRACE_LIMIT });
+      } catch (error) {
+        // The record's tab may be closed; the record still stops, without a trace.
+        result = { error };
       }
     }
-    if (record.capture.watch) await requestCallExtension(request, tool, { type: "STOP_PLAYBOOK_WATCH", tabId: record.tabId }, 30000, true).catch(() => {});
-    return stopRecord({ draft: args.draft === true });
+    const entries = result?.entries && traceEntriesForRecord(record, result.entries);
+    // Without --draft, stop runs the op pipeline on what the record captured. A weak pick leaves the
+    // record open, so stop --match can pick again.
+    if (entries && args.draft !== true) {
+      const context = pipelineContext(request, record.tabId);
+      hook = await readPage(context)
+        .then((page) => makeOp({ capture: { entries, pageUrl: page.url, pageText: page.text }, typed: recordTyped.get(record.id), match: args.match, site: record.site, op: record.op, ...context }))
+        .catch((error) => ({ status: "error", exitCode: 1, error: error.message }));
+      // A weak pick, or a --match that holds no request, leaves the record open to pick again.
+      if (hook.status === "weak") return { record: { id: record.id, status: record.status }, hook };
+      if (args.match !== undefined && !hook.picked) {
+        return { record: { id: record.id, status: record.status }, hook: { ...hook, error: `${hook.error}; record ${record.id} is still open: run surf pb record stop --match with another part of the URL` } };
+      }
+    }
+    if (entries) {
+      attachNetworkTrace(record.id, entries, undefined, {
+        capture: result.capture,
+        ...(result.entries.length >= RECORD_TRACE_LIMIT ? { truncatedAt: RECORD_TRACE_LIMIT } : {}),
+      });
+    }
+    await stopCapture(record);
+    recordTyped.delete(record.id);
+    const stopped = stopRecord({ target: { session: record.session, tabId: record.tabId }, draft: args.draft === true });
+    const warnings = [...(stopped.warnings || []), ...(result?.error ? [`the network trace could not be read: ${result.error.message || result.error}`] : [])];
+    if (hook?.status === "error") hook = { ...hook, error: `${hook.error}; record ${record.id} stopped, its trace saved` };
+    return { ...stopped, ...(hook ? { hook } : {}), ...(warnings.length > 0 ? { warnings } : {}) };
   }
   throw new Error(`Unknown record command: ${tool}`);
 }
@@ -1825,7 +1916,12 @@ function sendToolResponse(socket, id, result, error) {
           resultSummary: finalError ? "failed" : "success",
         };
         appendActivity(event);
-        appendRecordEvent(event);
+        const target = recordEventTarget(request);
+        const typed = finalError || metadata.effect !== "page-write" ? [] : [request.args?.text, request.args?.value, request.args?.values].flat().filter((value) => typeof value === "string" && value);
+        if (appendRecordEvent(event, { target }) && typed.length > 0) {
+          const { id } = recordStatus({ target });
+          if (id) recordTyped.set(id, [...(recordTyped.get(id) || []), ...typed]);
+        }
       }
     }
     await cleanupRequestTransfers(request);
@@ -1967,8 +2063,8 @@ function handleToolRequest(msg, socket, requestContext = requestStorage.getStore
       .catch((error) => sendToolResponse(socket, originalId, null, error));
     return;
   }
-  if (tool === "playbook.run") {
-    runHostPlaybook(msg, requestContext)
+  if (tool === "playbook.run" || tool === "playbook.hook") {
+    (tool === "playbook.run" ? runHostPlaybook : runHook)(msg, requestContext)
       .then((result) => sendToolResponse(socket, originalId, { output: JSON.stringify(result) }, null))
       .catch((error) => sendToolResponse(socket, originalId, null, error.message));
     return;
@@ -2965,7 +3061,7 @@ function processInput() {
           url: redactUrlSecrets(msg.url),
           tabId: msg.tabId,
           timestamp: msg.timestamp || new Date().toISOString(),
-        });
+        }, { target: { tabId: msg.tabId, page: true } });
         continue;
       }
 
@@ -3307,9 +3403,15 @@ const handleClient = (socket) => {
       return;
     }
 
-    // Answered here, without the extension, so `surf doctor` can compare versions.
+    // Answered here, without the extension, so `surf doctor` can compare versions and see
+    // whether this host, with the PATH the browser gave it, finds ffmpeg.
     if (msg.type === "versions_request") {
-      await sendSocket(socket, { type: "versions_response", host: HOST_VERSION, extension: browserIdentity?.extensionVersion ?? null });
+      await sendSocket(socket, {
+        type: "versions_response",
+        host: HOST_VERSION,
+        extension: browserIdentity?.extensionVersion ?? null,
+        ffmpeg: { path: findFfmpeg(), searchedPath: process.env.PATH || "", pinned: process.env.SURF_FFMPEG || null },
+      });
       return;
     }
 

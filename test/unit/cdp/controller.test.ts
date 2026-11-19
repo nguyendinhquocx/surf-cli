@@ -15,6 +15,14 @@ const mockChrome = {
 // Set global chrome before tests
 vi.stubGlobal("chrome", mockChrome);
 
+/** Feeds a CDP event to the controller as chrome.debugger.onEvent would. */
+const cdpEvent = (controller: CDPController, tabId: number, method: string, params: object) =>
+  (
+    controller as unknown as {
+      handleCDPEvent: (tab: number, event: string, value: unknown) => Promise<void> | void;
+    }
+  ).handleCDPEvent(tabId, method, params);
+
 describe("describeDebuggerError", () => {
   it("unwraps the JSON-encoded CDP error chrome.debugger rejects with", () => {
     const original = new Error('{"code":-32000,"message":"Inspected target navigated or closed"}');
@@ -31,6 +39,31 @@ describe("describeDebuggerError", () => {
     expect(describeDebuggerError('{"code":1}', "Page.enable").message).toBe('{"code":1}');
   });
 });
+
+function evaluateShadowLookup(
+  fakeDoc: unknown,
+  expectedMatch: unknown,
+  params?: Record<string, any>,
+) {
+  const fn = new Function("doc", "arg", `return (${params?.functionDeclaration}).call(doc, arg);`);
+  return fn(fakeDoc, params?.arguments?.[0]?.value) === expectedMatch
+    ? { result: { type: "object", subtype: "node", objectId: "shadow-input-obj" } }
+    : { result: { type: "object", subtype: "null", value: null } };
+}
+
+function createShadowSendCommandMock(fakeDoc: unknown, expectedMatch: unknown) {
+  const staticResponses: Record<string, unknown> = {
+    "DOM.getDocument": { root: { nodeId: 1 } },
+    "DOM.querySelector": { nodeId: 0 },
+    "Runtime.evaluate": { result: { objectId: "doc-obj" } },
+  };
+  return async (_target: unknown, method: string, params?: Record<string, any>) => {
+    if (method === "Runtime.callFunctionOn") {
+      return evaluateShadowLookup(fakeDoc, expectedMatch, params);
+    }
+    return staticResponses[method] ?? {};
+  };
+}
 
 describe("CDPController", () => {
   afterEach(() => {
@@ -1152,6 +1185,154 @@ describe("CDPController", () => {
         reason: "disabled",
       });
     });
+
+    it("stamps entries with wall-clock epoch ms, not Chrome's monotonic clock", async () => {
+      await controller.enableNetworkTracking(tabId);
+      // CDP `timestamp` is monotonic seconds since boot; `wallTime` is epoch seconds.
+      await cdpEvent(controller, tabId, "Network.requestWillBeSent", {
+        requestId: "req-wall",
+        timestamp: 1_160_000.5,
+        wallTime: 1_794_000_000.25,
+        request: { url: "https://example.test/wall", method: "GET", headers: {} },
+      });
+      await cdpEvent(controller, tabId, "Network.loadingFinished", {
+        requestId: "req-wall",
+        timestamp: 1_160_000.75,
+        encodedDataLength: 0,
+      });
+      const [entry] = controller.getNetworkEntries(tabId, { includeStatic: true });
+      expect(entry.ts).toBe(1_794_000_000_250);
+      expect(entry.duration).toBe(250);
+      expect(controller.getNetworkRequests(tabId)[0]).toMatchObject({
+        id: entry.id,
+        timestamp: 1_794_000_000_250,
+      });
+    });
+  });
+
+  describe("network capture interruptions", () => {
+    const tabId = 2650;
+    let controller: CDPController;
+    const request = (index: number) =>
+      cdpEvent(controller, tabId, "Network.requestWillBeSent", {
+        requestId: `req-${index}`,
+        timestamp: index,
+        wallTime: 1_794_000_000 + index,
+        request: { url: `https://example.test/${index}`, method: "POST", headers: {} },
+      });
+
+    beforeEach(async () => {
+      // Each controller registers its debugger listeners once; let this one register them.
+      (
+        CDPController as unknown as { debuggerListenerRegistered: boolean }
+      ).debuggerListenerRegistered = false;
+      controller = new CDPController();
+      mockChrome.debugger.attach.mockResolvedValue(undefined);
+      mockChrome.debugger.sendCommand.mockResolvedValue({});
+      await controller.enableNetworkTracking(tabId, { bodyMode: "none" });
+    });
+
+    it("notes when a detach stops capture, keeps what it captured, and resumes on the next attach", async () => {
+      await request(0);
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date("2026-11-14T10:00:00Z"));
+      mockChrome.debugger.onDetach.addListener.mock.calls.at(-1)?.[0]({ tabId }, "target_closed");
+      const interruption = { reason: "target_closed", at: Date.parse("2026-11-14T10:00:00Z") };
+      expect(controller.getNetworkCaptureStatus(tabId)).toEqual({
+        active: false,
+        interruptions: [interruption],
+        dropped: 0,
+      });
+
+      // The next command reports the detach once, then attaches again.
+      await expect(controller.sendCommand(tabId, "Runtime.evaluate")).rejects.toMatchObject({
+        code: "debugger_detached",
+      });
+      mockChrome.debugger.sendCommand.mockClear();
+      vi.setSystemTime(new Date("2026-11-14T10:00:05Z"));
+      await controller.sendCommand(tabId, "Runtime.evaluate");
+      expect(mockChrome.debugger.sendCommand).toHaveBeenCalledWith({ tabId }, "Network.enable", {
+        maxPostDataSize: 65536,
+      });
+      expect(controller.getNetworkCaptureStatus(tabId)).toEqual({
+        active: true,
+        interruptions: [{ ...interruption, resumedAt: Date.parse("2026-11-14T10:00:05Z") }],
+        dropped: 0,
+      });
+      expect(controller.getNetworkEntries(tabId, { includeStatic: true })).toHaveLength(1);
+      controller.clearNetworkRequests(tabId);
+      expect(controller.getNetworkCaptureStatus(tabId).interruptions).toEqual([]);
+    });
+
+    it("keeps a request that redirected as its own entry, with the redirect status", async () => {
+      // Chrome sends the redirected request under the same requestId, with the redirect response.
+      const onEvent = mockChrome.debugger.onEvent.addListener.mock.calls.at(-1)?.[0];
+      onEvent({ tabId }, "Network.requestWillBeSent", {
+        requestId: "cart",
+        timestamp: 1,
+        wallTime: 1_794_000_000,
+        request: {
+          url: "https://example.test/cart/add",
+          method: "POST",
+          headers: {},
+          postData: "id=1",
+        },
+      });
+      onEvent({ tabId }, "Network.requestWillBeSent", {
+        requestId: "cart",
+        timestamp: 2,
+        wallTime: 1_794_000_001,
+        redirectResponse: { status: 303, statusText: "See Other", headers: { location: "/cart" } },
+        request: { url: "https://example.test/cart", method: "GET", headers: {} },
+      });
+      await controller.drainNetworkEvents(tabId);
+      const entries = controller.getNetworkEntries(tabId, { includeStatic: true });
+      expect(entries.map(({ method, url, status }) => ({ method, url, status }))).toEqual([
+        { method: "POST", url: "https://example.test/cart/add", status: 303 },
+        { method: "GET", url: "https://example.test/cart", status: undefined },
+      ]);
+      expect(new Set(entries.map((entry) => entry.id)).size).toBe(2);
+    });
+
+    it("frees what a detach kept once the tab itself is detached (closed)", async () => {
+      await request(0);
+      mockChrome.debugger.onDetach.addListener.mock.calls.at(-1)?.[0]({ tabId }, "target_closed");
+      expect(controller.getNetworkEntries(tabId, { includeStatic: true })).toHaveLength(1);
+      await controller.detach(tabId);
+      expect(controller.getNetworkEntries(tabId, { includeStatic: true })).toEqual([]);
+      expect(controller.getNetworkCaptureStatus(tabId)).toEqual({
+        active: false,
+        interruptions: [],
+        dropped: 0,
+      });
+      mockChrome.debugger.attach.mockClear();
+      await controller.resumeNetworkCapture(tabId);
+      expect(mockChrome.debugger.attach).not.toHaveBeenCalled();
+    });
+
+    it("remembers a clear until capture starts again", () => {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date("2026-11-14T10:00:00Z"));
+      controller.clearNetworkRequests(tabId);
+      expect(controller.getNetworkCaptureStatus(tabId).clearedAt).toBe(
+        Date.parse("2026-11-14T10:00:00Z"),
+      );
+      controller.clearNetworkRequests(tabId, { restart: true });
+      expect(controller.getNetworkCaptureStatus(tabId)).not.toHaveProperty("clearedAt");
+    });
+
+    it("counts the requests it drops to stay within its per-tab limit", async () => {
+      for (let index = 0; index < 510; index++) {
+        await request(index);
+      }
+      const { dropped } = controller.getNetworkCaptureStatus(tabId);
+      expect(dropped).toBeGreaterThan(0);
+      expect(controller.getNetworkEntries(tabId, { includeStatic: true }).length + dropped).toBe(
+        510,
+      );
+      controller.clearNetworkRequests(tabId);
+      expect(controller.getNetworkCaptureStatus(tabId).dropped).toBe(0);
+    });
   });
 
   describe("handleDialog", () => {
@@ -1532,19 +1713,163 @@ describe("CDPController", () => {
           files: ["/path/to/file"],
         },
       );
+      expect(mockChrome.debugger.sendCommand).not.toHaveBeenCalledWith(
+        { tabId },
+        "Runtime.evaluate",
+        expect.anything(),
+      );
     });
 
-    it("returns error when element not found", async () => {
+    it("pierces open and nested shadow roots when DOM.querySelector misses and releases remote objects", async () => {
+      const selector = `[data-pi-file-id="__pi_file_99"]`;
+      const nestedInput = { id: "nested-shadow-file-input" };
+      const innerShadowRoot = {
+        querySelector: (sel: string) => (sel === selector ? nestedInput : null),
+        querySelectorAll: () => [],
+      };
+      const outerShadowRoot = {
+        querySelector: () => null,
+        querySelectorAll: () => [{ shadowRoot: innerShadowRoot }, { shadowRoot: null }],
+      };
+      const fakeDoc = {
+        querySelector: () => null,
+        querySelectorAll: () => [{ shadowRoot: outerShadowRoot }],
+      };
+
+      mockChrome.debugger.sendCommand.mockImplementation(
+        createShadowSendCommandMock(fakeDoc, nestedInput),
+      );
+
+      const result = await controller.setFileInputBySelector(tabId, selector, ["/path/to/file"]);
+
+      expect(result).toStrictEqual({ success: true });
+      const callFunctionCall = mockChrome.debugger.sendCommand.mock.calls.find(
+        (call) => call[1] === "Runtime.callFunctionOn",
+      );
+      expect(callFunctionCall?.[2]).toMatchObject({
+        objectId: "doc-obj",
+        arguments: [{ value: selector }],
+      });
+      expect(callFunctionCall?.[2].functionDeclaration).not.toContain("__pi_file_99");
+      expect(mockChrome.debugger.sendCommand).toHaveBeenCalledWith(
+        { tabId },
+        "DOM.setFileInputFiles",
+        {
+          objectId: "shadow-input-obj",
+          files: ["/path/to/file"],
+        },
+      );
+      expect(mockChrome.debugger.sendCommand).toHaveBeenCalledWith(
+        { tabId },
+        "Runtime.releaseObject",
+        { objectId: "doc-obj" },
+      );
+      expect(mockChrome.debugger.sendCommand).toHaveBeenCalledWith(
+        { tabId },
+        "Runtime.releaseObject",
+        { objectId: "shadow-input-obj" },
+      );
+    });
+
+    it("releases remote objects even when DOM.setFileInputFiles fails on a shadow match", async () => {
       mockChrome.debugger.sendCommand
         .mockResolvedValueOnce({}) // Page.enable
         .mockResolvedValueOnce({}) // DOM.enable
         .mockResolvedValueOnce({ root: { nodeId: 1 } }) // getDocument
-        .mockResolvedValueOnce({ nodeId: 0 }); // querySelector returns 0
+        .mockResolvedValueOnce({ nodeId: 0 }) // querySelector
+        .mockResolvedValueOnce({ result: { objectId: "doc-obj" } }) // Runtime.evaluate
+        .mockResolvedValueOnce({
+          result: { type: "object", subtype: "node", objectId: "shadow-input-obj" },
+        }) // Runtime.callFunctionOn
+        .mockResolvedValueOnce({}) // Runtime.releaseObject (doc-obj)
+        .mockRejectedValueOnce(new Error("Node is not a file input element")) // DOM.setFileInputFiles
+        .mockResolvedValueOnce({}); // Runtime.releaseObject (shadow-input-obj)
+
+      const result = await controller.setFileInputBySelector(tabId, "#shadow-div", ["/file"]);
+
+      expect(result).toStrictEqual({
+        success: false,
+        error: "Node is not a file input element",
+      });
+      expect(mockChrome.debugger.sendCommand).toHaveBeenCalledWith(
+        { tabId },
+        "Runtime.releaseObject",
+        { objectId: "doc-obj" },
+      );
+      expect(mockChrome.debugger.sendCommand).toHaveBeenCalledWith(
+        { tabId },
+        "Runtime.releaseObject",
+        { objectId: "shadow-input-obj" },
+      );
+    });
+
+    it("releases exception and document objects when Runtime.callFunctionOn reports exceptionDetails", async () => {
+      mockChrome.debugger.sendCommand
+        .mockResolvedValueOnce({}) // Page.enable
+        .mockResolvedValueOnce({}) // DOM.enable
+        .mockResolvedValueOnce({ root: { nodeId: 1 } }) // getDocument
+        .mockResolvedValueOnce({ nodeId: 0 }) // querySelector
+        .mockResolvedValueOnce({ result: { objectId: "doc-obj" } }) // Runtime.evaluate
+        .mockResolvedValueOnce({
+          result: { type: "object" },
+          exceptionDetails: {
+            text: "Uncaught DOMException",
+            exception: {
+              objectId: "err-obj",
+              description: "SyntaxError: Failed to execute 'querySelector' on 'Document'",
+            },
+          },
+        }) // Runtime.callFunctionOn
+        .mockResolvedValueOnce({}) // Runtime.releaseObject (err-obj)
+        .mockResolvedValueOnce({}); // Runtime.releaseObject (doc-obj)
+
+      const result = await controller.setFileInputBySelector(tabId, "[invalid", ["/file"]);
+
+      expect(result).toStrictEqual({
+        success: false,
+        error: "SyntaxError: Failed to execute 'querySelector' on 'Document'",
+      });
+      expect(mockChrome.debugger.sendCommand).toHaveBeenCalledWith(
+        { tabId },
+        "Runtime.releaseObject",
+        { objectId: "err-obj" },
+      );
+      expect(mockChrome.debugger.sendCommand).toHaveBeenCalledWith(
+        { tabId },
+        "Runtime.releaseObject",
+        { objectId: "doc-obj" },
+      );
+      expect(mockChrome.debugger.sendCommand).not.toHaveBeenCalledWith(
+        { tabId },
+        "DOM.setFileInputFiles",
+        expect.anything(),
+      );
+    });
+
+    it("returns error when element not found in document or open shadow roots", async () => {
+      mockChrome.debugger.sendCommand
+        .mockResolvedValueOnce({}) // Page.enable
+        .mockResolvedValueOnce({}) // DOM.enable
+        .mockResolvedValueOnce({ root: { nodeId: 1 } }) // getDocument
+        .mockResolvedValueOnce({ nodeId: 0 }) // querySelector returns 0
+        .mockResolvedValueOnce({ result: { objectId: "doc-obj" } }) // Runtime.evaluate
+        .mockResolvedValueOnce({ result: { type: "object", subtype: "null", value: null } }) // Runtime.callFunctionOn
+        .mockResolvedValueOnce({}); // Runtime.releaseObject (doc-obj)
 
       const result = await controller.setFileInputBySelector(tabId, "#missing", ["/file"]);
 
       expect(result.success).toBe(false);
       expect(result.error).toContain("Could not find element");
+      expect(mockChrome.debugger.sendCommand).toHaveBeenCalledWith(
+        { tabId },
+        "Runtime.releaseObject",
+        { objectId: "doc-obj" },
+      );
+      expect(mockChrome.debugger.sendCommand).not.toHaveBeenCalledWith(
+        { tabId },
+        "DOM.setFileInputFiles",
+        expect.anything(),
+      );
     });
   });
 });

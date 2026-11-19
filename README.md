@@ -542,7 +542,7 @@ surf video stop
 surf video restart ./take-2.webm --fps 60
 ```
 
-`--fps` defaults to 30 and is capped at 60. Video recording is local-only and requires `ffmpeg` on `PATH`.
+`--fps` defaults to 30 and is capped at 60. Video recording is local-only and requires `ffmpeg`. The native host runs with the browser's PATH, not your shell's, so `surf install` records the ffmpeg your shell finds as `SURF_FFMPEG` in the host wrapper; after installing ffmpeg, rerun `surf install` and reload the extension. `surf doctor` reports whether the host finds it.
 
 ### Animation Audit
 
@@ -1002,6 +1002,65 @@ surf use page read --json
 surf use <site> <write-op> --write --resource-id 123
 ```
 
+#### Ops
+
+An op is one JSON file at `~/.surf/playbooks/<site>/ops/<op>.json` (or `./.surf/playbooks/`), next to the site's `playbook.json` (`{ "id": "books", "version": "1.0.0" }`). Write it by hand or have an agent write it:
+
+```json
+{
+  "id": "list_books",
+  "description": "Books on one catalogue page, with prices",
+  "args": { "page": { "default": 1, "example": 2 } },
+  "request": { "url": "https://books.toscrape.com/catalogue/page-{{page}}.html" },
+  "extract": {
+    "records": "article.product_pod",
+    "fields": { "title": "h3 a@title", "price": ".price_color", "url": "h3 a@href" }
+  },
+  "page": { "into": "page", "next": "+1" },
+  "expect": { "minItems": 1, "fields": ["title", "url"] }
+}
+```
+
+```bash
+surf use books list_books --page 2 --pages 3   # pages 2, 3 and 4
+surf use books list_books --dry-run            # print the request; send nothing
+surf pb test books                             # run each op with its examples, check expect
+```
+
+| Key | Meaning |
+|---|---|
+| `args` | Inputs: `{ "<name>": { "default"?, "required"?, "example"?, "desc"? } }`. `pb test` uses `example`. |
+| `request` | `{ "method"?, "url", "query"?, "headers"?, "body"? }`. Strings take `{{input}}` and `{{env.NAME}}` (from the shell that runs `surf use`). An object body is sent as JSON, or as a form with a form `content-type`. The tab opens the op's site if it is elsewhere and sends the request with the browser's cookies. |
+| `open`, `steps` | A page to open and `surf do` steps to run there (`"click e3 \| wait.element .results"`); the rendered HTML is read. Used with no `request`, or when the request fails. |
+| `extract` | `{ "in"?, "records"?, "fields"? }`. JSON: `records` is a path (`$.data.items`), a field is a path (`author.name`, `links[0].href`, `a ?? b`). HTML: `records` is a selector, a field is `selector`, `selector@attr`, `selector[]` (every match) or `:scope`, or `{ "selector", "match" }` to keep one regex group; `href` and `src` come back absolute. `in` reads JSON the page embeds: a script selector (`script#__NEXT_DATA__`), `ld+json:<Type>` or `js:<name>` (`var data = [...]`). No `records`: one record from the whole response. |
+| `page` | `{ "into"?, "next" }`: `"+1"` adds to the input `into`; a path or selector gives the next value of `into`, or with no `into`, the next URL. `--pages <n>` follows it (default 1, at most 100, 1 s apart); it stops at a failed page or one that repeats the last request, keeping what it read. |
+| `expect` | `{ "status"?, "minItems"?, "fields"? }`, checked on every run; `fields` must be in the first record. |
+| `effect` | `"write"` for an op that changes data; it needs `--write` and a `safety` key as other writes do. |
+
+Selectors cover tag, `#id`, `.class`, `[attr]`, `[attr="v"]`, `:nth-child(n)`, descendant and `>`. `--url <u>` runs the op on another URL of its site; a URL or next link on another site is refused. `--json` says which step answered (`"via": "tab"` or `"page"`). An op with a `run` list works as before. Reading HTML needs Node 20.19 or 22.12 or later.
+
+#### Make an op with `surf hook`
+
+`surf hook` writes that file for you. It opens the URL in the session's tab with network capture on, runs any `--do` steps, picks the request that carries the data, names its inputs, infers the extract from a replay, tests the op and saves it:
+
+```
+$ surf hook 'https://books.toscrape.com/catalogue/page-{{page}}.html' --page 2 \
+    --goal "books with prices" --as books/list_books
+picked   GET https://books.toscrape.com/catalogue/page-2.html   HTML document
+inputs   --page (default 2)
+extract  article.product_pod → title, url, star_rating, price_color
+paging   --pages: page +1
+test     tab ✓ 20 records; title, url present
+saved    ~/.surf/playbooks/books/ops/list_books.json
+run      surf use books list_books --page 2
+```
+
+- `{{name}}` in the URL or a `--do` step (`--do 'type "{{query}}" --into "#q" | key Enter' --query einstein`), with `--name <sample>`, becomes an input where that value sits in the request. A search key becomes `query`, a page key or `page-N` segment `page`, an id in the path `<word before>_id`.
+- The pick scores each request: same site, a JSON list of objects, the page's own document, share of the page's words, sent after the `--do` steps, a word of the goal. Exit 2 when the best leads by under 3 points: it prints the top 3 and a rerun line with `--match <url-part>`.
+- Exit 1 on an error or when the pick is a write (not GET or HEAD): it prints the draft op and saves nothing. `surf hook` saves reads only.
+- `--as <site>/<op>` names it; the default is the host name and `get_` with the goal's first three words.
+- `surf pb record start <site> --op <name>` captures network requests by default (`--no-network` turns it off), and `surf pb record stop` makes the op the same way from what you did, values you typed included. On a weak pick the record keeps recording: `stop --match <url-part>` picks. `--draft` only drafts, as before.
+
 Playbook read ops can also use a trusted `script` strategy when fixed JSON steps are too rigid. Scripts require `--allow-script` at run time. Only run scripts from playbooks you trust. This is not a security sandbox.
 
 The script gets `input`, `tools.run`, `tools.all`, `tools.ref`/`refs`, `emit`, and `console`. Tool calls still use Surf workflow step behavior, including auto-waits unless `autoWait` is `false`.
@@ -1024,7 +1083,7 @@ Author a playbook from redacted recent activity or an explicit evidence record:
 ```bash
 surf pb suggest --since 1h
 surf pb save example --op read --from-recent 1h
-surf pb record start example --op read --network --watch
+surf pb record start example --op read --watch
 surf pb record mark "loaded results"
 surf pb record stop --draft
 surf pb save --from-record <record-id>

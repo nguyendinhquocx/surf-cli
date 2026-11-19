@@ -12,6 +12,7 @@ const networkFormatters = require("./formatters/network.cjs");
 const { formatPageChanges } = require("./formatters/page-changes.cjs");
 const {
   applyArgDefaults,
+  commandMetadata,
   formatStep,
   getWorkflowDirs,
   getWorkflowInfo,
@@ -34,6 +35,9 @@ const {
   handleOracleCli,
 } = require("./oracle-cli.cjs");
 const { formatPlaybookOutput, handlePlaybookCli } = require("./playbook-cli.cjs");
+const { handleHookCli } = require("./hook-cli.cjs");
+const { editDistance } = require("./edit-distance.cjs");
+const { formatGlobalOptions } = require("./global-options.cjs");
 
 const IS_WIN = process.platform === "win32";
 const { SURF_TMP, formatSocketError } = require("./socket-path.cjs");
@@ -259,8 +263,23 @@ if (["playbook", "pb", "use"].includes(args[0]) && !helpRequested()) {
   handlePlaybookCli(args, { endpoint, cwd: process.cwd(), ...targetOptions })
     .then((result) => {
       if (!result.handled) throw new Error("Playbook command was not handled");
-      if (result.value !== undefined) console.log(formatPlaybookOutput(result.value, result.json));
-      process.exit(0);
+      if (result.stderr) console.error(result.stderr);
+      if (result.value !== undefined && result.value !== "") console.log(formatPlaybookOutput(result.value, result.json));
+      process.exit(result.exitCode ?? 0);
+    })
+    .catch((error) => {
+      console.error(`Error: ${error.message}`);
+      process.exit(1);
+    });
+  return;
+}
+
+if (args[0] === "hook" && !helpRequested()) {
+  handleHookCli(args, { endpoint, ...resolveEarlyTargetOptions(args, { allowWindow: false }) })
+    .then(({ stdout, stderr, exitCode }) => {
+      if (stderr) console.error(stderr);
+      if (stdout) console.log(stdout);
+      process.exit(exitCode);
     })
     .catch((error) => {
       console.error(`Error: ${error.message}`);
@@ -1645,11 +1664,29 @@ const TOOLS = {
   playbook: {
     desc: "Reusable site operations: threads, feeds and recorded flows",
     commands: {
+      hook: {
+        desc: "Make a tested read op from a page: open it, pick the request with its data, name inputs, infer the extract, test, save",
+        args: ["url"],
+        opts: {
+          goal: "What the op returns, in words (required); its first words name the op",
+          do: "surf do steps to run after the page loads, before the pick (clicks, typing)",
+          "<input>": "This run's value of {{input}} in the URL or a --do step, e.g. --page 2; also found in the request",
+          match: "Pick the captured request whose URL holds this text",
+          as: "Save as <site>/<op> (default: the host name and get_ + the goal's first three words)",
+          json: "Output the result as JSON",
+        },
+        examples: [
+          { cmd: "hook 'https://books.toscrape.com/catalogue/page-{{page}}.html' --page 2 --goal \"books with prices\" --as books/list_books", desc: "Exit 0: saved and tested" },
+          { cmd: "hook https://quotes.toscrape.com/scroll --goal quotes --do 'scroll.bottom'", desc: "Picks the JSON the scroll loads" },
+          { cmd: "hook https://quotes.toscrape.com/scroll --goal quotes --match /api/quotes", desc: "After exit 2: pick by URL" },
+        ],
+      },
       use: {
         desc: "Run a playbook operation, such as reading a whole X thread",
         args: ["playbook", "op"],
         opts: {
-          "<arg>": "Operation input, e.g. --url <post-url> (see: surf pb ops <playbook>)",
+          "<arg>": "Operation input, e.g. --page 2; an input the op doesn't define fails and lists its inputs",
+          timeout: "Seconds before the run gives up (default: the op's --timeout, else 600)",
           format: "md or jsonl instead of JSON",
           write: "Authorize a write operation",
           "allow-script": "Allow the playbook's trusted script strategy",
@@ -1657,9 +1694,13 @@ const TOOLS = {
           "retry-attempt": "Retry this write attempt id",
           "override-in-doubt": "Write again after an indeterminate attempt",
           "pin-built-in": "Use the built-in playbook even if a user or project copy exists",
+          url: "Run the op on another URL of its site",
+          pages: "Follow the op's page rule for up to n pages (default 1, max 100)",
+          "dry-run": "Print the request the op would send; send nothing",
           json: "Output raw JSON",
         },
         examples: [
+          { cmd: "use books list_books --page 2 --pages 3", desc: "Three catalogue pages from a hand-written op" },
           { cmd: "use x thread --url https://x.com/<user>/status/<id> --format md", desc: "Whole X thread as Markdown" },
           { cmd: "use page read --json", desc: "Read the current page" },
         ],
@@ -1669,6 +1710,12 @@ const TOOLS = {
       "playbook show": { desc: "Show a playbook's source and ops", args: ["playbook"], opts: { json: "Output raw JSON" } },
       "playbook ops": { desc: "List a playbook's operations", args: ["playbook"], opts: { json: "Output raw JSON" } },
       "playbook run": { desc: "Same as surf use <playbook> <op>", args: ["playbook", "op"] },
+      "playbook test": {
+        desc: "Run each read op (or one) with its example inputs and check its expect; exit 1 on a failure",
+        args: ["playbook"],
+        opts: { json: "Output raw JSON" },
+        examples: [{ cmd: "pb test books list_books", desc: "Test one op" }],
+      },
       "playbook suggest": { desc: "Suggest playbooks from recent activity", args: [], opts: { since: "Look-back window (default: 1h)" } },
       "playbook save": {
         desc: "Save a playbook op from recent activity or a record",
@@ -1687,11 +1734,15 @@ const TOOLS = {
       "playbook record start": {
         desc: "Start recording a playbook op",
         args: ["playbook"],
-        opts: { op: "Operation name", network: "Record network requests", watch: "Watch page changes", "include-input-values": "Keep typed values (redacted by default)" },
-        examples: [{ cmd: "pb record start example --op read --network --watch", desc: "Record with network" }],
+        opts: { op: "Operation name", "no-network": "Don't capture network requests (captured by default)", watch: "Watch page changes", "include-input-values": "Keep typed values (redacted by default)" },
+        examples: [{ cmd: "pb record start example --op read --watch", desc: "Record network requests and page changes" }],
       },
       "playbook record mark": { desc: "Add a note to the recording", args: ["note"] },
-      "playbook record stop": { desc: "Stop recording", args: [], opts: { draft: "Save a draft playbook from the record" } },
+      "playbook record stop": {
+        desc: "Stop recording; with network capture, pick, test and save the op as surf hook does (exit 2 on a weak pick keeps recording)",
+        args: [],
+        opts: { match: "Pick the captured request whose URL holds this text", draft: "Only save a draft op in the record, as before" },
+      },
       "playbook record status": { desc: "Show the recording state (also: pause, resume, discard)", args: [] },
       "playbook trace export": { desc: "Export a record as HAR", args: [], opts: { "from-record": "Record id", har: "Output .har path" } },
       "playbook export": { desc: "Export a playbook directory", args: ["playbook"], opts: { out: "Output directory" } },
@@ -2188,21 +2239,7 @@ Usage: surf <command> [args] [options]
   console.log(`Aliases: snap -> screenshot, read -> page.read, find -> search, go -> navigate
 
 Options:
-  --remote <host>:<port>       Route requests to a remote native host
-  --remote-credential <path>   Use a mode-0600 Ed25519 remote credential file
-  --remote-tls                 Use TLS through a TLS-terminating reverse proxy
-  --remote-tls-ca <path>       Replace system roots with a custom CA bundle
-  --remote-tls-server-name <name>  Override TLS SNI and certificate identity
-  --session <name>  Target a durable named session (or set SURF_SESSION)
-  --tab-id <id>     Target specific tab
-  --window-id <id>  Target specific window
-  --no-wait         Return immediately when the tab/browser is busy
-  --json            Output raw JSON including target metadata
-  --auto-capture    On error: capture screenshot + console to /tmp
-  --soft-fail       Host tool errors: warn on stderr, exit 0, no JSON error output
-  --no-lock         Bypass the legacy lock for compound client-side commands
-  --settle <ms>     Max wait for the page to settle after actions (default 2000, max 30000, surf.json settleMs)
-  --no-diff         Skip reporting page changes after actions
+${formatGlobalOptions()}
 
 Host tool-response errors: stderr includes [code] on the first line when supplied;
 --json also writes {"error":{"code":"...","message":"..."}} to stdout; exit 1.
@@ -2312,18 +2349,6 @@ const showToolHelp = (toolName) => {
     return;
   }
   reportUnknownCommand(toolName);
-};
-
-const editDistance = (a, b) => {
-  let previous = Array.from({ length: b.length + 1 }, (_, index) => index);
-  for (let i = 1; i <= a.length; i++) {
-    const current = [i];
-    for (let j = 1; j <= b.length; j++) {
-      current[j] = Math.min(previous[j] + 1, current[j - 1] + 1, previous[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
-    }
-    previous = current;
-  }
-  return previous[b.length];
 };
 
 // Closest public names, comparing the whole name and its group part (`bookmarks` -> bookmark.*, `key.repeat` -> key).
@@ -3911,6 +3936,14 @@ if (explicitSession !== undefined) {
 ) {
   globalOpts.session = environmentSession;
   globalOpts.sessionSource = "environment";
+} else if (
+  environmentSession &&
+  ["browser", "host"].includes(finalClassification.targetUse) &&
+  commandMetadata(finalTool).recordable
+) {
+  // Tab and window commands don't target a session's tab, but the session's playbook record holds
+  // them: the host uses `recordSession` only to file the command there.
+  globalOpts.recordSession = environmentSession;
 }
 if (noWait) globalOpts.admission = { wait: false };
 
