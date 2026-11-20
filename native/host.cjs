@@ -63,10 +63,12 @@ const {
   traceEntriesForRecord,
   updateRecordContext,
 } = require("./playbook-records.cjs");
-const { resolveArgs, runPlaybookOp } = require("./playbook-runtime.cjs");
+const { runPlaybookOp } = require("./playbook-runtime.cjs");
 const { dryRunOp, runOp } = require("./op-run.cjs");
-const { captureHook, makeOp, readPage } = require("./op-pipeline.cjs");
+const { eachChain, runChain, stepInputs } = require("./op-chain.cjs");
+const { captureHook, makeOp, readPage, runWithRepair } = require("./op-pipeline.cjs");
 const { resolveOp } = require("./playbooks.cjs");
+const { createSavedOpsNotice } = require("./saved-ops-notice.cjs");
 const { replay, waitForResponse } = require("./api-harvest.cjs");
 const { runCollect } = require("./dom-collect.cjs");
 const { formatRecords } = require("./record-format.cjs");
@@ -1557,63 +1559,74 @@ async function executeNativePlaybook(request, handler, args, options = {}) {
   return { response: result.response, model: result.model, tookMs: result.tookMs };
 }
 
-// With --url, an input that only fills the op's URL (a hook-made detail op's id) isn't needed.
-function urlInputsOptional(op) {
-  const inUrl = `${op.request?.url || ""} ${op.open || ""}`;
-  const elsewhere = JSON.stringify([op.request && { ...op.request, url: "" }, op.steps]);
-  const optional = (name) => inUrl.includes(`{{${name}}}`) && !elsewhere.includes(`{{${name}}}`);
-  return Object.fromEntries(Object.entries(op.args || {}).map(([name, spec]) => [name, optional(name) ? { ...spec, required: false } : spec]));
+// The browser's cookies for one direct request's URL, read by the extension. They stay in memory
+// for that request: nothing here logs or stores them. The extension refuses for an incognito tab,
+// whose cookies are not the profile's, so the tab sends that request.
+async function readDirectCookies(request, url, sourceTabId) {
+  const reply = await requestExtensionOrThrow(request, "playbook.direct", { type: "GET_DIRECT_REQUEST_CONTEXT", url, sourceTabId }, 10000);
+  return { cookies: Array.isArray(reply.cookies) ? reply.cookies : [], userAgent: reply.userAgent };
 }
 
 async function runHostPlaybook(msg, request) {
   const params = msg.params?.args || {};
-  const { playbook, op } = resolveOp(params.playbook, params.op, {
+  const resolved = resolveOp(params.playbook, params.op, {
     cwd: request.context?.isRemote ? process.cwd() : params.projectDir || process.cwd(),
     pinBuiltIn: params.pinBuiltIn === true,
   });
-  // --url and --pages are surf's unless the op names an input so.
-  const flag = (name) => (Object.hasOwn(op.args || {}, name) ? undefined : params.args?.[name]);
-  const url = flag("url");
-  const pages = flag("pages") ?? 1;
-  if (op.run && (url !== undefined || pages !== 1 || params.dryRun)) {
-    throw new Error(`--url, --pages and --dry-run need an op with request or open; ${playbook.id} ${op.id} has a run list`);
-  }
-  if (url !== undefined && typeof url !== "string") throw new Error("--url needs a URL");
-  if (!Number.isInteger(pages) || pages < 1 || pages > 100) throw new Error("--pages must be a whole number from 1 to 100");
-  const runArgs = resolveArgs(url === undefined ? op : { ...op, args: urlInputsOptional(op) }, params.args || {}, { playbookId: playbook.id });
+  const { playbook } = resolved;
+  if (params.delayMs !== undefined && params.each === undefined) throw new Error("--delay-ms spaces the runs of --each; add --each <list-op>:<field>");
+  const op = params.each === undefined ? resolved.op : eachChain(playbook, resolved.op, params.each, { delayMs: params.delayMs });
+  if (params.dryRun && !op.request && !op.open) throw new Error(`--dry-run shows ops with request or open; ${playbook.id} ${op.id} has ${op.chain ? "a chain" : "a run list"}`);
+  const { args: runArgs, url, pages } = stepInputs(playbook, op, params.args || {});
   if (params.dryRun) return dryRunOp({ playbook, op, args: runArgs, url });
-  if (op.effect === "write" && op.safety.authorization === "explicit" && params.write !== true) {
-    throw new Error(`write op ${playbook.id} ${op.id} requires --write`);
+  // Before anything is sent: a write, or a chain with a write step, needs --write. The refusal
+  // names the method and URL as the op writes them, so no input value is printed.
+  const unsent = (op.chain ? op.chain.map((step) => playbook.ops.get(step.op)) : [op]).find((target) => target?.effect === "write" && target.safety.authorization === "explicit");
+  if (unsent && params.write !== true) {
+    const request = unsent.request || unsent.run?.find((strategy) => strategy.request)?.request;
+    throw new Error(`refused: ${playbook.id} ${unsent.id} is a write (${request ? `${request.method || "GET"} ${request.url}` : `on ${unsent.open || "its page"}`}); add --write to send it`);
   }
-  const receipt = reserveReceipt({
-    playbookId: playbook.id,
-    op,
-    args: runArgs,
-    repeat: params.repeat === true,
-    retryAttempt: params.retryAttempt,
-    overrideInDoubt: params.overrideInDoubt === true,
-  });
+  // Each write send (a chain's or --each's, once per record) has its own duplicate guard.
+  const guard = ({ op: target, args: targetArgs, url: targetUrl }) => {
+    const receipt = reserveReceipt({
+      playbookId: playbook.id,
+      op: target,
+      args: targetUrl === undefined ? targetArgs : { ...targetArgs, url: targetUrl },
+      repeat: params.repeat === true,
+      retryAttempt: params.retryAttempt,
+      overrideInDoubt: params.overrideInDoubt === true,
+    });
+    return {
+      attemptId: receipt?.attemptId,
+      beforeDispatch: async () => updateReceipt(receipt, "dispatched"),
+      afterDispatch: async ({ status, error, answered }) => updateReceipt(receipt, status, { error, answered }),
+    };
+  };
   const report = (event) => {
     appendActivity(event);
     appendRecordEvent(event, { target: recordEventTarget(request) });
   };
-  const result = await (op.run ? runPlaybookOp : runOp)({
+  const run = (target, args = runArgs) => (target.chain ? runChain : target.run ? runPlaybookOp : runOp)({
     playbook,
-    op,
-    args: runArgs,
+    op: target,
+    args,
     url,
     pages,
     env: { ...process.env, ...params.env },
-    attemptId: receipt?.attemptId,
+    readCookies: (url) => readDirectCookies(request, url, request.target?.tabId ?? msg.tabId),
     signal: request.signal,
     executeTool: (tool, args) => executeMappedHostTool(request, tool, args, msg.tabId),
     executeNative: (handler, args, options) => executeNativePlaybook(request, handler, args, options),
     sleep: (ms) => abortableDelay(ms, request.signal),
     onEvent: report,
-    beforeDispatch: async () => updateReceipt(receipt, "dispatched"),
-    afterDispatch: async ({ status, error }) => updateReceipt(receipt, status, { error }),
+    ...(target.run ? guard({ op: target, args }) : { guard }),
     allowScript: params.allowScript === true,
   });
+  // A read that fails on shape is rebuilt from its source and run again (op-pipeline.cjs).
+  const tabId = request.target?.tabId ?? msg.tabId;
+  const recording = activeRecords().some((record) => record.tabId === tabId);
+  const noRepair = params.noRepair === true ? "--no-repair" : recording ? "a playbook record is open on this tab" : undefined;
+  const result = await runWithRepair({ run, playbook, op, args: runArgs, url, noRepair, tabId, ...pipelineContext(request, tabId) });
   if (params.format === undefined) return result;
   return { ...result, value: formatRecords(result.value, params.format, { markdown: op.markdown, args: runArgs }) };
 }
@@ -1646,6 +1659,7 @@ const recordTyped = new Map();
 function pipelineContext(request, tabId) {
   return {
     executeTool: (tool, args) => executeMappedHostTool(request, tool, args, tabId),
+    readCookies: (url) => readDirectCookies(request, url, tabId),
     callExtension: (message) => requestExtensionOrThrow(request, request.tool, message),
     signal: request.signal,
     sleep: (ms) => abortableDelay(ms, request.signal),
@@ -1662,7 +1676,8 @@ async function runHook(msg, request) {
   }
   const context = pipelineContext(request, tabId);
   const capture = await captureHook({ url: params.url, steps: params.steps || [], tabId, ...context });
-  return makeOp({ capture, goal: params.goal, samples: params.samples, typed: params.typed, template: params.template, match: params.match, site: params.site, op: params.op, ...context });
+  const source = { url: params.template, goal: params.goal, ...(params.do ? { do: params.do } : {}), ...(params.match === undefined ? {} : { match: params.match }) };
+  return makeOp({ capture, goal: params.goal, samples: params.samples, typed: params.typed, template: params.template, match: params.match, site: params.site, op: params.op, source, dryRun: params.dryRun === true, ...context });
 }
 
 // Who a command's events belong to. Tab and window commands resolve no tab target, so they go by
@@ -1731,7 +1746,7 @@ async function handleRecordRequest(tool, args, msg, request) {
     if (entries && args.draft !== true) {
       const context = pipelineContext(request, record.tabId);
       hook = await readPage(context)
-        .then((page) => makeOp({ capture: { entries, pageUrl: page.url, pageText: page.text }, typed: recordTyped.get(record.id), match: args.match, site: record.site, op: record.op, ...context }))
+        .then((page) => makeOp({ capture: { entries, pageUrl: page.url, pageText: page.text }, typed: recordTyped.get(record.id), match: args.match, site: record.site, op: record.op, source: { url: page.url, ...(args.match === undefined ? {} : { match: args.match }) }, ...context }))
         .catch((error) => ({ status: "error", exitCode: 1, error: error.message }));
       // A weak pick, or a --match that holds no request, leaves the record open to pick again.
       if (hook.status === "weak") return { record: { id: record.id, status: record.status }, hook };
@@ -1876,6 +1891,23 @@ async function truncatePageTextResult(context, request, output) {
   return { ...output, text: cut.text, truncated: cut.truncated };
 }
 
+const savedOpsNotice = createSavedOpsNotice();
+
+// The saved ops for the site a CLI `go` or `tab.switch` lands on, the first time its session lands there.
+async function savedOpsFor(request, output) {
+  if (request?.savedOpsCwd === undefined) return null;
+  try {
+    return await savedOpsNotice({
+      session: request.target?.session || request.callerSession,
+      cwd: request.savedOpsCwd,
+      pageUrl: async () => (request.tool === "navigate" ? (await inspectBrowserTab(request, request.target?.tabId)).url : output?.url),
+    });
+  } catch (error) {
+    log(`Saved ops lookup failed: ${error.message}`);
+    return null;
+  }
+}
+
 function sendToolResponse(socket, id, result, error) {
   const context = socketContexts.get(socket);
   if (context && !sessionManager.canRespond(context, id)) return;
@@ -1926,6 +1958,7 @@ function sendToolResponse(socket, id, result, error) {
     }
     await cleanupRequestTransfers(request);
     if (request?.settled) return;
+    const savedOps = finalError || request?.signal.aborted ? null : await savedOpsFor(request, output);
     const outcome = request?.signal.aborted
       ? (request.tombstoned ? "cleanup-settled" : "cancelled")
       : finalError ? "error" : "completed";
@@ -1948,6 +1981,7 @@ function sendToolResponse(socket, id, result, error) {
     }
     if (request?.notice) response.notice = request.notice;
     if (pageChanges) response.pageChanges = pageChanges;
+    if (savedOps) response.savedOps = savedOps;
     if (formattedError) response.error = formattedError;
     else {
       response.result = { content: formatToolContent(output, log) };
@@ -1956,7 +1990,21 @@ function sendToolResponse(socket, id, result, error) {
         response.result.tabId = output.tabId;
       }
     }
-    if (!context?.closed) await sendSocket(socket, response);
+    if (!context?.closed) {
+      await sendSocket(socket, response).catch((sendError) => {
+        if (sendError.code !== "FRAME_TOO_LARGE") throw sendError;
+        // Too large for one frame: the CLI gets an error now instead of waiting out its timeout.
+        const { result: _result, truncated: _truncated, ...rest } = response;
+        // An op's --fields and --limit trim in the CLI, after the result arrives, so they can't help
+        // here; with --each, --limit caps the runs in the host and does.
+        const extract = "or narrow the op's extract (records, fields) in its file";
+        const less = !request?.tool?.startsWith("playbook.") ? "ask for less"
+          : request.args?.each !== undefined ? `ask for less: fewer --each runs (--limit), fewer --pages, ${extract}`
+          : `--limit and --fields trim it only after it arrives (unless the op takes them as inputs), so ask for less: fewer --pages, ${extract}`;
+        const text = `the result is ${(sendError.bytes / 1e6).toFixed(1)} MB, over the ${MAX_FRAME_BYTES / 1024 / 1024} MiB the host can send the CLI; ${less}`;
+        return sendSocket(socket, { ...rest, error: { content: [{ type: "text", text }] } });
+      });
+    }
   })().catch((sendError) => log(`Error sending tool_response: ${sendError.message}`));
 }
 
@@ -2050,6 +2098,10 @@ function handleToolRequest(msg, socket, requestContext = requestStorage.getStore
 
   requestContext.args = args || {};
   requestContext.activityStartedAt = new Date().toISOString();
+  if (msg.savedOps && ["navigate", "tab.switch"].includes(tool)) {
+    const projectDir = msg.savedOps.projectDir;
+    requestContext.savedOpsCwd = requestContext.context?.isRemote || typeof projectDir !== "string" ? process.cwd() : projectDir;
+  }
   if (!tool.startsWith("playbook.")) journalCommand(tool, args || {}, { tabId });
   if (tool.startsWith("session.")) {
     handleBrowserSessionCommand(tool, args || {}, requestContext)

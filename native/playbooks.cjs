@@ -130,7 +130,8 @@ function validateStrategy(strategy, effect, opId) {
 }
 
 // The op file's flat keys (README "Ops"); safety, auth, origins, markdown and provenance as for run ops.
-const FLAT_KEYS = new Set(["id", "description", "effect", "args", "request", "open", "steps", "extract", "page", "expect", "chain", "safety", "auth", "origins", "markdown", "provenance"]);
+const FLAT_KEYS = new Set(["id", "description", "effect", "args", "request", "open", "steps", "extract", "page", "expect", "chain", "source", "safety", "auth", "origins", "markdown", "provenance"]);
+const CHAIN_STEP_KEYS = new Set(["id", "op", "with", "each", "limit", "delayMs"]);
 const isObject = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
 
 function validateRequest(request, id, effect) {
@@ -154,7 +155,7 @@ function validateFlatOp(value, id, effect) {
   if (value.open !== undefined && (typeof value.open !== "string" || !value.open)) throw new Error(`op ${id} open must be a URL`);
   if (value.steps !== undefined) {
     if (value.open === undefined) throw new Error(`op ${id} steps run on the page it opens, so they need open`);
-    const steps = typeof value.steps === "string" ? parseDoCommands(value.steps) : value.steps;
+    const steps = typeof value.steps === "string" ? parseDoCommands(value.steps, { checkClicks: false }) : value.steps;
     if (!Array.isArray(steps)) throw new Error(`op ${id} steps must be surf do steps`);
     op.steps = steps.map(normalizeStep);
   }
@@ -173,25 +174,38 @@ function validateFlatOp(value, id, effect) {
     }
     if (fields !== undefined && (!Array.isArray(fields) || !fields.every((name) => typeof name === "string"))) throw new Error(`op ${id} expect.fields must be a list of field names`);
   }
+  // What `surf hook` was given (url, goal, do, match), which self-repair runs again.
+  if (value.source !== undefined && !(isObject(value.source) && typeof value.source.url === "string")) throw new Error(`op ${id} source must be { url, goal?, do?, match? }`);
   if (value.chain !== undefined && (!Array.isArray(value.chain) || !value.chain.every((step) => isObject(step) && typeof step.id === "string" && typeof step.op === "string"))) {
     throw new Error(`op ${id} chain must be a list of { id, op } steps`);
+  }
+  for (const step of value.chain || []) {
+    const extra = Object.keys(step).find((key) => !CHAIN_STEP_KEYS.has(key));
+    if (extra) throw new Error(`op ${id} chain step ${step.id} has unknown key "${extra}" (it takes ${[...CHAIN_STEP_KEYS].join(", ")})`);
+    if (step.with !== undefined && !isObject(step.with)) throw new Error(`op ${id} chain step ${step.id} with must be an object`);
   }
   return op;
 }
 
+// A flat write without `safety`: needs --write, and the same inputs are blocked 5 minutes after a send.
+const DEFAULT_GUARD = { authorization: "explicit", duplicate: "repeatable-window", windowMs: 5 * 60 * 1000 };
+
 function validateOp(value, manifest) {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("playbook op must be an object");
   const id = assertId(value.id, "op id");
-  const effect = value.effect || "read";
-  if (effect !== "read" && effect !== "write") throw new Error(`op ${id} effect must be read or write`);
   const kinds = ["request", "open", "chain", "run"].filter((key) => value[key] !== undefined);
   const flat = kinds.length > 0 && !kinds.includes("run");
+  // A flat op that doesn't say is a write when its request is not a GET or HEAD.
+  const sends = flat && isObject(value.request) && !["GET", "HEAD"].includes(String(value.request.method || "GET").toUpperCase());
+  const effect = value.effect || (sends ? "write" : "read");
+  if (effect !== "read" && effect !== "write") throw new Error(`op ${id} effect must be read or write`);
   if (kinds.length === 0 || (kinds.includes("run") && kinds.length > 1) || (kinds.includes("chain") && kinds.length > 1)) {
     throw new Error(`op ${id} needs one of request, open, chain or run (request and open may go together)`);
   }
   if (!flat && (!Array.isArray(value.run) || value.run.length === 0)) throw new Error(`op ${id} requires at least one strategy`);
   let safety = value.safety;
-  if (effect === "write") {
+  if (effect === "write" && flat && safety === undefined) safety = { ...DEFAULT_GUARD };
+  else if (effect === "write") {
     if (!value.safety || !["transactional", "repeatable-window"].includes(value.safety.duplicate)) throw new Error(`write op ${id} requires duplicate safety`);
     if (!Array.isArray(value.safety.key) || value.safety.key.length === 0) throw new Error(`write op ${id} requires a semantic safety key`);
     safety = { ...value.safety, authorization: value.safety.authorization || "explicit" };
@@ -269,6 +283,18 @@ function listPlaybooks(options = {}) {
   return [...found.values()];
 }
 
+const originOf = (url) => (URL.canParse(url) ? [new URL(url).origin] : []);
+
+/** The ops of user and project playbooks, each with its inputs and the origins it runs on (its playbook's, its request's or open URL's). */
+function savedOps(options = {}) {
+  return listPlaybooks(options).filter(({ scope }) => scope !== "built-in").flatMap(({ id }) => [...resolvePlaybook(id, options).ops.values()].map((op) => ({
+    playbook: id,
+    op: op.id,
+    inputs: Object.keys(op.args || {}),
+    origins: [...(op.origins || []), ...originOf(op.request?.url), ...originOf(op.open)],
+  })));
+}
+
 function resolveOp(playbookId, opId, options = {}) {
   const playbook = resolvePlaybook(playbookId, options);
   const op = playbook.ops.get(opId);
@@ -322,5 +348,6 @@ module.exports = {
   resolveOp,
   resolvePlaybook,
   savePlaybook,
+  savedOps,
   validateOp,
 };

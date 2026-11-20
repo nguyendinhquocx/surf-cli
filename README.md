@@ -998,8 +998,8 @@ surf pb show page
 surf pb ops page
 surf use page read --json
 
-# Write ops require explicit authorization and a durable duplicate-safety receipt.
-surf use <site> <write-op> --write --resource-id 123
+# A write needs --write; the same op and inputs are blocked 5 minutes after a send (--repeat sends).
+surf use httpbin order --custname Ada --write
 ```
 
 #### Ops
@@ -1030,14 +1030,37 @@ surf pb test books                             # run each op with its examples, 
 | Key | Meaning |
 |---|---|
 | `args` | Inputs: `{ "<name>": { "default"?, "required"?, "example"?, "desc"? } }`. `pb test` uses `example`. |
-| `request` | `{ "method"?, "url", "query"?, "headers"?, "body"? }`. Strings take `{{input}}` and `{{env.NAME}}` (from the shell that runs `surf use`). An object body is sent as JSON, or as a form with a form `content-type`. The tab opens the op's site if it is elsewhere and sends the request with the browser's cookies. |
+| `request` | `{ "method"?, "url", "query"?, "headers"?, "body"? }`. Strings take `{{input}}` and `{{env.NAME}}` (from the shell that runs `surf use`). An object body is sent as JSON, or as a form with a form `content-type`. A read goes first from surf itself with the browser's cookies for that URL (read through the extension for that one request, never saved), then, on an error, no answer in 15 s, a redirect, a status of 400 or more, a 200 page with no records or a failed `expect`, from the tab (always the tab for an incognito session tab), which opens the op's site if it is elsewhere. A write goes from the tab only. |
 | `open`, `steps` | A page to open and `surf do` steps to run there (`"click e3 \| wait.element .results"`); the rendered HTML is read. Used with no `request`, or when the request fails. |
-| `extract` | `{ "in"?, "records"?, "fields"? }`. JSON: `records` is a path (`$.data.items`), a field is a path (`author.name`, `links[0].href`, `a ?? b`). HTML: `records` is a selector, a field is `selector`, `selector@attr`, `selector[]` (every match) or `:scope`, or `{ "selector", "match" }` to keep one regex group; `href` and `src` come back absolute. `in` reads JSON the page embeds: a script selector (`script#__NEXT_DATA__`), `ld+json:<Type>` or `js:<name>` (`var data = [...]`). No `records`: one record from the whole response. |
+| `extract` | `{ "in"?, "records"?, "fields"? }`. JSON: `records` is a path (`$.data.items`), a field is a path (`author.name`, `links[0].href`, `a ?? b`). HTML: `records` is a selector, a field is `selector`, `selector@attr`, `selector[]` (every match) or `:scope`, `+ dd .title` reads in the record's next sibling when it is a `dd` (a `dl` of `dt`/`dd` pairs, records `dl > dt`), or `{ "selector", "match" }` to keep one regex group; `href` and `src` come back absolute. `in` reads JSON the page embeds: a script selector (`script#__NEXT_DATA__`), `ld+json:<Type>` or `js:<name>` (`var data = [...]`). No `records`: one record from the whole response. |
 | `page` | `{ "into"?, "next" }`: `"+1"` adds to the input `into`; a path or selector gives the next value of `into`, or with no `into`, the next URL. `--pages <n>` follows it (default 1, at most 100, 1 s apart); it stops at a failed page or one that repeats the last request, keeping what it read. |
 | `expect` | `{ "status"?, "minItems"?, "fields"? }`, checked on every run; `fields` must be in the first record. |
-| `effect` | `"write"` for an op that changes data; it needs `--write` and a `safety` key as other writes do. |
+| `effect` | `"write"` for an op that changes data. Left out: a write when `request.method` is not GET or HEAD, else a read; a POST that only searches says `"read"`. A write needs `--write` (without it surf names the method and URL and sends nothing) and is sent once, one way: `request` from the tab, or else `open` + `steps`, with no fallback or retry. The same op with the same inputs is blocked for 5 minutes after a send, and after a send whose outcome is unknown, until `--repeat`; the guard keeps a salted hash, no input value. |
+| `chain` | Steps that run other ops of the playbook, in place of `request` (below). |
 
-Selectors cover tag, `#id`, `.class`, `[attr]`, `[attr="v"]`, `:nth-child(n)`, descendant and `>`. `--url <u>` runs the op on another URL of its site; a URL or next link on another site is refused. `--json` says which step answered (`"via": "tab"` or `"page"`). An op with a `run` list works as before. Reading HTML needs Node 20.19 or 22.12 or later.
+Selectors cover tag, `#id`, `.class`, `[attr]`, `[attr="v"]`, `:nth-child(n)`, descendant and `>`. `--url <u>` runs the op on another URL of its site; a URL or next link on another site is refused. `--json` says which step answered (`"via": "direct"`, `"tab"`, `"page"` or `"chain"`); `--dry-run` shows the request and the steps it would try. An op with a `run` list works as before. Reading HTML needs Node 20.19 or 22.12 or later.
+
+#### Chains, `--each` and filters
+
+```json
+{
+  "id": "books_with_details",
+  "args": { "pages": { "default": 2 }, "limit": { "default": 5 } },
+  "chain": [
+    { "id": "list", "op": "list_books", "with": { "pages": "{{pages}}" } },
+    { "id": "book", "op": "get_book", "each": "list", "limit": "{{limit}}", "with": { "url": "{{item.url}}" } }
+  ]
+}
+```
+
+Each step runs an op of the same playbook; `with` gives its inputs (and may set `url` and `pages`) as templates: `{{input}}`, `{{item.<path>}}` (the record an `each` step runs for) or `{{<step>.<path>}}` (an earlier step's result). `each` loops over a step's records, `limit` of them (default 10), each 1 s after the request before it (`delayMs`, or `--delay-ms <n>` with `--each`); the chain returns the last step's records. A run makes at most 100 op runs. A chain with a write step, or `--each` over a write, needs `--write`, and each send has its own duplicate guard. Without a file:
+
+```bash
+surf use books get_book --each list_books:url --pages 2 --limit 5   # url fills --url; field=input names another input
+surf use books list_books --where star_rating~=Five --fields title,price_color --limit 3   # field names as surf hook saves them (below)
+```
+
+`--where field=value` (also `!=`, and `~=` for contains, any case; repeatable; dotted fields read nested ones), `--fields a,b.c` and `--limit n` trim the records in the CLI after the run, with a `filter: { where, fields, limit, before, after }` summary; an unknown field fails and lists the fields. They don't combine with `--format` or `--dry-run`. With `--each`, `--limit` caps the records looped over instead (10 by default), and a relative `url` resolves on the list op's site. `pb test` takes them too, for what it prints; `expect` still checks the whole result.
 
 #### Make an op with `surf hook`
 
@@ -1050,16 +1073,25 @@ picked   GET https://books.toscrape.com/catalogue/page-2.html   HTML document
 inputs   --page (default 2)
 extract  article.product_pod → title, url, star_rating, price_color
 paging   --pages: page +1
-test     tab ✓ 20 records; title, url present
+test     direct ✓ 20 records; title, url present
 saved    ~/.surf/playbooks/books/ops/list_books.json
 run      surf use books list_books --page 2
 ```
 
 - `{{name}}` in the URL or a `--do` step (`--do 'type "{{query}}" --into "#q" | key Enter' --query einstein`), with `--name <sample>`, becomes an input where that value sits in the request. A search key becomes `query`, a page key or `page-N` segment `page`, an id in the path `<word before>_id`.
 - The pick scores each request: same site, a JSON list of objects, the page's own document, share of the page's words, sent after the `--do` steps, a word of the goal. Exit 2 when the best leads by under 3 points: it prints the top 3 and a rerun line with `--match <url-part>`.
-- Exit 1 on an error or when the pick is a write (not GET or HEAD): it prints the draft op and saves nothing. `surf hook` saves reads only.
-- `--as <site>/<op>` names it; the default is the host name and `get_` with the goal's first three words.
+- A pick that is not GET or HEAD is saved as a write, untested (`test     not run: the --do steps sent it once; …`), with its extract read from the captured response; its run line ends in `--write`. A secret-named body or query field (`password`, `token`, `secret`, `api_key`, `csrf`…) becomes a required input with no stored value.
+- Exit 1 on an error: it prints the draft op and saves nothing.
+- `--as <site>/<op>` names it; the default is the host name and `get_` with the goal's first three words. An op already there is kept as `<op>.json.bak`, and the output says so: `replaced books list_books (the old op is list_books.json.bak)`. There is one `.bak`: the line adds `; the older .bak is overwritten` when one was there.
+- `--dry-run` opens the page, picks, names the inputs and tests as usual, then prints the op instead of saving it.
+- A `surf use` option (`--format`, `--fields`, `--where`, `--limit`, `--pages`, `--write`…) is refused before anything opens, unless the URL or a `--do` step writes it as `{{name}}`, or the op `--as` names already has that input.
 - `surf pb record start <site> --op <name>` captures network requests by default (`--no-network` turns it off), and `surf pb record stop` makes the op the same way from what you did, values you typed included. On a weak pick the record keeps recording: `stop --match <url-part>` picks. `--draft` only drafts, as before.
+
+#### Self-repair and the saved-ops hint
+
+An op made by `surf hook` or `pb record stop` keeps what made it in `source` (`url`, `goal`, and `do` and `match` when given). When such a read later gets an answer without its records, or a 404 or 410, on its last step and again with its saved sample inputs (so an empty search or a page past the end changes nothing), `surf use` runs the hook pipeline again on `source` with those samples. It keeps the op's input names, `expect` and the names of fields whose selector still reads them, saves the new op only if it passes `expect`, keeps the old file as `<op>.json.bak`, prints one line on stderr (`repaired books list_books: records article.product_pod → article.product_card; fields +price_now`), and answers the call. If the rebuild fails, the run fails as before and prints the `surf hook` command to rebuild it. A 401, 403, 429, 5xx or network error, a write, a call with `--url`, or `--no-repair` never repairs, and a `--do` that types a value that is no input saves no `source`; `pb test` reports a repair and takes `--no-repair` too.
+
+When `go`, `navigate` or `tab.switch` lands on a site your playbooks have ops for, surf prints them once per session and site, up to five: `saved: books get_book --catalogue_id, list_books --page`. `--json` carries them as `savedOps`.
 
 Playbook read ops can also use a trusted `script` strategy when fixed JSON steps are too rigid. Scripts require `--allow-script` at run time. Only run scripts from playbooks you trust. This is not a security sandbox.
 

@@ -34,7 +34,8 @@ const {
   formatOracleOutput,
   handleOracleCli,
 } = require("./oracle-cli.cjs");
-const { formatPlaybookOutput, handlePlaybookCli } = require("./playbook-cli.cjs");
+const { formatPlaybookOutput, handlePlaybookCli, opHelp } = require("./playbook-cli.cjs");
+const { formatSavedOps } = require("./saved-ops-notice.cjs");
 const { handleHookCli } = require("./hook-cli.cjs");
 const { editDistance } = require("./edit-distance.cjs");
 const { formatGlobalOptions } = require("./global-options.cjs");
@@ -269,6 +270,7 @@ if (["playbook", "pb", "use"].includes(args[0]) && !helpRequested()) {
     })
     .catch((error) => {
       console.error(`Error: ${error.message}`);
+      if (error.hostError && args.includes("--json")) console.log(hostErrorJson(error.hostError));
       process.exit(1);
     });
   return;
@@ -329,6 +331,10 @@ const REMOVED_COMMANDS = {
   triple_click: "click --button triple",
   left_click_drag: "drag",
 };
+
+// `surf --find` words that lead to hook and use; a command named by the word still ranks first.
+const HOOK_KEYWORDS = ["api", "scrape", "extract", "op", "playbook", "save", "reuse"];
+const USE_KEYWORDS = ["api", "op", "playbook", "reuse"];
 
 const TOOLS = {
   session: {
@@ -604,7 +610,7 @@ const TOOLS = {
     desc: "Navigation",
     commands: {
       "navigate": {
-        desc: "Go to URL",
+        desc: "Go to URL; on a site with saved ops, prints them once per session (saved: <site> <op> --<input>, …)",
         args: ["url"],
         examples: [{ cmd: 'navigate "https://example.com"', desc: "Go to URL" }]
       },
@@ -1665,14 +1671,16 @@ const TOOLS = {
     desc: "Reusable site operations: threads, feeds and recorded flows",
     commands: {
       hook: {
-        desc: "Make a tested read op from a page: open it, pick the request with its data, name inputs, infer the extract, test, save",
+        keywords: HOOK_KEYWORDS,
+        desc: "Make a tested read op from a page: open it, pick the request with its data, name inputs, infer the extract, test, save. A picked POST etc. is saved untested as a write",
         args: ["url"],
         opts: {
           goal: "What the op returns, in words (required); its first words name the op",
           do: "surf do steps to run after the page loads, before the pick (clicks, typing)",
-          "<input>": "This run's value of {{input}} in the URL or a --do step, e.g. --page 2; also found in the request",
+          "<input>": "This run's value of {{input}} in the URL or a --do step, e.g. --page 2; also found in the request. A surf use option (--format, --limit, --write…) is refused unless the URL writes it as {{name}}",
           match: "Pick the captured request whose URL holds this text",
-          as: "Save as <site>/<op> (default: the host name and get_ + the goal's first three words)",
+          as: "Save as <site>/<op> (default: the host name and get_ + the goal's first three words); an op already there is kept as <op>.json.bak",
+          "dry-run": "Open the page, pick, name inputs and test as usual, then print the op instead of saving it",
           json: "Output the result as JSON",
         },
         examples: [
@@ -1682,25 +1690,35 @@ const TOOLS = {
         ],
       },
       use: {
+        keywords: USE_KEYWORDS,
         desc: "Run a playbook operation, such as reading a whole X thread",
         args: ["playbook", "op"],
         opts: {
           "<arg>": "Operation input, e.g. --page 2; an input the op doesn't define fails and lists its inputs",
           timeout: "Seconds before the run gives up (default: the op's --timeout, else 600)",
-          format: "md or jsonl instead of JSON",
-          write: "Authorize a write operation",
+          format: "md or jsonl instead of JSON; not with the --where, --fields or --limit filters (--limit with --each is fine)",
+          write: "Send a write (\"effect\": \"write\", or a request that is not GET or HEAD), once, from the tab; without it surf names the method and URL and sends nothing",
           "allow-script": "Allow the playbook's trusted script strategy",
-          repeat: "Repeat a write whose last attempt was verified",
+          repeat: "Send a write again: the same op and inputs are blocked 5 minutes after a send, and after a send whose outcome is unknown",
           "retry-attempt": "Retry this write attempt id",
           "override-in-doubt": "Write again after an indeterminate attempt",
           "pin-built-in": "Use the built-in playbook even if a user or project copy exists",
           url: "Run the op on another URL of its site",
-          pages: "Follow the op's page rule for up to n pages (default 1, max 100)",
-          "dry-run": "Print the request the op would send; send nothing",
-          json: "Output raw JSON",
+          pages: "Follow the op's page rule for up to n pages (default 1, max 100); with --each, the list op's",
+          each: "<list-op>:<field>[=<input>]: run the op once per record of the list op, the field filling the input of its name (url fills --url); a write needs --write, each send guarded",
+          "delay-ms": "With --each: milliseconds before each run, the first too (default 1000)",
+          where: "field=value, field!=value or field~=text (contains, any case); repeatable, all must match; dotted fields read nested ones",
+          fields: "a,b.c: keep only these fields",
+          limit: "Keep the first n records; with --each, loop over the first n (default 10)",
+          "dry-run": "Print the request the op would send and the steps it tries (direct, then tab); send nothing; not with the --where, --fields or --limit filters",
+          "no-repair": "Don't rebuild a hook-made read op whose site changed (a 2xx without records, or a 404/410); fail and print the surf hook command",
+          json: "Output raw JSON; via says which step answered (direct, tab, page or chain)",
         },
         examples: [
           { cmd: "use books list_books --page 2 --pages 3", desc: "Three catalogue pages from a hand-written op" },
+          { cmd: "use books get_book --each list_books:url --limit 3", desc: "The detail op for the first 3 books of the list" },
+          { cmd: "use books list_books --where star_rating~=Five --fields title,price_color", desc: "Five-star books from a hook-made op, title and price only" },
+          { cmd: "use httpbin order --custname Ada --write", desc: "Send a write op; again within 5 minutes needs --repeat" },
           { cmd: "use x thread --url https://x.com/<user>/status/<id> --format md", desc: "Whole X thread as Markdown" },
           { cmd: "use page read --json", desc: "Read the current page" },
         ],
@@ -1713,7 +1731,13 @@ const TOOLS = {
       "playbook test": {
         desc: "Run each read op (or one) with its example inputs and check its expect; exit 1 on a failure",
         args: ["playbook"],
-        opts: { json: "Output raw JSON" },
+        opts: {
+          where: "As with surf use: print the records that match; expect still checks the whole result",
+          fields: "As with surf use: print only these fields",
+          limit: "As with surf use: print the first n records",
+          "no-repair": "As with surf use: report a changed site, don't rebuild the op (a repair is reported on the op's line)",
+          json: "Output raw JSON",
+        },
         examples: [{ cmd: "pb test books list_books", desc: "Test one op" }],
       },
       "playbook suggest": { desc: "Suggest playbooks from recent activity", args: [], opts: { since: "Look-back window (default: 1h)" } },
@@ -2145,6 +2169,8 @@ Common Commands:
   animate-audit      JSON timeline of element animation/style samples
   perf-audit         PerformanceObserver snapshot for motion/jank debugging
   page.read          Get page accessibility tree (alias: read)
+  hook <url> --goal  Make a saved op from a page's data
+  use <site> <op>    Run a saved op; add --help for its inputs
   semantic.find      Optional model-powered candidate selection
   semantic.act       Bounded semantic browser action controller
   semantic.extract   Optional model-powered typed values from the page
@@ -2216,6 +2242,7 @@ Session cleanup: surf session.cleanup --idle-after 1h [--dry-run]
 Recovery: run the exact command printed after Recovery: on tab_gone, session_epoch_stale, tab_busy, or browser_busy
 Concurrency: commands for different session tabs can overlap; each tab remains FIFO; provider flows are browser-exclusive
 Doctor: surf doctor --browser all              # native host/socket diagnostics
+Saved ops: surf hook <url> --goal "<what>" makes one from a page's data; surf use <site> <op> runs it   # --help after it lists its inputs
 Workflow: surf do 'go "https://example.com" | wait 2 | read | click e5 | screenshot'
 More help: surf --help-full | surf <command> --help | surf --help-topic refs | surf --find <query>`);
 };
@@ -2383,15 +2410,19 @@ const fuzzyFind = (query) => {
   for (const [groupName, group] of Object.entries(TOOLS)) {
     for (const [cmd, info] of Object.entries(group.commands)) {
       if (info.alias) continue;
-      const searchText = `${cmd} ${info.desc} ${groupName}`.toLowerCase();
-      const score = terms.filter(t => searchText.includes(t)).length;
+      const keywords = info.keywords || [];
+      const searchText = `${cmd} ${info.desc} ${groupName} ${keywords.join(" ")}`.toLowerCase();
+      // A term that is a whole part of the name or the group counts twice (`save` -> page.save); among
+      // equal scores a whole keyword goes first, so `op` lists hook and use before names that only hold the letters.
+      const parts = [...cmd.split(/[.\s]/), groupName];
+      const score = terms.filter(t => searchText.includes(t)).length + terms.filter(t => parts.includes(t)).length;
       if (score > 0) {
-        results.push({ cmd, desc: info.desc, group: groupName, score });
+        results.push({ cmd, desc: info.desc, group: groupName, score, keyword: terms.filter(t => keywords.includes(t)).length });
       }
     }
   }
 
-  return results.sort((a, b) => b.score - a.score);
+  return results.sort((a, b) => b.score - a.score || b.keyword - a.keyword);
 };
 
 const showFindResults = (query) => {
@@ -2597,6 +2628,14 @@ if (args.includes("--help") || args.includes("-h")) {
   const words = [args[0] === "pb" ? "playbook" : args[0], ...args.slice(1).filter((arg) => !arg.startsWith("-"))];
   const isCommand = (name) => Object.values(TOOLS).some((group) => group.commands[name]);
   const subcommand = [words.slice(0, 3), words.slice(0, 2)].filter((w) => w.length > 1).map((w) => w.join(" ")).find(isCommand);
+  if (args[0] === "use") {
+    try {
+      const help = opHelp(args);
+      if (help) console.log(`\n${help}`);
+    } catch (error) {
+      console.error(error.message);
+    }
+  }
   if (subcommand) showToolHelp(subcommand);
   // A command that shares its group's name (network, ai, upload) shows its own help; `surf <group>` shows the group.
   else if (TOOLS[words[0]] && !isCommand(words[0])) showGroupHelp(words[0]);
@@ -4076,6 +4115,8 @@ const request = {
   params: { tool: finalTool, args: toolArgs },
   id: "cli-" + Date.now(),
   ...globalOpts,
+  // The host answers with the saved ops, this project's too, for the site the tab lands on.
+  ...(["navigate", "tab.switch"].includes(finalTool) ? { savedOps: { projectDir: process.cwd() } } : {}),
 };
 
 const sendRequest = async (toolName, toolArgs = {}, timeoutMs = 5000) => {
@@ -4417,6 +4458,21 @@ function queueSummary(queue) {
   return pieces.join(" ");
 }
 
+// --json: a host tool-response error as {"error":{"code","message","details"?}} for stdout.
+function hostErrorJson(error) {
+  const text = error.content?.[0]?.text || JSON.stringify(error);
+  // details repeats code/message when the error serialises itself; keep the rest.
+  const { code: _code, message: _message, ...details } =
+    error.details && typeof error.details === "object" ? error.details : {};
+  return JSON.stringify({
+    error: {
+      code: typeof error.code === "string" ? error.code : "error",
+      message: typeof error.message === "string" ? error.message : text.split("\n")[0],
+      ...(Object.keys(details).length > 0 ? { details } : {}),
+    },
+  }, null, 2);
+}
+
 async function handleResponse(response) {
   clearTimeout(timeout);
   printResponseContext(response);
@@ -4435,18 +4491,7 @@ async function handleResponse(response) {
       ? [`${firstLine} [${errorCode}]`, ...restLines].join("\n")
       : errContent;
     console.error("Error:", display);
-    if (wantJson) {
-      // details repeats code/message when the error serialises itself; keep the rest.
-      const { code: _code, message: _message, ...details } =
-        response.error.details && typeof response.error.details === "object" ? response.error.details : {};
-      console.log(JSON.stringify({
-        error: {
-          code: errorCode || "error",
-          message: typeof response.error.message === "string" ? response.error.message : firstLine,
-          ...(Object.keys(details).length > 0 ? { details } : {}),
-        },
-      }, null, 2));
-    }
+    if (wantJson) console.log(hostErrorJson(response.error));
 
     if (autoCapture) {
       await performAutoCapture();
@@ -4496,13 +4541,14 @@ async function handleResponse(response) {
   }
 
   if (wantJson) {
-    const output = response.target || response.notice || response.truncated || response.pageChanges
+    const output = response.target || response.notice || response.truncated || response.pageChanges || response.savedOps
       ? {
         result: data ?? null,
         target: response.target || null,
         notice: response.notice || null,
         ...(response.truncated ? { truncated: response.truncated } : {}),
         ...(response.pageChanges ? { pageChanges: response.pageChanges } : {}),
+        ...(response.savedOps ? { savedOps: response.savedOps } : {}),
       }
       : data ?? null;
     console.log(JSON.stringify(output, null, 2));
@@ -4906,6 +4952,7 @@ async function handleResponse(response) {
     console.log(JSON.stringify(data, null, 2));
   }
   if (pageChangeLines.length > 0 && typeof data !== "string") console.log(pageChangeLines.join("\n"));
+  if (response.savedOps) console.log(formatSavedOps(response.savedOps));
 
   socket.end();
   process.exit(0);

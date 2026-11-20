@@ -3,7 +3,8 @@ const { openClientTransport } = require("./client-transport.cjs");
 const { resolveRequestDeadlineMs } = require("./host-sessions.cjs");
 const { exportRecordHar, saveFromRecent, saveFromRecord, suggestions } = require("./playbook-authoring.cjs");
 const { deriveClient, exportClient, verifyClient } = require("./playbook-client.cjs");
-const { exportPlaybookDirectory, importPlaybookDirectory, listPlaybooks, resolvePlaybook } = require("./playbooks.cjs");
+const { exportPlaybookDirectory, importPlaybookDirectory, listPlaybooks, resolveOp, resolvePlaybook } = require("./playbooks.cjs");
+const { applyFilter, collectFilterFlags, filterText, takeRunFilter } = require("./record-filter.cjs");
 
 function parseCommandArgs(argv) {
   const positional = [];
@@ -26,7 +27,8 @@ function parseCommandArgs(argv) {
 }
 
 function unwrapResponse(response) {
-  if (response.error) throw new Error(response.error.content?.[0]?.text || JSON.stringify(response.error));
+  // hostError lets the CLI print the error as JSON with --json.
+  if (response.error) throw Object.assign(new Error(response.error.content?.[0]?.text || JSON.stringify(response.error)), { hostError: response.error });
   const text = response.result?.content?.[0]?.text;
   if (text === undefined) return response.result;
   try { return JSON.parse(text); } catch { return text; }
@@ -54,17 +56,21 @@ function runSpec(argv) {
   const parsed = parseCommandArgs(argv.slice(offset));
   const [playbook, op] = parsed.positional;
   if (!playbook || !op) throw new Error(direct ? "Usage: surf use <playbook> <op> [--arg value]" : "Usage: surf pb run <playbook> <op> [--arg value]");
-  const reserved = new Set(["json", "no-lock", "no-wait", "session", "tab-id", "write", "repeat", "retry-attempt", "override-in-doubt", "pin-built-in", "allow-script", "format", "dry-run"]);
+  const reserved = new Set(["json", "no-lock", "no-wait", "session", "tab-id", "write", "repeat", "retry-attempt", "override-in-doubt", "pin-built-in", "allow-script", "format", "dry-run", "no-repair", "each", "delay-ms"]);
   const args = Object.fromEntries(Object.entries(parsed.options).filter(([name]) => !reserved.has(name)));
-  return { playbook, op, args, options: parsed.options };
+  return { playbook, op, args, options: parsed.options, filterFlags: collectFilterFlags(argv.slice(offset)) };
 }
 
-// The op as this machine sees it, for its timeout and env names; the host resolves it again.
-function localOp(spec, cwd) {
+// The ops a run reaches, as this machine sees them, for the timeout, env names and filters; the
+// host resolves them again. A chain or --each may reach any op of the playbook.
+function localOps(spec, cwd) {
   try {
-    return resolvePlaybook(spec.playbook, { cwd, pinBuiltIn: spec.options["pin-built-in"] === true }).ops.get(spec.op);
+    const playbook = resolvePlaybook(spec.playbook, { cwd, pinBuiltIn: spec.options["pin-built-in"] === true });
+    const op = playbook.ops.get(spec.op);
+    const list = spec.options.each && playbook.ops.get(String(spec.options.each).split(":")[0]);
+    return { op, filtered: [op, list].filter(Boolean), reached: op?.chain || list ? [...playbook.ops.values()] : [op] };
   } catch {
-    return undefined;
+    return { filtered: [], reached: [] };
   }
 }
 
@@ -76,13 +82,13 @@ function resolveRunTimeout(spec, op) {
 }
 
 // `{{env.NAME}}` reads the caller's environment, so the CLI sends the values the op names.
-function opEnv(op) {
-  const names = [...JSON.stringify(op || {}).matchAll(/\{\{env\.([a-zA-Z0-9._-]+)\}\}/g)].map((match) => match[1]);
+function opEnv(ops) {
+  const names = [...JSON.stringify(ops).matchAll(/\{\{env\.([a-zA-Z0-9._-]+)\}\}/g)].map((match) => match[1]);
   return Object.fromEntries(names.filter((name) => process.env[name] !== undefined).map((name) => [name, process.env[name]]));
 }
 
 function runRequest(spec, endpoint, { cwd, session, sessionSource, admission }) {
-  const op = localOp(spec, cwd);
+  const { op, reached } = localOps(spec, cwd);
   const timeout = resolveRunTimeout(spec, op);
   const format = spec.options.format;
   const args = {
@@ -98,7 +104,10 @@ function runRequest(spec, endpoint, { cwd, session, sessionSource, admission }) 
     pinBuiltIn: spec.options["pin-built-in"] === true,
     allowScript: spec.options["allow-script"] === true,
     dryRun: spec.options["dry-run"] === true,
-    env: opEnv(op),
+    noRepair: spec.options["no-repair"] === true,
+    env: opEnv(reached),
+    ...(spec.options.each === undefined ? {} : { each: String(spec.options.each) }),
+    ...(spec.options["delay-ms"] === undefined ? {} : { delayMs: spec.options["delay-ms"] }),
     ...(format ? { format } : {}),
   };
   return requestHost(endpoint, "playbook.run", args, {
@@ -111,25 +120,54 @@ function runRequest(spec, endpoint, { cwd, session, sessionSource, admission }) 
 }
 
 // pb test: each read op with its example inputs; the run checks the op's expect. Writes are skipped.
-async function testPlaybook(siteId, opId, context) {
+// A filter trims the records printed, after the check.
+async function testPlaybook(siteId, opId, context, flags) {
   const playbook = resolvePlaybook(siteId, { cwd: context.cwd });
   if (opId && !playbook.ops.has(opId)) throw new Error(`Op not found: ${siteId} ${opId}`);
+  const tested = opId ? [playbook.ops.get(opId)] : [...playbook.ops.values()];
+  const filter = takeRunFilter({ flags, args: {}, ops: tested });
   const results = [];
-  for (const op of opId ? [playbook.ops.get(opId)] : playbook.ops.values()) {
+  for (const op of tested) {
     if (op.effect === "write") {
       results.push({ op: op.id, status: "skip", detail: "a write; pb test sends no writes" });
       continue;
     }
     const args = Object.fromEntries(Object.entries(op.args || {}).filter(([, spec]) => spec.example !== undefined).map(([name, spec]) => [name, spec.example]));
+    let run;
     try {
-      const run = await runRequest({ playbook: siteId, op: op.id, args, options: {} }, context.endpoint, context);
-      const count = Array.isArray(run.value) ? `${run.value.length} records` : "1 value";
-      results.push({ op: op.id, status: "pass", detail: `${count} via ${run.via || run.strategy}` });
+      run = await runRequest({ playbook: siteId, op: op.id, args, options: { "no-repair": context.noRepair } }, context.endpoint, context);
     } catch (error) {
       results.push({ op: op.id, status: "fail", detail: error.message });
+      continue;
     }
+    const count = Array.isArray(run.value) ? `${run.value.length} records` : "1 value";
+    results.push({ op: op.id, status: "pass", detail: `${count} via ${run.via || run.strategy}${run.repaired ? `; ${run.repaired}` : ""}`, ...(filter ? filterRun(run.value, filter) : {}) });
   }
   return results;
+}
+
+// The filter only trims what pb test prints, so a field one op lacks is a note, not a failure.
+function filterRun(value, filter) {
+  try {
+    return applyFilter(value, filter);
+  } catch (error) {
+    return { filterError: error.message };
+  }
+}
+
+// `--page (default 2)` or `--q (required)`: an op input as help and pb ops show it. An empty or null
+// default shows as optional; a default that is not a string or number as JSON.
+const shownDefault = (value) => (typeof value === "string" || typeof value === "number" ? String(value) : JSON.stringify(value));
+const inputLabel = ([name, spec]) => `--${name} (${spec.required ? "required" : [undefined, null, ""].includes(spec.default) ? "optional" : `default ${shownDefault(spec.default)}`})`;
+
+/** `surf use <playbook> <op> --help`: the op's description, effect and inputs; null without an op name. Throws when the op is missing. */
+function opHelp(argv, { cwd = process.cwd() } = {}) {
+  const { positional, options } = parseCommandArgs(argv.slice(1).filter((arg) => arg !== "--help" && arg !== "-h"));
+  const [playbookId, opId] = positional;
+  if (!opId) return null;
+  const { op } = resolveOp(playbookId, opId, { cwd, pinBuiltIn: options["pin-built-in"] === true });
+  const inputs = Object.entries(op.args || {}).map((input) => (input[1].desc ? `  ${inputLabel(input).padEnd(20)} ${input[1].desc}` : `  ${inputLabel(input)}`));
+  return [`${playbookId} ${opId}${op.description ? ` - ${op.description}` : ""} (${op.effect})`, "", "Inputs:", ...(inputs.length ? inputs : ["  none"])].join("\n");
 }
 
 function playbookCommandNeedsBrowser(argv) {
@@ -145,10 +183,15 @@ async function handlePlaybookCli(argv, { endpoint, cwd = process.cwd(), session,
     const spec = runSpec(argv);
     const format = spec.options.format;
     if (format !== undefined && format !== "md" && format !== "jsonl") throw new Error("--format must be md or jsonl");
+    // Takes the filter flags the ops don't name as inputs out of spec.args.
+    const filter = takeRunFilter({ flags: spec.filterFlags, args: spec.args, ops: localOps(spec, cwd).filtered, each: spec.options.each });
+    if (filter && (format || spec.options["dry-run"] === true)) throw new Error("--where, --fields and --limit filter a run's JSON records; they don't combine with --format or --dry-run");
     const value = await runRequest(spec, endpoint, { cwd, session, sessionSource, admission });
-    // With --format the host returns the rendered records as the value.
-    if (format && !value.dryRun) return { handled: true, value: value.value, json: false };
-    return { handled: true, value, json: spec.options.json === true || value.dryRun === true };
+    // A repair's one line goes to stderr. With --format the host returns the rendered records as the value.
+    const repaired = value.repaired ? { stderr: value.repaired } : {};
+    if (format && !value.dryRun) return { handled: true, value: value.value, json: false, ...repaired };
+    const filtered = filter && Object.hasOwn(value, "value") ? { ...value, ...applyFilter(value.value, filter) } : value;
+    return { handled: true, value: filtered, json: spec.options.json === true || value.dryRun === true, ...repaired };
   }
   const command = argv[1];
   const parsed = parseCommandArgs(argv.slice(2));
@@ -161,14 +204,16 @@ async function handlePlaybookCli(argv, { endpoint, cwd = process.cwd(), session,
   }
   if (command === "ops") {
     const playbook = resolvePlaybook(parsed.positional[0], { cwd });
-    return { handled: true, value: [...playbook.ops.values()].map((op) => ({ id: op.id, description: op.description || "", effect: op.effect, strategies: op.run ? op.run.map((strategy) => strategy.using) : ["request", "open", "chain"].filter((key) => op[key]) })), json: parsed.options.json === true };
+    return { handled: true, value: [...playbook.ops.values()].map((op) => ({ id: op.id, description: op.description || "", effect: op.effect, inputs: Object.entries(op.args || {}).map(inputLabel), strategies: op.run ? op.run.map((strategy) => strategy.using) : ["request", "open", "chain"].filter((key) => op[key]) })), json: parsed.options.json === true };
   }
   if (command === "test") {
-    if (!parsed.positional[0]) throw new Error("Usage: surf pb test <playbook> [<op>]");
-    const results = await testPlaybook(parsed.positional[0], parsed.positional[1], { endpoint, cwd, session, sessionSource, admission });
+    if (!parsed.positional[0]) throw new Error("Usage: surf pb test <playbook> [<op>] [--no-repair]");
+    const results = await testPlaybook(parsed.positional[0], parsed.positional[1], { endpoint, cwd, session, sessionSource, admission, noRepair: parsed.options["no-repair"] === true }, collectFilterFlags(argv.slice(2)));
     const exitCode = results.some((result) => result.status === "fail") ? 1 : 0;
     const width = Math.max(...results.map((result) => result.op.length));
-    const text = results.map((result) => `${result.status.padEnd(4)}  ${result.op.padEnd(width)}  ${result.detail}`).join("\n");
+    const line = (result) => `${result.status.padEnd(4)}  ${result.op.padEnd(width)}  ${result.detail}`;
+    const kept = ({ filter, value, filterError }) => (filterError ? [`  ${filterError}`] : filter ? [`Filtered: ${filter.after} of ${filter.before} records (${filterText(filter)})`, JSON.stringify(value, null, 2)] : []);
+    const text = results.flatMap((result) => [line(result), ...kept(result)]).join("\n");
     return { handled: true, value: parsed.options.json === true ? results : text, json: parsed.options.json === true, exitCode };
   }
   if (command === "record") {
@@ -227,4 +272,4 @@ function formatPlaybookOutput(value, json = false) {
   return value;
 }
 
-module.exports = { formatPlaybookOutput, handlePlaybookCli, playbookCommandNeedsBrowser, requestHost };
+module.exports = { formatPlaybookOutput, handlePlaybookCli, opHelp, playbookCommandNeedsBrowser, requestHost };

@@ -122,6 +122,10 @@ describe("op-rank", () => {
     expect(pickRequest(ranked, {}).weak).toMatch(/leads .* by 0 points/);
     expect(matchHint(ranked)).toBe(new URL(ranked[0].entry.url).pathname);
     expect(pickRequest([], {})).toEqual({ error: "the capture holds no request to pick" });
+    // A load that failed after its answer keeps its status but is no candidate.
+    expect(
+      rankRequests([{ ...a, flags: ["failed"] }], { pageUrl: "https://shop.example/" }),
+    ).toEqual([]);
   });
 
   it("ranks a POST as a write", () => {
@@ -132,6 +136,33 @@ describe("op-rank", () => {
     });
     const [top] = rankRequests([post], { pageUrl: post.url, pageText: visibleText(quotesPage) });
     expect(top.effect).toBe("write");
+  });
+
+  it("keeps a form POST answered by a redirect, prefers it for a write goal, and --match POST picks it", () => {
+    const html = (url: string, fields: Partial<Captured> = {}) =>
+      entry({
+        url,
+        responseBody: `<html><body><h1>Comment</h1>${"word ".repeat(30)}</body></html>`,
+        ...fields,
+      });
+    const form = html("https://blog.example/comments/new");
+    const post = html("https://blog.example/comments", {
+      method: "POST",
+      status: 303,
+      responseBody: undefined,
+    });
+    const shown = html("https://blog.example/comments/1");
+    const capture = [form, post, shown];
+    const context = { pageUrl: shown.url, pageText: "Comment" };
+    const written = rankRequests(capture, { ...context, goal: "post a comment" });
+    expect(pickRequest(written, {}).pick.entry).toBe(post);
+    const read = rankRequests(capture, { ...context, goal: "the comment" });
+    expect(read.map((candidate: { entry: Captured }) => candidate.entry)).toContain(post);
+    expect(pickRequest(read, { match: "POST" }).pick.entry).toBe(post);
+    expect(pickRequest(read, { match: "POST /comments" }).pick.entry).toBe(post);
+    expect(pickRequest(read, { match: "GET /comments/1" }).pick.entry).toBe(shown);
+    // A redirected read is still no data.
+    expect(rankRequests([html("https://blog.example/go", { status: 302 })], context)).toEqual([]);
   });
 });
 
@@ -261,6 +292,115 @@ describe("op-inputs", () => {
     });
     expect(searched.request.query).toEqual({ kw: "{{kw}}" });
   });
+
+  it("catches secret names in any spelling, keeps a repeated form field, and saves a secret-named wrapper", () => {
+    const { validateOp } = require("../../native/playbooks.cjs");
+    const body = {
+      "user[password]": "hunter2",
+      newPassword: "n3w",
+      clientSecret: "cs",
+      csrfToken: "ct",
+      custname: "Ada",
+      keyword: "pizza",
+      monkey: "m",
+      passenger: "p",
+      key: "theme",
+      topping: ["bacon", "cheese"],
+    };
+    const named = nameInputs({ request: { method: "POST", url: "https://a.example/o", body } });
+    expect(Object.keys(named.args).sort()).toEqual([
+      "client_secret",
+      "csrf_token",
+      "new_password",
+      "user_password",
+    ]);
+    for (const spec of Object.values(named.args)) {
+      expect(spec).toEqual({ required: true });
+    }
+    expect(named.request.body).toMatchObject({
+      custname: "Ada",
+      keyword: "pizza",
+      monkey: "m",
+      passenger: "p",
+      key: "theme",
+    });
+    expect(JSON.stringify(named)).not.toMatch(/hunter2|n3w|"cs"|"ct"/);
+    // A trailing number still names a secret (Django's password1, WordPress's pass1).
+    const { isSecret } = require("../../native/op-inputs.cjs");
+    for (const name of [
+      "password1",
+      "password2",
+      "new_password1",
+      "pass1",
+      "pass2",
+      "newPassword1",
+      "Password1",
+    ]) {
+      expect(isSecret(name)).toBe(true);
+    }
+    for (const name of ["page2", "custname", "keyword", "address1", "passenger2"]) {
+      expect(isSecret(name)).toBe(false);
+    }
+    // A sample given for a secret is never kept.
+    const sampled = nameInputs({
+      request: { method: "POST", url: "https://a.example/o", body: { pw: "s3cret" } },
+      samples: { password: "s3cret" },
+    });
+    expect(sampled.args.password).toEqual({ required: true });
+    // A read keeps its query as it is; the rule is for writes.
+    const read = nameInputs({
+      request: { url: "https://a.example/s", query: { token: "t", key: "theme" } },
+    });
+    expect(read).toMatchObject({ args: {}, request: { query: { token: "t", key: "theme" } } });
+    const form = requestOf(
+      entry({
+        url: "https://a.example/o",
+        method: "POST",
+        requestHeaders: { "Content-Type": "application/x-www-form-urlencoded" },
+        requestBody: "size=large&topping=bacon&topping=cheese",
+      }),
+    );
+    expect(form.body).toEqual({ size: "large", topping: ["bacon", "cheese"] });
+    expect(renderRequest(form, { args: {}, env: {} }).body).toBe(
+      "size=large&topping=bacon&topping=cheese",
+    );
+    const wrapped = nameInputs({
+      request: {
+        method: "POST",
+        url: "https://a.example/login",
+        body: { session: { email: "a@b.c", password: "pw" } },
+      },
+    });
+    expect(wrapped.request.body).toEqual({ session: { email: "a@b.c", password: "{{password}}" } });
+    expect(() =>
+      validateOp({ id: "login", args: wrapped.args, request: wrapped.request }, {}),
+    ).not.toThrow();
+  });
+
+  it("makes a secret-named body or query field a required input with no stored value", () => {
+    const named = nameInputs({
+      request: {
+        method: "POST",
+        url: "https://a.example/login",
+        query: { api_key: "k-123", lang: "en" },
+        body: { user: "ada", password: "hunter2", csrf_token: "t0k", nested: { secret: "s" } },
+      },
+      typed: ["ada", "hunter2"],
+      samples: { lang: "en" },
+    });
+    expect(named.request.body).toEqual({
+      user: "{{user}}",
+      password: "{{password}}",
+      csrf_token: "{{csrf_token}}",
+      nested: { secret: "{{secret}}" },
+    });
+    expect(named.request.query).toEqual({ api_key: "{{api_key}}", lang: "{{lang}}" });
+    for (const name of ["password", "csrf_token", "secret", "api_key"]) {
+      expect(named.args[name]).toEqual({ required: true });
+    }
+    expect(named.args.user).toEqual({ required: true, example: "ada" });
+    expect(JSON.stringify(named)).not.toMatch(/hunter2|k-123|t0k/);
+  });
 });
 
 describe("op-infer", () => {
@@ -349,17 +489,30 @@ describe("op-infer", () => {
     expect(embedded.read[0]).toMatchObject({ author_name: "Albert Einstein" });
   });
 
-  it("reads arXiv's dt/dd listing as parallel [] fields of the list", () => {
+  it("reads arXiv's dt/dd listing as one record per dt, its dd read through + dd", () => {
     const found = infer(arxivList, "https://arxiv.org/list/cs.CL/recent");
-    expect(found.extract.records).toBe("dl#articles");
+    expect(found.extract.records).toBe("dl#articles > dt");
     expect(found.extract.fields).toMatchObject({
-      url: 'dt a[title="Abstract"]@href[]',
-      id: 'dt a[title="Abstract"]@id[]',
-      title: "dd .list-title[]",
-      authors: "dd .list-authors[]",
+      url: 'a[title="Abstract"]@href',
+      id: 'a[title="Abstract"]@id',
+      title: "+ dd .list-title",
+      authors: "+ dd .list-authors",
     });
-    expect(found.read[0].url).toHaveLength(4);
-    expect(found.read[0].url[0]).toBe("https://arxiv.org/abs/2611.23218");
+    expect(found.count).toBe(4);
+    expect(found.read).toHaveLength(4);
+    for (const record of found.read) {
+      expect(Object.keys(record)).toEqual(expect.arrayContaining(["id", "url", "title"]));
+    }
+    expect(found.read[0]).toMatchObject({
+      url: "https://arxiv.org/abs/2611.23218",
+      id: "2611.23218",
+      title: expect.stringContaining("What Does a Bias Head Measure?"),
+    });
+    expect(found.read[3]).toMatchObject({
+      id: "2611.23158",
+      authors: expect.stringContaining("Nikit Srivastava"),
+    });
+    expect(keyFields(found)).toEqual(["title", "url"]);
   });
 
   it("reads an arXiv abstract page from its citation meta tags and own heading", () => {

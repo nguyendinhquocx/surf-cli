@@ -75,6 +75,37 @@ describe("playbook resolution and strategies", () => {
     expect(executeTool).toHaveBeenCalledWith("page.text", { label: "fallback" }, expect.anything());
   });
 
+  it("loads a playbook whose op has a click with no target in its steps, and runs its other ops", () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "surf-playbook-home-"));
+    tempDirs.push(home);
+    const directory = path.join(home, ".surf", "playbooks", "forms");
+    fs.mkdirSync(path.join(directory, "ops"), { recursive: true });
+    fs.writeFileSync(
+      path.join(directory, "playbook.json"),
+      JSON.stringify({ id: "forms", version: "1.0.0", origins: ["https://a.test"] }),
+    );
+    fs.writeFileSync(
+      path.join(directory, "ops", "send.json"),
+      JSON.stringify({ id: "send", open: "https://a.test/form", steps: 'click "Submit order"' }),
+    );
+    fs.writeFileSync(
+      path.join(directory, "ops", "list.json"),
+      JSON.stringify({ id: "list", request: { url: "https://a.test/items.json" } }),
+    );
+    expect(playbooks.listPlaybooks({ home }).map((entry: { id: string }) => entry.id)).toContain(
+      "forms",
+    );
+    const playbook = playbooks.resolvePlaybook("forms", { home });
+    expect([...playbook.ops.keys()].sort()).toEqual(["list", "send"]);
+    expect(
+      require("../../native/op-run.cjs").dryRunOp({
+        playbook,
+        op: playbook.ops.get("list"),
+        args: {},
+      }),
+    ).toMatchObject({ request: { url: "https://a.test/items.json" } });
+  });
+
   it("defaults protected writes to explicit authorization and uses op auth origins", () => {
     const op = playbooks.validateOp(
       {
@@ -93,6 +124,28 @@ describe("playbook resolution and strategies", () => {
     );
     expect(op.safety.authorization).toBe("explicit");
     expect(op.origins).toEqual(["https://example.test"]);
+  });
+
+  it("takes a flat op's effect from its method and gives a write the default guard", () => {
+    const flat = (fields: Record<string, unknown>) =>
+      playbooks.validateOp({ id: "op", request: { url: "https://a.test/x", ...fields } }, {});
+    expect(flat({}).effect).toBe("read");
+    expect(flat({ method: "HEAD" }).effect).toBe("read");
+    const post = flat({ method: "post" });
+    expect(post).toMatchObject({ effect: "write", request: { method: "POST" } });
+    expect(post.safety).toEqual({
+      authorization: "explicit",
+      duplicate: "repeatable-window",
+      windowMs: 300000,
+    });
+    expect(flat({ method: "DELETE" }).effect).toBe("write");
+    // A POST that only searches says so.
+    const search = playbooks.validateOp(
+      { id: "s", effect: "read", request: { method: "POST", url: "https://a.test/s" } },
+      {},
+    );
+    expect(search).toMatchObject({ effect: "read" });
+    expect(search.safety).toBeUndefined();
   });
 
   it("rejects literal credentials and unsafe write workflows", () => {

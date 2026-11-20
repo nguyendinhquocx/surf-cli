@@ -63,6 +63,8 @@ type FakeHostOptions = {
   javascript?: (code: string) => unknown;
   // The requests network capture holds when they are read.
   network?: () => Record<string, unknown>[];
+  // The browser's cookies for a direct request's URL.
+  directContext?: (url: string) => Record<string, unknown>;
 };
 
 // Messages the fake answers with success and nothing else: capture, waits and page actions.
@@ -192,6 +194,11 @@ function buildExtensionResponse(
       return { id: message.id, success: true };
     case "GET_PLAYBOOK_RECORD_CONTEXT":
       return { id: message.id, success: true, origin: new URL(currentUrl).origin, url: currentUrl };
+    case "GET_DIRECT_REQUEST_CONTEXT":
+      if (options.directContext) {
+        return { id: message.id, ...options.directContext(String(message.url)) };
+      }
+      return { id: message.id, error: `Unhandled fake extension message: ${message.type}` };
     case "READ_NETWORK_REQUESTS":
       return { id: message.id, entries: options.network?.() ?? [], capture: { active: true } };
     case "EXECUTE_JAVASCRIPT":
@@ -390,6 +397,28 @@ async function runCli(
       resolve({ code: typeof code === "number" ? code : null, stdout, stderr });
     });
   });
+}
+
+type LocalHandler = (
+  req: { url: string; headers: Record<string, string> },
+  res: {
+    writeHead(status: number, headers: Record<string, string>): void;
+    end(body: string): void;
+  },
+) => void;
+
+// A site on 127.0.0.1 that the host's direct step reaches.
+async function serveLocal(handler: LocalHandler) {
+  const http = require("node:http") as {
+    createServer(handler: LocalHandler): {
+      listen(port: number, host: string, done: () => void): void;
+      address(): { port: number };
+      close(): void;
+    };
+  };
+  const server = http.createServer(handler);
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  return { origin: `http://127.0.0.1:${server.address().port}`, close: () => server.close() };
 }
 
 afterEach(() => {
@@ -693,6 +722,88 @@ describe("CLI/native-host/fake-extension E2E contract", () => {
     }
   });
 
+  it("fails a surf use result too large to send the CLI at once, naming its size", async () => {
+    const socketPath = createSocketPath();
+    const project = fs.mkdtempSync(path.join(os.tmpdir(), "surf-op-project-"));
+    tempDirs.push(project);
+    const site = path.join(project, ".surf", "playbooks", "big");
+    fs.mkdirSync(path.join(site, "ops"), { recursive: true });
+    fs.writeFileSync(
+      path.join(site, "playbook.json"),
+      JSON.stringify({ id: "big", version: "1.0.0" }),
+    );
+    fs.writeFileSync(
+      path.join(site, "ops", "list_items.json"),
+      JSON.stringify({
+        id: "list_items",
+        request: { url: "https://big.example/items.json" },
+        extract: { records: "$.items", fields: { text: "text" } },
+      }),
+    );
+    fs.writeFileSync(
+      path.join(site, "ops", "item_copies.json"),
+      JSON.stringify({
+        id: "item_copies",
+        args: { text: { required: true } },
+        request: { url: "https://big.example/items.json", query: { text: "{{text}}" } },
+        extract: { records: "$.items", fields: { text: "text" } },
+      }),
+    );
+    // 1,800 records of 1 kB: about 1.8 MB once the host frames them.
+    const items = Array.from({ length: 1800 }, (_, n) => ({ text: `${n} ${"x".repeat(1000)}` }));
+    const host = startHost(socketPath, {
+      javascript: () => ({
+        status: 200,
+        ok: true,
+        url: "https://big.example/items.json",
+        contentType: "application/json",
+        body: JSON.stringify({ items }),
+      }),
+    });
+    try {
+      await host.waitForMessage((message) => message.type === "HOST_READY");
+      const started = Date.now();
+      const used = await runCli(
+        socketPath,
+        ["use", "big", "list_items", "--json", "--timeout", "15"],
+        project,
+      );
+      expect(used.code).toBe(1);
+      // --json: the host error as JSON on stdout too, as for other tools.
+      expect(JSON.parse(used.stdout)).toEqual({
+        error: {
+          code: "error",
+          message: expect.stringMatching(/^the result is 1\.8 MB, over the 1 MiB/),
+        },
+      });
+      expect(used.stderr).toContain(
+        "the result is 1.8 MB, over the 1 MiB the host can send the CLI; --limit and --fields trim it only after it arrives (unless the op takes them as inputs), so ask for less: fewer --pages, or narrow the op's extract (records, fields) in its file",
+      );
+      expect(Date.now() - started).toBeLessThan(10_000);
+      // With --each, --limit caps the runs in the host, so it is the way to ask for less.
+      const each = await runCli(
+        socketPath,
+        [
+          "use",
+          "big",
+          "item_copies",
+          "--each",
+          "list_items:text",
+          "--limit",
+          "1",
+          "--delay-ms",
+          "0",
+        ],
+        project,
+      );
+      expect(each.stderr).toContain(
+        "MiB the host can send the CLI; ask for less: fewer --each runs (--limit), fewer --pages, or narrow the op's extract (records, fields) in its file",
+      );
+    } finally {
+      await host.dispose();
+    }
+  });
+
   it("removes an old live Surf-created session and its target", async () => {
     const socketPath = createSocketPath();
     const host = startHost(socketPath, { targetActive: false });
@@ -915,12 +1026,202 @@ describe("surf hook and pb record stop through the fake extension", () => {
         },
         page: { into: "page", next: "+1" },
         expect: { minItems: 1, fields: ["title", "url"] },
+        source: {
+          url: "https://books.toscrape.com/catalogue/page-{{page}}.html",
+          goal: "books with prices",
+        },
       });
 
       const tested = await runCli(socketPath, ["pb", "test", site, "list_books"]);
       expect(tested.code).toBe(0);
       expect(tested.stdout).toMatch(/^pass +list_books +3 records via tab$/m);
     } finally {
+      await host.dispose();
+    }
+  });
+
+  // A fake tab on books.toscrape.com's page 2, with network capture holding that page.
+  const booksHost = (socketPath: string) => {
+    const html = readFixture("books-page-1.html");
+    const page = "https://books.toscrape.com/catalogue/page-2.html";
+    return startHost(socketPath, {
+      network: () => [captured(page, { responseBody: html })],
+      javascript: tab(page, "A Light in the Attic £51.77", { [page]: html }, []),
+    });
+  };
+  const hookBooks = (socketPath: string, site: string, ...extra: string[]) =>
+    runCli(socketPath, [
+      "hook",
+      "https://books.toscrape.com/catalogue/page-{{page}}.html",
+      ...extra,
+      "--page",
+      "2",
+      "--goal",
+      "books with prices",
+      "--as",
+      `${site}/list_books`,
+    ]);
+
+  it("refuses a surf use flag before any request, unless the URL writes it as {{name}}", async () => {
+    const socketPath = createSocketPath();
+    const site = unique("stray");
+    const host = booksHost(socketPath);
+    try {
+      await host.waitForMessage((message) => message.type === "HOST_READY");
+      const format = await hookBooks(socketPath, site, "--format", "md");
+      expect(format.code).toBe(1);
+      expect(format.stdout).toBe("");
+      expect(format.stderr.trim()).toBe(
+        "Error: --format is a surf use option, not a surf hook one: give it to surf use when you run the saved op. surf hook takes --goal, --do, --match, --as, --dry-run, --json and --<input> <sample>. An input named format needs {{format}} in the URL or a --do step; a sample under another name works too (--per_page 20).",
+      );
+      // A flag with no value is refused before it can take the next word as its value.
+      const write = await hookBooks(socketPath, site, "--write");
+      expect(write.code).toBe(1);
+      expect(write.stderr).toMatch(/^Error: --write is a surf use option, not a surf hook one/);
+      expect(host.messages.map((message) => message.type)).not.toContain("START_NETWORK_CAPTURE");
+      expect(exists(opFile(site, "list_books"))).toBe(false);
+
+      // A URL that writes {{limit}} makes --limit an input sample, as {{page}} does --page.
+      const limited = await runCli(socketPath, [
+        "hook",
+        "https://books.toscrape.com/catalogue/page-{{page}}.html?limit={{limit}}",
+        "--page",
+        "2",
+        "--limit",
+        "20",
+        "--goal",
+        "books",
+        "--as",
+        `${site}/list_books`,
+        "--dry-run",
+      ]);
+      expect(limited.stderr).not.toMatch(/surf use option/);
+      expect(host.messages.find((message) => message.type === "EXECUTE_NAVIGATE")?.url).toBe(
+        "https://books.toscrape.com/catalogue/page-2.html?limit=20",
+      );
+    } finally {
+      await host.dispose();
+    }
+  });
+
+  it("--dry-run picks and tests as usual, prints the op and writes no file", async () => {
+    const socketPath = createSocketPath();
+    const site = unique("dry");
+    const host = booksHost(socketPath);
+    try {
+      await host.waitForMessage((message) => message.type === "HOST_READY");
+      // Before --goal, --dry-run takes no value.
+      const dry = await hookBooks(socketPath, site, "--dry-run");
+      expect(dry.stderr).toBe("");
+      expect(dry.code).toBe(0);
+      expect(dry.stdout).toMatch(/^test +tab ✓ 3 records; title, url present$/m);
+      expect(dry.stdout).toMatch(
+        new RegExp(
+          `^saved +nothing \\(--dry-run\\); the op would go to ~/\\.surf/playbooks/${site}/ops/list_books\\.json$`,
+          "m",
+        ),
+      );
+      expect(dry.stdout).not.toMatch(/^run /m);
+      const [, printed] = dry.stdout.split(/^op +as surf hook would save it:\n/m);
+      expect(JSON.parse(printed)).toMatchObject({
+        id: "list_books",
+        args: { page: { default: 2, example: 2 } },
+        extract: { records: "article.product_pod" },
+        expect: { minItems: 1, fields: ["title", "url"] },
+      });
+      expect(exists(opFile(site, "list_books"))).toBe(false);
+      expect(
+        exists(path.join(String(process.env.HOME), ".surf", "playbooks", site, "playbook.json")),
+      ).toBe(false);
+    } finally {
+      await host.dispose();
+    }
+  });
+
+  it("says when it replaces an op and keeps the old one as <op>.json.bak", async () => {
+    const socketPath = createSocketPath();
+    const site = unique("again");
+    const host = booksHost(socketPath);
+    try {
+      await host.waitForMessage((message) => message.type === "HOST_READY");
+      const first = await hookBooks(socketPath, site);
+      expect(first.code).toBe(0);
+      expect(first.stdout).not.toMatch(/^replaced /m);
+      const file = opFile(site, "list_books");
+      // A hand edit, which the second hook replaces.
+      const edited = {
+        ...JSON.parse(fs.readFileSync(file, "utf8")),
+        description: "edited by hand",
+      };
+      fs.writeFileSync(file, JSON.stringify(edited));
+
+      const dry = await hookBooks(socketPath, site, "--dry-run");
+      expect(dry.stdout).toMatch(
+        /^saved +nothing \(--dry-run\); the op would replace ~\/.*\/list_books\.json$/m,
+      );
+      expect(exists(`${file}.bak`)).toBe(false);
+
+      const second = await hookBooks(socketPath, site);
+      expect(second.stderr).toBe("");
+      expect(second.code).toBe(0);
+      expect(second.stdout).toMatch(
+        new RegExp(
+          `^saved +~/\\.surf/playbooks/${site}/ops/list_books\\.json\\nreplaced ${site} list_books \\(the old op is list_books\\.json\\.bak\\)$`,
+          "m",
+        ),
+      );
+      expect(JSON.parse(fs.readFileSync(`${file}.bak`, "utf8"))).toEqual(edited);
+      expect(JSON.parse(fs.readFileSync(file, "utf8")).description).toBe("books with prices");
+
+      // One .bak slot: a third hook keeps the second op there, and says the older .bak is overwritten.
+      const replaced = JSON.parse(fs.readFileSync(file, "utf8"));
+      const third = await hookBooks(socketPath, site);
+      expect(third.stdout).toMatch(
+        new RegExp(
+          `^replaced ${site} list_books \\(the old op is list_books\\.json\\.bak; the older \\.bak is overwritten\\)$`,
+          "m",
+        ),
+      );
+      expect(JSON.parse(fs.readFileSync(`${file}.bak`, "utf8"))).toEqual(replaced);
+    } finally {
+      await host.dispose();
+    }
+  }, 30000);
+
+  it("tests a draft from the tab when the host gets a 200 page without the records", async () => {
+    const shell = await serveLocal((_req, res) => {
+      res.writeHead(200, { "content-type": "text/html" });
+      res.end("<html><body><h1>Prove your humanity</h1></body></html>");
+    });
+    const socketPath = createSocketPath();
+    const site = unique("shell");
+    const html = readFixture("books-page-1.html");
+    const page = `${shell.origin}/catalogue/page-2.html`;
+    const codes: string[] = [];
+    const host = startHost(socketPath, {
+      network: () => [captured(page, { responseBody: html })],
+      javascript: tab(page, "A Light in the Attic £51.77", { [page]: html }, codes),
+      directContext: () => ({ cookies: [] }),
+    });
+
+    try {
+      await host.waitForMessage((message) => message.type === "HOST_READY");
+      const hooked = await runCli(socketPath, [
+        "hook",
+        `${shell.origin}/catalogue/page-{{page}}.html`,
+        "--page",
+        "2",
+        "--goal",
+        "books with prices",
+        "--as",
+        `${site}/list_books`,
+      ]);
+      expect(hooked.stderr).toBe("");
+      expect(hooked.code).toBe(0);
+      expect(hooked.stdout).toMatch(/^test +tab ✓ 3 records; title, url present$/m);
+      expect(exists(opFile(site, "list_books"))).toBe(true);
+    } finally {
+      shell.close();
       await host.dispose();
     }
   });
@@ -1053,35 +1354,65 @@ describe("surf hook and pb record stop through the fake extension", () => {
         },
         extract: { records: "$.quotes" },
         page: { into: "page", next: "+1" },
+        source: { do: 'type "{{query}}" --into "input#q" | key Enter' },
       });
+
+      // A typed value that is no input (a password) stays out of every file; the op can't repair.
+      const secret = await runCli(socketPath, [
+        "hook",
+        page,
+        "--goal",
+        "quotes",
+        "--do",
+        'type "{{query}}" --into "input#q" | type dummy-pass-9 --into "input[name=password]"',
+        "--query",
+        "einstein",
+        "--as",
+        `${site}/login_search`,
+      ]);
+      expect(secret.code).toBe(0);
+      expect(secret.stdout).toMatch(/^Warning: .*no input.* can't repair/m);
+      expect(JSON.parse(fs.readFileSync(opFile(site, "login_search"), "utf8"))).not.toHaveProperty(
+        "source",
+      );
+      type Entry = { name: string; isDirectory(): boolean };
+      const { readdirSync } = require("node:fs") as {
+        readdirSync(dir: string, options: { withFileTypes: true }): Entry[];
+      };
+      const files = (dir: string): string[] =>
+        readdirSync(dir, { withFileTypes: true }).flatMap((entry) =>
+          entry.isDirectory() ? files(path.join(dir, entry.name)) : [path.join(dir, entry.name)],
+        );
+      for (const file of [
+        ...files(path.join(opFile(site, "x"), "..", "..")),
+        ...files(host.stateDir),
+      ]) {
+        expect(fs.readFileSync(file, "utf8")).not.toContain("dummy-pass-9");
+      }
     } finally {
       await host.dispose();
     }
-  });
+  }, 30000);
 
-  it("refuses a picked write: prints the draft, sends nothing again and saves nothing", async () => {
+  it("saves a picked write untested, a typed secret as an input with no value", async () => {
     const socketPath = createSocketPath();
-    const site = unique("quotes");
-    const page = "https://quotes.toscrape.com/search.aspx";
-    const results = readFixture("quotes-page-1.html");
+    const site = unique("httpbin");
+    const page = "https://httpbin.org/forms/post";
     const codes: string[] = [];
     const host = startHost(socketPath, {
       network: () => [
         captured(page, { responseBody: "<html><body><form></form></body></html>" }),
-        captured("https://quotes.toscrape.com/filter.aspx", {
+        captured("https://httpbin.org/post", {
           method: "POST",
+          type: "XHR",
+          mimeType: "application/json",
           requestHeaders: { "Content-Type": "application/x-www-form-urlencoded" },
-          requestBody: "author=Albert+Einstein&tag=----------",
-          responseBody: results,
+          requestBody: "custname=Ada&size=medium&password=hunter2",
+          responseBody: JSON.stringify({ form: { custname: "Ada", size: "medium" } }),
           ts: Date.now(),
         }),
       ],
-      javascript: tab(
-        "https://quotes.toscrape.com/filter.aspx",
-        "Albert Einstein The world as we have created it",
-        {},
-        codes,
-      ),
+      javascript: tab("https://httpbin.org/post", "custname Ada size medium", {}, codes),
     });
 
     try {
@@ -1090,28 +1421,153 @@ describe("surf hook and pb record stop through the fake extension", () => {
         "hook",
         page,
         "--goal",
-        "quotes by author",
+        "send the order",
         "--do",
-        'click --selector "#go"',
+        'type "Ada" --into "input[name=custname]" | type "hunter2" --into "#pw" | click --selector "#go"',
         "--as",
-        `${site}/by_author`,
+        `${site}/order`,
       ]);
-      expect(hooked.code).toBe(1);
-      expect(hooked.stderr).toMatch(
-        /refused: POST https:\/\/quotes\.toscrape\.com\/filter\.aspx can change data; surf hook saves reads only/,
+      expect(hooked.stderr).toBe("");
+      expect(hooked.code).toBe(0);
+      expect(hooked.stdout).toMatch(/^picked +POST https:\/\/httpbin\.org\/post/m);
+      expect(hooked.stdout).toMatch(
+        /^inputs +--custname \(required, sample Ada\) · --password \(required\)$/m,
       );
-      expect(JSON.parse(hooked.stdout)).toMatchObject({
-        id: "by_author",
+      expect(hooked.stdout).toMatch(
+        /^test +not run: the --do steps sent it once; surf hook sends nothing more \(surf use … --write sends it again\)$/m,
+      );
+      expect(hooked.stdout).toMatch(
+        new RegExp(
+          `^run +surf use ${site} order --custname Ada --password '<password>' --write$`,
+          "m",
+        ),
+      );
+      const saved = fs.readFileSync(opFile(site, "order"), "utf8");
+      expect(JSON.parse(saved)).toMatchObject({
         effect: "write",
+        args: { custname: { required: true, example: "Ada" }, password: { required: true } },
         request: {
           method: "POST",
-          url: "https://quotes.toscrape.com/filter.aspx",
-          body: { author: "Albert Einstein" },
+          url: "https://httpbin.org/post",
+          body: { custname: "{{custname}}", size: "medium", password: "{{password}}" },
         },
-        extract: { records: "div.quote" },
       });
+      expect(`${hooked.stdout}${saved}`).not.toContain("hunter2");
       expect(fetches(codes)).toEqual([]);
-      expect(exists(opFile(site, "by_author"))).toBe(false);
+    } finally {
+      await host.dispose();
+    }
+  });
+
+  it("refuses a --do click with no target before it opens the page, as surf do --dry-run does", async () => {
+    const socketPath = createSocketPath();
+    const steps = 'type "Ada" --into "input[name=custname]" | click "Submit order"';
+    const host = startHost(socketPath, { network: () => [] });
+    try {
+      await host.waitForMessage((message) => message.type === "HOST_READY");
+      const hooked = await runCli(socketPath, [
+        "hook",
+        "https://httpbin.org/forms/post",
+        "--goal",
+        "send the order",
+        "--do",
+        steps,
+      ]);
+      expect(hooked.code).toBe(1);
+      expect(hooked.stderr.trim()).toBe(
+        'Error: --do step 2: click takes a ref (e5), --selector <css> or x y, not "Submit order". Try: click --selector "form button"',
+      );
+      expect(host.messages.some((message) => message.type === "EXECUTE_NAVIGATE")).toBe(false);
+      const dry = await runCli(socketPath, ["do", steps, "--dry-run"]);
+      expect(dry.code).toBe(1);
+      expect(dry.stderr).toContain(
+        'step 2: click takes a ref (e5), --selector <css> or x y, not "Submit order"',
+      );
+    } finally {
+      await host.dispose();
+    }
+  });
+
+  it("says an error page's status when the capture holds no request to pick", async () => {
+    const socketPath = createSocketPath();
+    const page = "https://httpbin.org/status/404";
+    const answered =
+      "Error: https://httpbin.org/status/404 answered 404, so the capture holds no request to pick; check the URL, or add --do steps that load the data";
+    const failed =
+      "Error: https://httpbin.org/status/404 failed to load (net::ERR_NAME_NOT_RESOLVED), so the capture holds no request to pick; check the URL, or add --do steps that load the data";
+    let entry: Record<string, unknown> = { status: 404, responseBody: "" };
+    // The tab's location keeps a fragment the captured request doesn't have.
+    let shown = `${page}#top`;
+    const host = startHost(socketPath, {
+      network: () => [captured(page, entry)],
+      javascript: (code: string) => tab(shown, "", {}, [])(code),
+    });
+    const hook = async () => {
+      // Typed as HTTPBIN.org: Chrome's entry spells the host in lowercase.
+      const hooked = await runCli(socketPath, [
+        "hook",
+        page.replace("httpbin.org", "HTTPBIN.org"),
+        "--goal",
+        "status",
+      ]);
+      expect(hooked.code).toBe(1);
+      return hooked.stderr.trim();
+    };
+    try {
+      await host.waitForMessage((message) => message.type === "HOST_READY");
+      expect(await hook()).toBe(answered);
+      // An empty 404 page Chrome then fails to load keeps its status.
+      entry = { status: 404, flags: ["failed"], errorText: "net::ERR_HTTP_RESPONSE_CODE_FAILURE" };
+      expect(await hook()).toBe(answered);
+      // A page that got no answer at all.
+      entry = { status: 0, flags: ["failed"], errorText: "net::ERR_NAME_NOT_RESOLVED" };
+      expect(await hook()).toBe(failed);
+      // On Chrome's error page, location.href is chrome-error://chromewebdata/: the URL the
+      // hook opened names the page.
+      shown = "chrome-error://chromewebdata/";
+      expect(await hook()).toBe(failed);
+      entry = { status: 404, flags: ["failed"], errorText: "net::ERR_HTTP_RESPONSE_CODE_FAILURE" };
+      expect(await hook()).toBe(answered);
+    } finally {
+      await host.dispose();
+    }
+  });
+
+  it("tells a write goal with no captured write to submit the form in --do", async () => {
+    const socketPath = createSocketPath();
+    const page = "https://httpbin.org/forms/post";
+    const form =
+      "<html><body><form><input name=custname><button>Submit order</button></form></body></html>";
+    const host = startHost(socketPath, {
+      network: () => [captured(page, { responseBody: form })],
+      javascript: tab(page, "Customer name Submit order", { [page]: form }, []),
+    });
+    try {
+      await host.waitForMessage((message) => message.type === "HOST_READY");
+      const hooked = await runCli(socketPath, ["hook", page, "--goal", "submit the order"]);
+      expect(hooked.code).toBe(1);
+      expect(hooked.stderr.trim()).toBe(
+        `Error: found no records or fields in the response of ${page}; a form's POST is captured only when --do submits the form: --do 'type "…" --into "<css>" | click --selector "<css>"'`,
+      );
+      // A read goal, even one with a write word as a noun, keeps the short message, and so
+      // does a write goal whose --do steps ran.
+      for (const goal of ["the form", "order history", "blog post titles"]) {
+        const read = await runCli(socketPath, ["hook", page, "--goal", goal]);
+        expect(read.stderr.trim()).toBe(
+          `Error: found no records or fields in the response of ${page}`,
+        );
+      }
+      const done = await runCli(socketPath, [
+        "hook",
+        page,
+        "--goal",
+        "submit the order",
+        "--do",
+        'click --selector "form button"',
+      ]);
+      expect(done.stderr.trim()).toBe(
+        `Error: found no records or fields in the response of ${page}`,
+      );
     } finally {
       await host.dispose();
     }
@@ -1156,6 +1612,7 @@ describe("surf hook and pb record stop through the fake extension", () => {
         args: { page: { default: 3, example: 3 } },
         request: { url: "https://books.toscrape.com/catalogue/page-{{page}}.html" },
         expect: { minItems: 1, fields: ["title", "url"] },
+        source: { url: page },
       });
       const status = await runCli(socketPath, ["pb", "record", "status", "--json"]);
       expect(JSON.parse(status.stdout)).toMatchObject({ status: "idle" });
@@ -1237,4 +1694,360 @@ describe("surf hook and pb record stop through the fake extension", () => {
       await host.dispose();
     }
   });
+
+  it("repairs a read op the site changed under, in surf use and pb test, unless --no-repair", async () => {
+    const socketPath = createSocketPath();
+    const site = unique("books");
+    const html = readFixture("books-page-1.html").replaceAll("product_pod", "product_card");
+    const page = "https://books.toscrape.com/catalogue/page-2.html";
+    const url = "https://books.toscrape.com/catalogue/page-{{page}}.html";
+    const file = opFile(site, "list_books");
+    fs.mkdirSync(path.join(file, ".."), { recursive: true });
+    fs.writeFileSync(
+      path.join(file, "..", "..", "playbook.json"),
+      `{"id":"${site}","version":"1"}`,
+    );
+    const broken = JSON.stringify({
+      id: "list_books",
+      args: { page: { default: 1, example: 2 } },
+      request: { url },
+      extract: { records: "article.product_pod", fields: { title: "h3 a@title" } },
+      expect: { minItems: 1, fields: ["title"] },
+      source: { url, goal: "books" },
+    });
+    fs.writeFileSync(file, broken);
+    const host = startHost(socketPath, {
+      network: () => [captured(page, { responseBody: html, ts: Date.now() })],
+      javascript: tab(page, "A Light in the Attic", { [page]: html }, []),
+    });
+    const repaired = `repaired ${site} list_books: records article.product_pod → article.product_card; fields +url, +star_rating, +price_color (the old op is list_books.json.bak)`;
+
+    try {
+      await host.waitForMessage((message) => message.type === "HOST_READY");
+      const off = await runCli(socketPath, ["pb", "test", site, "--no-repair"]);
+      expect(off.code).toBe(1);
+      expect(off.stdout).toMatch(/not repaired \(--no-repair\)\. Rebuild it: surf hook/);
+      const tested = await runCli(socketPath, ["pb", "test", site]);
+      expect(tested.code).toBe(0);
+      expect(tested.stdout).toBe(`pass  list_books  3 records via tab; ${repaired}\n`);
+
+      fs.writeFileSync(file, broken);
+      const used = await runCli(socketPath, ["use", site, "list_books", "--page", "2", "--json"]);
+      expect(used.code).toBe(0);
+      expect(used.stderr).toBe(`${repaired}\n`);
+      expect(JSON.parse(used.stdout)).toMatchObject({
+        via: "tab",
+        repaired,
+        value: [{ title: "A Light in the Attic" }, {}, {}],
+      });
+      expect(fs.readFileSync(`${file}.bak`, "utf8")).toBe(broken);
+    } finally {
+      await host.dispose();
+    }
+  });
+});
+
+describe("the saved-ops hint through the fake extension", () => {
+  it("lists an origin's saved ops once per session, and in --json", async () => {
+    const origin = `https://hint-${process.pid}.test`;
+    const site = `hint-${process.pid}`;
+    const dir = path.join(String(process.env.HOME), ".surf", "playbooks", site);
+    fs.mkdirSync(path.join(dir, "ops"), { recursive: true });
+    fs.writeFileSync(path.join(dir, "playbook.json"), `{"id":"${site}","version":"1"}`);
+    const ops = { list_items: { page: { default: 1 } }, get_item: { item_id: { required: true } } };
+    for (const [op, args] of Object.entries(ops)) {
+      const body = { id: op, args, request: { url: `${origin}/${op}` } };
+      fs.writeFileSync(path.join(dir, "ops", `${op}.json`), JSON.stringify(body));
+    }
+    const socketPath = createSocketPath();
+    const host = startHost(socketPath);
+
+    try {
+      await host.waitForMessage((message) => message.type === "HOST_READY");
+      expect(await runCli(socketPath, ["go", `${origin}/`])).toMatchObject({
+        code: 0,
+        stdout: `OK\nsaved: ${site} get_item --item_id, list_items --page\n`,
+      });
+      expect(await runCli(socketPath, ["go", `${origin}/page-2`])).toMatchObject({
+        stdout: "OK\n",
+      });
+      expect(await runCli(socketPath, ["go", "https://plain.test/"])).toMatchObject({
+        stdout: "OK\n",
+      });
+      // Another session hears of them once, here in --json.
+      seedOldSession(host.stateDir);
+      const json = await runCli(socketPath, ["go", `${origin}/`, "--session", "old", "--json"]);
+      expect(JSON.parse(json.stdout)).toMatchObject({
+        result: "OK",
+        savedOps: {
+          origin,
+          ops: [
+            { playbook: site, op: "get_item", inputs: ["item_id"] },
+            { playbook: site, op: "list_items", inputs: ["page"] },
+          ],
+        },
+      });
+      const again = await runCli(socketPath, ["go", `${origin}/`, "--session", "old", "--json"]);
+      expect(JSON.parse(again.stdout)).not.toHaveProperty("savedOps");
+    } finally {
+      await host.dispose();
+    }
+  });
+});
+
+describe("direct requests, --each and filters through the fake extension", () => {
+  it("answers via direct with the browser's cookies, runs --each and filters the records", async () => {
+    const seen: { url: string; cookie?: string }[] = [];
+    let origin = "";
+    const server = await serveLocal((req, res) => {
+      seen.push({ url: req.url, cookie: req.headers.cookie });
+      const page = Number(req.url.match(/page=(\d+)/)?.[1] ?? 0);
+      const item = req.url.match(/^\/item\/(\d+)$/)?.[1];
+      const items = [1, 2].map((n) => ({
+        url: `${origin}/item/${(page - 1) * 2 + n}`,
+        slug: `s${n}`,
+      }));
+      res.writeHead(200, { "content-type": "application/json" });
+      // /shell is a 200 page that holds no records, as a challenge or consent page would.
+      const empty = page > 2 || req.url === "/shell";
+      res.end(JSON.stringify(item ? { name: `Item ${item}` } : { items: empty ? [] : items }));
+    });
+    origin = server.origin;
+    const project = fs.mkdtempSync(path.join(os.tmpdir(), "surf-direct-project-"));
+    tempDirs.push(project);
+    const site = path.join(project, ".surf", "playbooks", "shop");
+    fs.mkdirSync(path.join(site, "ops"), { recursive: true });
+    fs.writeFileSync(
+      path.join(site, "playbook.json"),
+      JSON.stringify({ id: "shop", version: "1.0.0" }),
+    );
+    const ops = [
+      {
+        id: "list_items",
+        args: { page: { default: 1, example: 1 } },
+        request: { url: `${origin}/list?page={{page}}` },
+        extract: { records: "$.items", fields: { url: "url", slug: "slug" } },
+        page: { into: "page", next: "+1" },
+        expect: { minItems: 1, fields: ["url"] },
+      },
+      {
+        id: "get_item",
+        args: { item_id: { required: true, example: 1 } },
+        request: { url: `${origin}/item/{{item_id}}` },
+        extract: { fields: { name: "name" } },
+        expect: { fields: ["name"] },
+      },
+      {
+        id: "shell_items",
+        request: { url: `${origin}/shell` },
+        extract: { records: "$.items", fields: { url: "url", slug: "slug" } },
+      },
+    ];
+    for (const op of ops) {
+      fs.writeFileSync(path.join(site, "ops", `${op.id}.json`), JSON.stringify(op));
+    }
+    const socketPath = createSocketPath();
+    const host = startHost(socketPath, {
+      directContext: () => ({ cookies: [{ name: "sid", value: "e2e" }], userAgent: "Chrome/E2E" }),
+      javascript: () => ({
+        status: 200,
+        url: `${origin}/shell`,
+        contentType: "application/json",
+        body: JSON.stringify({ items: [{ url: `${origin}/item/9`, slug: "from-tab" }] }),
+      }),
+    });
+    const use = async (args: string[]) => {
+      const result = await runCli(socketPath, args, project);
+      expect(result.stderr).toBe("");
+      expect(result.code).toBe(0);
+      return result.stdout;
+    };
+
+    try {
+      await host.waitForMessage((message) => message.type === "HOST_READY");
+      const direct = JSON.parse(await use(["use", "shop", "list_items", "--json"]));
+      expect(direct).toMatchObject({ via: "direct", value: [{ slug: "s1" }, { slug: "s2" }] });
+      expect(seen).toEqual([{ url: "/list?page=1", cookie: "sid=e2e" }]);
+      expect(
+        host.messages.find((message) => message.type === "GET_DIRECT_REQUEST_CONTEXT"),
+      ).toMatchObject({ url: `${origin}/list?page=1`, sourceTabId: 42 });
+      expect(host.messages.some((message) => message.type === "EXECUTE_JAVASCRIPT")).toBe(false);
+
+      const each = JSON.parse(
+        await use([
+          "use",
+          "shop",
+          "get_item",
+          "--each",
+          "list_items:url",
+          "--limit",
+          "2",
+          "--json",
+        ]),
+      );
+      expect(each).toMatchObject({ via: "chain", value: [{ name: "Item 1" }, { name: "Item 2" }] });
+      expect(seen.slice(1).map((request) => request.url)).toEqual([
+        "/list?page=1",
+        "/item/1",
+        "/item/2",
+      ]);
+
+      const filtered = JSON.parse(
+        await use([
+          "use",
+          "shop",
+          "list_items",
+          "--pages",
+          "2",
+          "--where",
+          "slug=s2",
+          "--fields",
+          "url",
+          "--limit",
+          "1",
+          "--json",
+        ]),
+      );
+      expect(filtered.value).toEqual([{ url: `${origin}/item/2` }]);
+      expect(filtered.filter).toMatchObject({ before: 4, after: 1, limit: 1 });
+
+      const tested = await use(["pb", "test", "shop", "list_items", "--where", "slug=nothing"]);
+      expect(tested).toMatch(/^pass +list_items +2 records via direct$/m);
+      expect(tested).toContain("Filtered: 0 of 2 records (--where slug=nothing)");
+
+      // A 200 page with no records goes to the tab, though the op has no expect.
+      const shell = JSON.parse(await use(["use", "shop", "shell_items", "--json"]));
+      expect(shell).toMatchObject({ via: "tab", value: [{ slug: "from-tab" }] });
+      // A filter only trims what pb test prints: a field one op lacks keeps it a pass.
+      const whole = await use(["pb", "test", "shop", "--fields", "slug"]);
+      expect(whole).toMatch(/^pass +get_item +1 value via direct$/m);
+      expect(whole).toMatch(/^ +--fields: unknown field "slug". Fields: name$/m);
+      expect(whole).toMatch(/^pass +shell_items +1 records via tab$/m);
+
+      const dry = JSON.parse(await use(["use", "shop", "list_items", "--dry-run", "--json"]));
+      expect(dry).toMatchObject({ via: "direct", fallback: ["tab"] });
+    } finally {
+      server.close();
+      await host.dispose();
+    }
+  }, 30000);
+});
+
+describe("writes through the fake extension", () => {
+  it("--write sends once from the tab, a second run is blocked, --repeat sends; chains and --each too", async () => {
+    const project = fs.mkdtempSync(path.join(os.tmpdir(), "surf-write-project-"));
+    tempDirs.push(project);
+    const site = path.join(project, ".surf", "playbooks", "forms");
+    fs.mkdirSync(path.join(site, "ops"), { recursive: true });
+    fs.writeFileSync(
+      path.join(site, "playbook.json"),
+      JSON.stringify({ id: "forms", version: "1.0.0", origins: ["https://httpbin.org"] }),
+    );
+    const ops = [
+      {
+        id: "order",
+        args: { custname: { required: true }, size: { default: "medium" } },
+        request: {
+          method: "POST",
+          url: "https://httpbin.org/post",
+          headers: { "content-type": "application/x-www-form-urlencoded" },
+          body: { custname: "{{custname}}", size: "{{size}}" },
+        },
+        open: "https://httpbin.org/forms/post",
+        extract: { fields: { name: "form.custname" } },
+        expect: { fields: ["name"] },
+      },
+      {
+        id: "list_names",
+        request: { url: "https://httpbin.org/names" },
+        extract: { records: "$.names", fields: { name: "name" } },
+      },
+      {
+        id: "order_all",
+        chain: [
+          { id: "list", op: "list_names" },
+          {
+            id: "send",
+            op: "order",
+            each: "list",
+            delayMs: 0,
+            with: { custname: "{{item.name}}" },
+          },
+        ],
+      },
+    ];
+    for (const op of ops) {
+      fs.writeFileSync(path.join(site, "ops", `${op.id}.json`), JSON.stringify(op));
+    }
+    const sent: string[] = [];
+    const socketPath = createSocketPath();
+    const host = startHost(socketPath, {
+      javascript: (code) => {
+        const body = (value: unknown) => ({
+          status: 200,
+          contentType: "application/json",
+          body: JSON.stringify(value),
+        });
+        if (code.includes("/names")) {
+          return body({ names: [{ name: "Cy" }, { name: "Dee" }] });
+        }
+        const name = code.match(/custname=(\w+)/)?.[1] ?? "";
+        sent.push(name);
+        if (name === "Away") {
+          return { elsewhere: "https://login.example" };
+        }
+        if (name === "Deny") {
+          return { status: 403, body: "" };
+        }
+        return name === "Fail" ? { status: 500, body: "" } : body({ form: { custname: name } });
+      },
+    });
+    const use = (...args: string[]) => runCli(socketPath, ["use", "forms", ...args], project);
+
+    try {
+      await host.waitForMessage((message) => message.type === "HOST_READY");
+      const refused = await use("order", "--custname", "Ada");
+      expect(refused.code).toBe(1);
+      expect(refused.stderr).toMatch(
+        /refused: forms order is a write \(POST https:\/\/httpbin\.org\/post\); add --write to send it/,
+      );
+      const once = await use("order", "--custname", "Ada", "--write", "--json");
+      expect(once.code).toBe(0);
+      expect(JSON.parse(once.stdout)).toMatchObject({ via: "tab", value: { name: "Ada" } });
+      const again = await use("order", "--custname", "Ada", "--write");
+      expect(again.code).toBe(1);
+      expect(again.stderr).toMatch(/write blocked by verified receipt .*--repeat sends it again/);
+      expect((await use("order", "--custname", "Ada", "--write", "--repeat")).code).toBe(0);
+      expect(sent).toEqual(["Ada", "Ada"]);
+
+      // A failed send never falls to the page step, and its unknown outcome blocks until --repeat.
+      expect((await use("order", "--custname", "Fail", "--write")).stderr).toMatch(/status 500/);
+      expect((await use("order", "--custname", "Fail", "--write")).stderr).toMatch(
+        /outcome is unknown/,
+      );
+      expect(host.messages.some((message) => message.type === "EXECUTE_NAVIGATE")).toBe(false);
+      expect(sent).toEqual(["Ada", "Ada", "Fail"]);
+      // A tab that stays on another site sent nothing; a 403 was answered, so it waits the window.
+      expect((await use("order", "--custname", "Away", "--write")).stderr).toMatch(/stayed on/);
+      expect((await use("order", "--custname", "Away", "--write")).stderr).toMatch(/stayed on/);
+      expect((await use("order", "--custname", "Deny", "--write")).stderr).toMatch(/status 403/);
+      expect((await use("order", "--custname", "Deny", "--write")).stderr).toMatch(
+        /answered \d+ s ago/,
+      );
+      sent.splice(3);
+
+      expect((await use("order_all")).stderr).toMatch(
+        /refused: forms order is a write \(POST https:\/\/httpbin\.org\/post\); add --write/,
+      );
+      const chained = await use("order_all", "--write", "--json");
+      expect(chained.code).toBe(0);
+      expect(JSON.parse(chained.stdout).value).toEqual([{ name: "Cy" }, { name: "Dee" }]);
+      const each = ["order", "--each", "list_names:name=custname", "--write", "--delay-ms", "0"];
+      expect((await use(...each)).stderr).toMatch(/record 1: write blocked by verified receipt/);
+      expect((await use(...each, "--repeat")).code).toBe(0);
+      expect(sent.slice(3)).toEqual(["Cy", "Dee", "Cy", "Dee"]);
+    } finally {
+      await host.dispose();
+    }
+  }, 30000);
 });
