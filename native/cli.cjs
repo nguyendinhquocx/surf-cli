@@ -284,7 +284,10 @@ if (args[0] === "hook" && !helpRequested()) {
       process.exit(exitCode);
     })
     .catch((error) => {
-      console.error(`Error: ${error.message}`);
+      // A host error's code goes on its first line, as for other commands.
+      const code = typeof error.hostError?.code === "string" ? error.hostError.code : null;
+      const [first, ...rest] = error.message.split("\n");
+      console.error(`Error: ${[code && !first.includes(`[${code}]`) ? `${first} [${code}]` : first, ...rest].join("\n")}`);
       process.exit(1);
     });
   return;
@@ -1681,6 +1684,7 @@ const TOOLS = {
           match: "Pick the captured request whose URL holds this text",
           as: "Save as <site>/<op> (default: the host name and get_ + the goal's first three words); an op already there is kept as <op>.json.bak",
           "dry-run": "Open the page, pick, name inputs and test as usual, then print the op instead of saving it",
+          "keep-body": "Save the op even when its text request body still holds a literal value under a secret-looking key (refused without it)",
           json: "Output the result as JSON",
         },
         examples: [
@@ -1765,7 +1769,7 @@ const TOOLS = {
       "playbook record stop": {
         desc: "Stop recording; with network capture, pick, test and save the op as surf hook does (exit 2 on a weak pick keeps recording)",
         args: [],
-        opts: { match: "Pick the captured request whose URL holds this text", draft: "Only save a draft op in the record, as before" },
+        opts: { match: "Pick the captured request whose URL holds this text", draft: "Only save a draft op in the record, as before", "keep-body": "Save the op even when its text request body still holds a literal value under a secret-looking key (refused without it; a refused stop keeps the record open)" },
       },
       "playbook record status": { desc: "Show the recording state (also: pause, resume, discard)", args: [] },
       "playbook trace export": { desc: "Export a record as HAR", args: [], opts: { "from-record": "Record id", har: "Output .har path" } },
@@ -4502,6 +4506,8 @@ async function handleResponse(response) {
   }
 
   const result = response.result?.content?.[0]?.text;
+  // A hint the host sends beside the result (js run in the page) prints after the value.
+  const hint = typeof response.hint === "string" ? response.hint : undefined;
 
   let data;
   try {
@@ -4541,11 +4547,12 @@ async function handleResponse(response) {
   }
 
   if (wantJson) {
-    const output = response.target || response.notice || response.truncated || response.pageChanges || response.savedOps
+    const output = response.target || response.notice || response.truncated || response.pageChanges || response.savedOps || hint
       ? {
         result: data ?? null,
         target: response.target || null,
         notice: response.notice || null,
+        ...(hint ? { hint } : {}),
         ...(response.truncated ? { truncated: response.truncated } : {}),
         ...(response.pageChanges ? { pageChanges: response.pageChanges } : {}),
         ...(response.savedOps ? { savedOps: response.savedOps } : {}),
@@ -4951,6 +4958,7 @@ async function handleResponse(response) {
   } else {
     console.log(JSON.stringify(data, null, 2));
   }
+  if (hint) console.log(`[hint] ${hint}`);
   if (pageChangeLines.length > 0 && typeof data !== "string") console.log(pageChangeLines.join("\n"));
   if (response.savedOps) console.log(formatSavedOps(response.savedOps));
 

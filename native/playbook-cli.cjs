@@ -6,6 +6,10 @@ const { deriveClient, exportClient, verifyClient } = require("./playbook-client.
 const { exportPlaybookDirectory, importPlaybookDirectory, listPlaybooks, resolveOp, resolvePlaybook } = require("./playbooks.cjs");
 const { applyFilter, collectFilterFlags, filterText, takeRunFilter } = require("./record-filter.cjs");
 
+// A flag's value as surf use reads it: a number only when it reads back the same, so ids such as
+// 2101.10010 or 0704.0001 stay text.
+const optionValue = (text) => (/^-?\d+(?:\.\d+)?$/.test(text) && String(Number(text)) === text ? Number(text) : text);
+
 function parseCommandArgs(argv) {
   const positional = [];
   const options = {};
@@ -18,8 +22,7 @@ function parseCommandArgs(argv) {
     const name = value.slice(2);
     const next = argv[index + 1];
     if (next !== undefined && !next.startsWith("--")) {
-      // A number only when it reads back the same: ids such as 2101.10010 or 0704.0001 stay text.
-      options[name] = /^-?\d+(?:\.\d+)?$/.test(next) && String(Number(next)) === next ? Number(next) : next;
+      options[name] = optionValue(next);
       index++;
     } else options[name] = true;
   }
@@ -222,7 +225,7 @@ async function handlePlaybookCli(argv, { endpoint, cwd = process.cwd(), session,
     let args = {};
     if (action === "start") args = { site: parsed.positional[1], op: parsed.options.op, watch: parsed.options.watch === true, network: parsed.options["no-network"] !== true, includeInputValues: parsed.options["include-input-values"] === true };
     else if (action === "mark") args = { label: parsed.positional.slice(1).join(" ") };
-    else if (action === "stop") args = { draft: parsed.options.draft === true, ...(parsed.options.match === undefined ? {} : { match: String(parsed.options.match) }) };
+    else if (action === "stop") args = { draft: parsed.options.draft === true, keepBody: parsed.options["keep-body"] === true, ...(parsed.options.match === undefined ? {} : { match: String(parsed.options.match) }) };
     else if (!["status", "pause", "resume", "discard"].includes(action)) throw new Error("Unknown record command");
     const value = await requestHost(endpoint, tool, args, {
       tabId: parsed.options["tab-id"],
@@ -272,4 +275,4 @@ function formatPlaybookOutput(value, json = false) {
   return value;
 }
 
-module.exports = { formatPlaybookOutput, handlePlaybookCli, opHelp, playbookCommandNeedsBrowser, requestHost };
+module.exports = { formatPlaybookOutput, handlePlaybookCli, opHelp, optionValue, playbookCommandNeedsBrowser, requestHost };
